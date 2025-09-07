@@ -32,27 +32,38 @@ type ErrorStats struct {
 // DNSHandler обрабатывает DNS-запросы
 type DNSHandler struct {
 	resolver *resolver.Resolver
-	
+
 	// Кэш с быстрым доступом
 	cache    sync.Map // map[string]*CacheEntry
 	cacheTTL int64    // в секундах
-	
+
 	// Статистика ошибок
 	errorStats *ErrorStats
-	
+
 	// Метрики
 	totalQueries  int64
 	cachedQueries int64
+
+	// Для расчета QPS
+	queryCountLast int64
+	lastMetricsAt  time.Time
+	qps            float64
+	qpsMutex       sync.RWMutex
+
+	// Время запуска сервера
+	startTime time.Time
 }
 
 // NewDNSHandler создает новый обработчик DNS-запросов
 func NewDNSHandler() *DNSHandler {
 	handler := &DNSHandler{
-		resolver: resolver.NewResolver(),
-		cacheTTL: 300, // 5 минут по умолчанию
+		resolver:      resolver.NewResolver(),
+		cacheTTL:      300, // 5 минут по умолчанию
 		errorStats: &ErrorStats{
 			errors: make(map[string]int64),
 		},
+		lastMetricsAt: time.Now(),
+		startTime:     time.Now(), // Запоминаем время запуска
 	}
 
 	// Настройка резолвера
@@ -62,12 +73,15 @@ func NewDNSHandler() *DNSHandler {
 
 	// Запускаем очистку кэша в отдельной горутине
 	go handler.cleanupCache()
-	
+
 	// Запускаем вывод метрик
 	go handler.printMetrics()
-	
+
 	// Запускаем вывод сводки ошибок
 	go handler.printErrorSummary()
+
+	// Запускаем обновление QPS
+	go handler.updateQPS()
 
 	return handler
 }
@@ -81,7 +95,7 @@ func (h *DNSHandler) cleanupCache() {
 		<-ticker.C
 		now := time.Now().Unix()
 		removed := 0
-		
+
 		h.cache.Range(func(key, value interface{}) bool {
 			entry := value.(*CacheEntry)
 			if now > entry.ExpireAt {
@@ -90,29 +104,77 @@ func (h *DNSHandler) cleanupCache() {
 			}
 			return true
 		})
-		
+
 		if removed > 0 {
 			log.Printf("Cache cleanup: removed %d expired entries", removed)
 		}
 	}
 }
 
+// updateQPS обновляет значение QPS
+func (h *DNSHandler) updateQPS() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		<-ticker.C
+		now := time.Now()
+		total := atomic.LoadInt64(&h.totalQueries)
+		lastCount := atomic.LoadInt64(&h.queryCountLast)
+
+		// Вычисляем QPS за последнюю секунду
+		// Используем небольшое сглаживание или просто фиксируем последнее значение
+		// за 1 секунду. Для более точного среднего QPS можно усреднять за N секунд.
+		var qps float64
+		if now.Sub(h.lastMetricsAt).Seconds() > 0 { // Защита от деления на ноль
+			qps = float64(total-lastCount) / now.Sub(h.lastMetricsAt).Seconds()
+		} else {
+			qps = 0 // Или можно сохранить предыдущее значение
+		}
+
+		h.qpsMutex.Lock()
+		h.qps = qps
+		h.queryCountLast = total
+		h.lastMetricsAt = now
+		h.qpsMutex.Unlock()
+	}
+}
+
+// getQPS возвращает текущее значение QPS
+func (h *DNSHandler) getQPS() float64 {
+	h.qpsMutex.RLock()
+	defer h.qpsMutex.RUnlock()
+	return h.qps
+}
+
 // printMetrics выводит метрики работы сервера
 func (h *DNSHandler) printMetrics() {
-	ticker := time.NewTicker(30 * time.Second)
+	// Уменьшаем интервал для более частого обновления статистики
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		<-ticker.C
 		total := atomic.LoadInt64(&h.totalQueries)
 		cached := atomic.LoadInt64(&h.cachedQueries)
-		
+		uptime := time.Since(h.startTime).Truncate(time.Second) // Округляем для красоты
+
 		cacheHitRate := float64(0)
 		if total > 0 {
 			cacheHitRate = float64(cached) / float64(total) * 100
 		}
-		
-		log.Printf("METRICS - Total: %d, Cached: %d (%.2f%%)", total, cached, cacheHitRate)
+
+		qps := h.getQPS()
+		goroutines := runtime.NumGoroutine()
+
+		// Форматированный вывод статистики
+		log.Printf("=== SERVER STATS ===")
+		log.Printf("Uptime:        %v", uptime)
+		log.Printf("Total Queries: %d", total)
+		log.Printf("Cached Hits:   %d (%.2f%%)", cached, cacheHitRate)
+		log.Printf("Current QPS:   %.2f", qps)
+		log.Printf("Goroutines:    %d", goroutines)
+		log.Printf("====================")
 	}
 }
 
@@ -123,7 +185,7 @@ func (h *DNSHandler) printErrorSummary() {
 
 	for {
 		<-ticker.C
-		
+
 		h.errorStats.mutex.Lock()
 		if len(h.errorStats.errors) > 0 {
 			log.Printf("ERROR SUMMARY - Top problematic domains:")
@@ -132,12 +194,12 @@ func (h *DNSHandler) printErrorSummary() {
 				domain string
 				count  int64
 			}
-			
+
 			var errors []domainError
 			for domain, count := range h.errorStats.errors {
 				errors = append(errors, domainError{domain, count})
 			}
-			
+
 			// Простая сортировка по количеству ошибок (первые 10)
 			for i := 0; i < len(errors) && i < 10; i++ {
 				for j := i + 1; j < len(errors); j++ {
@@ -146,13 +208,15 @@ func (h *DNSHandler) printErrorSummary() {
 					}
 				}
 			}
-			
+
 			for i := 0; i < len(errors) && i < 10; i++ {
 				log.Printf("  %s: %d errors", errors[i].domain, errors[i].count)
 			}
-			
+
 			// Очищаем статистику после вывода
 			h.errorStats.errors = make(map[string]int64)
+		} else {
+			log.Printf("ERROR SUMMARY - No errors recorded in the last period.")
 		}
 		h.errorStats.mutex.Unlock()
 	}
@@ -172,7 +236,7 @@ func (h *DNSHandler) getCachedResponse(key string, request *dns.Msg) *dns.Msg {
 
 	entry := value.(*CacheEntry)
 	now := time.Now().Unix()
-	
+
 	// Проверяем, не истекло ли время жизни
 	if now > entry.ExpireAt {
 		h.cache.Delete(key)
@@ -181,10 +245,10 @@ func (h *DNSHandler) getCachedResponse(key string, request *dns.Msg) *dns.Msg {
 
 	// Создаем копию сообщения
 	cachedMsg := entry.Msg.Copy()
-	
+
 	// Сохраняем оригинальный ID запроса
 	cachedMsg.Id = request.Id
-	
+
 	// Копируем EDNS0 опции из оригинального запроса
 	if edns0 := request.IsEdns0(); edns0 != nil {
 		// Создаем новый OPT record
@@ -193,18 +257,18 @@ func (h *DNSHandler) getCachedResponse(key string, request *dns.Msg) *dns.Msg {
 		newOpt.Hdr.Rrtype = dns.TypeOPT
 		newOpt.SetUDPSize(edns0.UDPSize())
 		newOpt.SetDo(edns0.Do())
-		
+
 		// Добавляем OPT record в ответ
 		cachedMsg.Extra = append(cachedMsg.Extra, newOpt)
 	}
-	
+
 	// Обновляем TTL в записях
 	timeLeft := entry.ExpireAt - now
 	if timeLeft < 0 {
 		timeLeft = 0
 	}
 	ttlSeconds := uint32(timeLeft)
-	
+
 	// Обновляем TTL для всех записей
 	for _, rr := range cachedMsg.Answer {
 		rr.Header().Ttl = ttlSeconds
@@ -218,7 +282,7 @@ func (h *DNSHandler) getCachedResponse(key string, request *dns.Msg) *dns.Msg {
 			rr.Header().Ttl = ttlSeconds
 		}
 	}
-	
+
 	atomic.AddInt64(&h.cachedQueries, 1)
 	return cachedMsg
 }
@@ -227,7 +291,7 @@ func (h *DNSHandler) getCachedResponse(key string, request *dns.Msg) *dns.Msg {
 func (h *DNSHandler) cacheResponse(key string, msg *dns.Msg) {
 	// Определяем минимальный TTL
 	minTTL := h.cacheTTL
-	
+
 	// Для NXDOMAIN устанавливаем меньший TTL (например, 30 секунд)
 	if msg.Rcode == dns.RcodeNameError {
 		minTTL = 30 // NXDOMAIN кэшируем на 30 секунд
@@ -243,10 +307,10 @@ func (h *DNSHandler) cacheResponse(key string, msg *dns.Msg) {
 			}
 		}
 	}
-	
+
 	// Создаем копию сообщения для кэширования (без ID и OPT)
 	cachedMsg := msg.Copy()
-	
+
 	// Удаляем OPT record из кэшируемого сообщения
 	extra := make([]dns.RR, 0, len(cachedMsg.Extra))
 	for _, rr := range cachedMsg.Extra {
@@ -255,7 +319,7 @@ func (h *DNSHandler) cacheResponse(key string, msg *dns.Msg) {
 		}
 	}
 	cachedMsg.Extra = extra
-	
+
 	// Сохраняем в кэш
 	expireAt := time.Now().Unix() + minTTL
 	h.cache.Store(key, &CacheEntry{
@@ -268,23 +332,23 @@ func (h *DNSHandler) cacheResponse(key string, msg *dns.Msg) {
 func (h *DNSHandler) recordError(domain string) {
 	h.errorStats.mutex.Lock()
 	defer h.errorStats.mutex.Unlock()
-	
+
 	h.errorStats.errors[domain]++
 }
 
 // isNormalError проверяет, является ли ошибка "нормальной" (не требующей логирования)
 func (h *DNSHandler) isNormalError(err error) bool {
 	errStr := err.Error()
-	return strings.Contains(errStr, "timeout") || 
-		   strings.Contains(errStr, "Refused") || 
-		   strings.Contains(errStr, "connection refused") ||
-		   strings.Contains(errStr, "i/o timeout")
+	return strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "Refused") ||
+		strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "i/o timeout")
 }
 
 // ServeDNS обрабатывает входящие DNS-запросы
 func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	atomic.AddInt64(&h.totalQueries, 1)
-	
+
 	// Создаем ответное сообщение
 	m := new(dns.Msg)
 	m.SetReply(r)
@@ -313,7 +377,7 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	// Создаем запрос для upstream-сервера
 	upstreamMsg := new(dns.Msg)
 	upstreamMsg.SetQuestion(domain, question.Qtype)
-	
+
 	// Проверяем, запрашивается ли DNSSEC
 	if r.IsEdns0() != nil && r.IsEdns0().Do() {
 		upstreamMsg.SetEdns0(4096, true)
@@ -322,19 +386,19 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	// Выполняем запрос с таймаутом
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	
+
 	result := h.resolver.Exchange(ctx, upstreamMsg)
-	
+
 	// Проверяем ошибки
 	if result.Err != nil {
 		// Записываем ошибку в статистику
 		h.recordError(domain)
-		
+
 		// Логируем только "нестандартные" ошибки
 		if !h.isNormalError(result.Err) {
 			log.Printf("ERROR resolving %s: %v", domain, result.Err)
 		}
-		
+
 		m.SetRcode(r, dns.RcodeServerFailure)
 		w.WriteMsg(m)
 		return
@@ -345,14 +409,14 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		m.Answer = result.Msg.Answer
 		m.Ns = result.Msg.Ns
 		m.Extra = result.Msg.Extra
-		
+
 		// Копируем важные флаги
 		m.MsgHdr.AuthenticatedData = result.Msg.MsgHdr.AuthenticatedData
 		m.MsgHdr.RecursionAvailable = result.Msg.MsgHdr.RecursionAvailable
 		m.MsgHdr.Response = result.Msg.MsgHdr.Response
 		m.MsgHdr.Authoritative = result.Msg.MsgHdr.Authoritative
 		m.Rcode = result.Msg.Rcode
-		
+
 		// Копируем EDNS0 опции
 		if edns0 := r.IsEdns0(); edns0 != nil {
 			// Убеждаемся, что OPT record присутствует
@@ -363,7 +427,7 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 					break
 				}
 			}
-			
+
 			if !hasOpt {
 				// Создаем новый OPT record
 				newOpt := new(dns.OPT)
@@ -374,7 +438,7 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 				m.Extra = append(m.Extra, newOpt)
 			}
 		}
-		
+
 		// Сохраняем в кэш
 		h.cacheResponse(cacheKey, result.Msg)
 	}
@@ -406,7 +470,7 @@ func main() {
 	}
 
 	log.Println("Starting DNS server on :5353")
-	log.Println("Features: Caching with DNSSEC support + Error statistics")
+	log.Println("Features: Caching with DNSSEC support + Error statistics + Metrics")
 	log.Printf("CPUs: %d", runtime.NumCPU())
 
 	// Запуск UDP сервера в отдельной горутине
