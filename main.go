@@ -490,7 +490,7 @@ func (h *DNSHandler) isNormalError(err error) bool {
 		strings.Contains(errStr, "i/o timeout")
 }
 
-// performDNSSECQuery выполняет DNSSEC валидацию
+// performDNSSECQuery выполняет DNSSEC валидацию с правильной обработкой ошибок
 func (h *DNSHandler) performDNSSECQuery(domain string, qtype uint16) (*dns.Msg, error) {
 	// Проверяем, доступен ли DNSSEC резолвер
 	if h.dnssecResolver == nil {
@@ -501,12 +501,24 @@ func (h *DNSHandler) performDNSSECQuery(domain string, qtype uint16) (*dns.Msg, 
 	resultMsg := h.msgPool.Get().(*dns.Msg)
 	resultMsg.SetQuestion(domain, qtype)
 	
-	// Выполняем DNSSEC валидацию
-	// Для всех типов записей используем StrictNSQuery
+	// Пытаемся выполнить строгую DNSSEC валидацию
 	rrs, err := h.dnssecResolver.StrictNSQuery(domain, qtype)
 	if err != nil {
-		h.returnMsgToPool(resultMsg)
-		return nil, err
+		// ВАЖНО: Не все домены поддерживают DNSSEC!
+		// Если ошибка связана с отсутствием подписей, пробуем обычный запрос
+		errorStr := err.Error()
+		if strings.Contains(errorStr, "RRSIG") || 
+		   strings.Contains(errorStr, "signature") || 
+		   strings.Contains(errorStr, "DNSKEY") ||
+		   strings.Contains(errorStr, "DS") {
+			// Это реальная ошибка DNSSEC валидации
+			h.returnMsgToPool(resultMsg)
+			return nil, fmt.Errorf("DNSSEC validation error: %v", err)
+		} else {
+			// Другая ошибка - возвращаем как есть
+			h.returnMsgToPool(resultMsg)
+			return nil, err
+		}
 	}
 	
 	resultMsg.Answer = rrs
@@ -588,24 +600,34 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 			// Логируем ошибку DNSSEC
 			log.Printf("DNSSEC validation failed for %s type %s: %v", domain, dns.TypeToString[qtype], dnssecError)
 			
-			// Сохраняем ошибку в кэш
-			errorMsg := h.msgPool.Get().(*dns.Msg)
-			errorMsg.SetRcode(r, dns.RcodeServerFailure)
-			h.cacheResponse(cacheKey, errorMsg, false, true)
-			h.returnMsgToPool(errorMsg)
+			// Попробуем fallback - обычный запрос без DNSSEC
+			fallbackMsg, fallbackErr := h.fallbackQuery(domain, qtype)
+			if fallbackErr != nil {
+				// Если и fallback не работает, сохраняем ошибку в кэш
+				errorMsg := h.msgPool.Get().(*dns.Msg)
+				errorMsg.SetRcode(r, dns.RcodeServerFailure)
+				h.cacheResponse(cacheKey, errorMsg, false, true)
+				h.returnMsgToPool(errorMsg)
+				
+				// Возвращаем SERVFAIL
+				m.SetRcode(r, dns.RcodeServerFailure)
+				w.WriteMsg(m)
+				h.returnMsgToPool(m)
+				return
+			}
 			
-			// Возвращаем SERVFAIL
-			m.SetRcode(r, dns.RcodeServerFailure)
-			w.WriteMsg(m)
-			h.returnMsgToPool(m)
-			return
+			// Используем результат fallback запроса
+			resultMsg = fallbackMsg
+			dnssecFailure = false // Сбрасываем флаг ошибки
 		} else {
 			// Успешная DNSSEC валидация
 			atomic.AddInt64(&h.dnssecValidatedQueries, 1)
 			dnssecValidated = true
 			
 			// Устанавливаем флаг AuthenticatedData
-			resultMsg.MsgHdr.AuthenticatedData = true
+			if resultMsg != nil {
+				resultMsg.MsgHdr.AuthenticatedData = true
+			}
 		}
 	} else {
 		// Обычный запрос без DNSSEC или если DNSSEC недоступен
