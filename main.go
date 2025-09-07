@@ -2,9 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto"
-	"crypto/ecdsa"
-	"crypto/rsa"
 	"fmt"
 	"log"
 	"os"
@@ -32,14 +29,6 @@ type CacheEntry struct {
 type ErrorStats struct {
 	errors map[string]int64
 	mutex  sync.RWMutex
-}
-
-// DNSSECValidationResult результат валидации DNSSEC
-type DNSSECValidationResult struct {
-	Valid      bool
-	Error      error
-	RRSIGs     []dns.RR
-	DNSKEYs    []dns.RR
 }
 
 // DNSHandler обрабатывает DNS-запросы
@@ -477,33 +466,6 @@ func (h *DNSHandler) getDNSKEY(domain string) ([]dns.RR, error) {
 	return dnskeys, nil
 }
 
-// verifySignature проверяет RRSIG подпись
-func (h *DNSHandler) verifySignature(rrset []dns.RR, rrsig *dns.RRSIG, dnskey *dns.DNSKEY) error {
-	// Проверяем срок действия подписи
-	now := time.Now()
-	if now.Before(rrsig.Inception) || now.After(rrsig.Expiration) {
-		return fmt.Errorf("signature expired or not yet valid")
-	}
-	
-	// Проверяем соответствие подписи типу записей
-	if len(rrset) == 0 || rrset[0].Header().Rrtype != rrsig.TypeCovered {
-		return fmt.Errorf("RRSIG type mismatch")
-	}
-	
-	// Проверяем имя зоны
-	if rrsig.Header().Name != dnskey.Header().Name {
-		return fmt.Errorf("zone name mismatch")
-	}
-	
-	// Выполняем криптографическую проверку
-	err := rrsig.Verify(dnskey, rrset)
-	if err != nil {
-		return fmt.Errorf("cryptographic verification failed: %v", err)
-	}
-	
-	return nil
-}
-
 // validateRRSIGs проверяет все RRSIG подписи в ответе
 func (h *DNSHandler) validateRRSIGs(response *dns.Msg, domain string) error {
 	// Собираем RRSET и RRSIG записи
@@ -535,9 +497,13 @@ func (h *DNSHandler) validateRRSIGs(response *dns.Msg, domain string) error {
 			}
 		}
 		if hasRecords {
-			return fmt.Errorf("missing RRSIG records for domain with records")
+			// Проверим, может ли домен поддерживать DNSSEC
+			dnskeys, _ := h.getDNSKEY(domain)
+			if len(dnskeys) > 0 {
+				return fmt.Errorf("missing RRSIG records for domain with DNSKEY")
+			}
 		}
-		return nil // Нет записей для подписи - нормально
+		return nil // Нет записей для подписи или домен без DNSSEC - нормально
 	}
 	
 	// Получаем DNSKEY для проверки подписей
@@ -568,9 +534,32 @@ func (h *DNSHandler) validateRRSIGs(response *dns.Msg, domain string) error {
 			return fmt.Errorf("no matching DNSKEY found for RRSIG %s", key)
 		}
 		
-		// Проверяем подпись
-		if err := h.verifySignature(rrset, rrsig, matchingDNSKEY); err != nil {
-			return fmt.Errorf("signature verification failed for %s: %v", key, err)
+		// Проверяем срок действия подписи
+		now := time.Now()
+		inception := time.Unix(int64(rrsig.Inception), 0)
+		expiration := time.Unix(int64(rrsig.Expiration), 0)
+		
+		if now.Before(inception) {
+			return fmt.Errorf("signature not yet valid (inception: %v, now: %v)", inception, now)
+		}
+		if now.After(expiration) {
+			return fmt.Errorf("signature expired (expiration: %v, now: %v)", expiration, now)
+		}
+		
+		// Проверяем соответствие подписи типу записей
+		if len(rrset) == 0 || rrset[0].Header().Rrtype != rrsig.TypeCovered {
+			return fmt.Errorf("RRSIG type mismatch")
+		}
+		
+		// Проверяем имя зоны
+		if rrsig.Header().Name != matchingDNSKEY.Header().Name {
+			return fmt.Errorf("zone name mismatch")
+		}
+		
+		// Выполняем криптографическую проверку
+		err := rrsig.Verify(matchingDNSKEY, rrset)
+		if err != nil {
+			return fmt.Errorf("cryptographic verification failed for %s: %v", key, err)
 		}
 	}
 	
