@@ -3,9 +3,9 @@
 * `github.com/miekg/dns` — для реализации протокола DNS (серверная часть)
 * `github.com/nsmithuk/resolver` — для рекурсивного разрешения и DNSSEC
 
-Вот готовый вариант в **Markdown**:
 
-````markdown
+
+
 # DNS Resolver
 
 Полноценный рекурсивный DNS Resolver, созданный как аналог PowerDNS, с высокой производительностью, многоуровневым кэшированием и поддержкой **DNSSEC**.  
