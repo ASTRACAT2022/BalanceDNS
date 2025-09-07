@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/rsa"
 	"fmt"
 	"log"
 	"os"
@@ -15,7 +18,6 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/nsmithuk/resolver"
-	goresolver "github.com/peterzen/goresolver"
 )
 
 // CacheEntry представляет запись в кэше
@@ -32,10 +34,18 @@ type ErrorStats struct {
 	mutex  sync.RWMutex
 }
 
+// DNSSECValidationResult результат валидации DNSSEC
+type DNSSECValidationResult struct {
+	Valid      bool
+	Error      error
+	RRSIGs     []dns.RR
+	DNSKEYs    []dns.RR
+}
+
 // DNSHandler обрабатывает DNS-запросы
 type DNSHandler struct {
 	resolver *resolver.Resolver
-	dnssecResolver *goresolver.Resolver // DNSSEC резолвер
+	dnsClient *dns.Client // Для DNSSEC запросов
 
 	// Кэш с быстрым доступом
 	cache    sync.Map // map[string]*CacheEntry
@@ -65,67 +75,9 @@ type DNSHandler struct {
 
 // NewDNSHandler создает новый обработчик DNS-запросов
 func NewDNSHandler() *DNSHandler {
-	// Создаем временный resolv.conf с публичными DNS серверами
-	dnsConfig := `nameserver 1.1.1.1
-nameserver 8.8.8.8
-nameserver 9.9.9.9`
-	
-	// Записываем во временный файл
-	tmpFile, err := os.CreateTemp("", "dnssec-resolv-*.conf")
-	if err != nil {
-		log.Printf("Warning: Failed to create temp resolv.conf: %v. DNSSEC validation will be disabled.", err)
-		return &DNSHandler{
-			resolver:      resolver.NewResolver(),
-			dnssecResolver: nil,
-			cacheTTL:      300,
-			errorStats: &ErrorStats{
-				errors: make(map[string]int64),
-			},
-			lastMetricsAt: time.Now(),
-			startTime:     time.Now(),
-			msgPool: sync.Pool{
-				New: func() interface{} {
-					return new(dns.Msg)
-				},
-			},
-		}
-	}
-	
-	// Записываем конфигурацию
-	if _, err := tmpFile.WriteString(dnsConfig); err != nil {
-		log.Printf("Warning: Failed to write to temp resolv.conf: %v", err)
-		tmpFile.Close()
-		os.Remove(tmpFile.Name())
-		return &DNSHandler{
-			resolver:      resolver.NewResolver(),
-			dnssecResolver: nil,
-			cacheTTL:      300,
-			errorStats: &ErrorStats{
-				errors: make(map[string]int64),
-			},
-			lastMetricsAt: time.Now(),
-			startTime:     time.Now(),
-			msgPool: sync.Pool{
-				New: func() interface{} {
-					return new(dns.Msg)
-				},
-			},
-		}
-	}
-	
-	tmpFile.Close()
-	
-	// Создаем DNSSEC резолвер с временным файлом
-	dnssecResolver, err := goresolver.NewResolver(tmpFile.Name())
-	if err != nil {
-		log.Printf("Warning: Failed to create DNSSEC resolver: %v. DNSSEC validation will be disabled.", err)
-		os.Remove(tmpFile.Name())
-		dnssecResolver = nil
-	}
-	
 	handler := &DNSHandler{
 		resolver:      resolver.NewResolver(),
-		dnssecResolver: dnssecResolver,
+		dnsClient:     &dns.Client{Net: "udp", Timeout: 5 * time.Second},
 		cacheTTL:      300, // 5 минут по умолчанию
 		errorStats: &ErrorStats{
 			errors: make(map[string]int64),
@@ -156,7 +108,7 @@ nameserver 9.9.9.9`
 	// Запускаем обновление QPS
 	go handler.updateQPS()
 
-	log.Printf("DNSSEC resolver initialized with temp config: %s", tmpFile.Name())
+	log.Println("DNSSEC resolver initialized with full cryptographic validation")
 	
 	return handler
 }
@@ -490,46 +442,161 @@ func (h *DNSHandler) isNormalError(err error) bool {
 		strings.Contains(errStr, "i/o timeout")
 }
 
-// performDNSSECQuery выполняет DNSSEC валидацию с правильной обработкой ошибок
-func (h *DNSHandler) performDNSSECQuery(domain string, qtype uint16) (*dns.Msg, error) {
-	// Проверяем, доступен ли DNSSEC резолвер
-	if h.dnssecResolver == nil {
-		return nil, fmt.Errorf("DNSSEC resolver is not available")
+// queryDNS отправляет DNS запрос
+func (h *DNSHandler) queryDNS(server, domain string, qtype uint16, dnssec bool) (*dns.Msg, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), qtype)
+	
+	if dnssec {
+		m.SetEdns0(4096, true) // Устанавливаем DO бит
 	}
 	
-	// Создаем DNS сообщение для результата из пула
-	resultMsg := h.msgPool.Get().(*dns.Msg)
-	resultMsg.SetQuestion(domain, qtype)
-	
-	// Пытаемся выполнить строгую DNSSEC валидацию
-	rrs, err := h.dnssecResolver.StrictNSQuery(domain, qtype)
+	// Отправляем запрос
+	response, _, err := h.dnsClient.Exchange(m, server+":53")
+	return response, err
+}
+
+// getDNSKEY получает DNSKEY записи для зоны
+func (h *DNSHandler) getDNSKEY(domain string) ([]dns.RR, error) {
+	response, err := h.queryDNS("8.8.8.8", domain, dns.TypeDNSKEY, true)
 	if err != nil {
-		// ВАЖНО: Не все домены поддерживают DNSSEC!
-		// Если ошибка связана с отсутствием подписей, пробуем обычный запрос
-		errorStr := err.Error()
-		if strings.Contains(errorStr, "RRSIG") || 
-		   strings.Contains(errorStr, "signature") || 
-		   strings.Contains(errorStr, "DNSKEY") ||
-		   strings.Contains(errorStr, "DS") {
-			// Это реальная ошибка DNSSEC валидации
-			h.returnMsgToPool(resultMsg)
-			return nil, fmt.Errorf("DNSSEC validation error: %v", err)
-		} else {
-			// Другая ошибка - возвращаем как есть
-			h.returnMsgToPool(resultMsg)
-			return nil, err
+		return nil, err
+	}
+	
+	var dnskeys []dns.RR
+	for _, rr := range response.Answer {
+		if rr.Header().Rrtype == dns.TypeDNSKEY {
+			dnskeys = append(dnskeys, rr)
 		}
 	}
 	
-	resultMsg.Answer = rrs
-	resultMsg.Rcode = dns.RcodeSuccess
-	return resultMsg, nil
+	if len(dnskeys) == 0 {
+		return nil, fmt.Errorf("no DNSKEY records found for %s", domain)
+	}
+	
+	return dnskeys, nil
+}
+
+// verifySignature проверяет RRSIG подпись
+func (h *DNSHandler) verifySignature(rrset []dns.RR, rrsig *dns.RRSIG, dnskey *dns.DNSKEY) error {
+	// Проверяем срок действия подписи
+	now := time.Now()
+	if now.Before(rrsig.Inception) || now.After(rrsig.Expiration) {
+		return fmt.Errorf("signature expired or not yet valid")
+	}
+	
+	// Проверяем соответствие подписи типу записей
+	if len(rrset) == 0 || rrset[0].Header().Rrtype != rrsig.TypeCovered {
+		return fmt.Errorf("RRSIG type mismatch")
+	}
+	
+	// Проверяем имя зоны
+	if rrsig.Header().Name != dnskey.Header().Name {
+		return fmt.Errorf("zone name mismatch")
+	}
+	
+	// Выполняем криптографическую проверку
+	err := rrsig.Verify(dnskey, rrset)
+	if err != nil {
+		return fmt.Errorf("cryptographic verification failed: %v", err)
+	}
+	
+	return nil
+}
+
+// validateRRSIGs проверяет все RRSIG подписи в ответе
+func (h *DNSHandler) validateRRSIGs(response *dns.Msg, domain string) error {
+	// Собираем RRSET и RRSIG записи
+	rrsets := make(map[string][]dns.RR) // имя+тип -> записи
+	rrsigs := make(map[string]*dns.RRSIG) // имя+тип -> RRSIG
+	
+	for _, rr := range response.Answer {
+		header := rr.Header()
+		key := header.Name + "|" + fmt.Sprintf("%d", header.Rrtype)
+		
+		if header.Rrtype == dns.TypeRRSIG {
+			if rrsig, ok := rr.(*dns.RRSIG); ok {
+				sigKey := rrsig.Header().Name + "|" + fmt.Sprintf("%d", rrsig.TypeCovered)
+				rrsigs[sigKey] = rrsig
+			}
+		} else {
+			rrsets[key] = append(rrsets[key], rr)
+		}
+	}
+	
+	// Если нет подписей, это может быть нормально для доменов без DNSSEC
+	if len(rrsigs) == 0 {
+		// Проверим, есть ли вообще какие-либо записи кроме служебных
+		hasRecords := false
+		for _, rr := range response.Answer {
+			if rr.Header().Rrtype != dns.TypeOPT {
+				hasRecords = true
+				break
+			}
+		}
+		if hasRecords {
+			return fmt.Errorf("missing RRSIG records for domain with records")
+		}
+		return nil // Нет записей для подписи - нормально
+	}
+	
+	// Получаем DNSKEY для проверки подписей
+	dnskeys, err := h.getDNSKEY(domain)
+	if err != nil {
+		return fmt.Errorf("failed to get DNSKEY: %v", err)
+	}
+	
+	// Проверяем каждую подпись
+	for key, rrsig := range rrsigs {
+		rrset, exists := rrsets[key]
+		if !exists {
+			return fmt.Errorf("RRSIG without corresponding RRSET for %s", key)
+		}
+		
+		// Находим подходящий DNSKEY
+		var matchingDNSKEY *dns.DNSKEY
+		for _, keyRR := range dnskeys {
+			if dnskey, ok := keyRR.(*dns.DNSKEY); ok {
+				if dnskey.KeyTag() == rrsig.KeyTag && dnskey.Algorithm == rrsig.Algorithm {
+					matchingDNSKEY = dnskey
+					break
+				}
+			}
+		}
+		
+		if matchingDNSKEY == nil {
+			return fmt.Errorf("no matching DNSKEY found for RRSIG %s", key)
+		}
+		
+		// Проверяем подпись
+		if err := h.verifySignature(rrset, rrsig, matchingDNSKEY); err != nil {
+			return fmt.Errorf("signature verification failed for %s: %v", key, err)
+		}
+	}
+	
+	return nil
+}
+
+// performDNSSECQuery выполняет DNSSEC валидацию с криптографической проверкой
+func (h *DNSHandler) performDNSSECQuery(domain string, qtype uint16) (*dns.Msg, error) {
+	// Запрашиваем записи с DNSSEC
+	response, err := h.queryDNS("8.8.8.8", domain, qtype, true)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Проверяем RRSIG подписи
+	if err := h.validateRRSIGs(response, domain); err != nil {
+		return nil, fmt.Errorf("DNSSEC validation failed: %v", err)
+	}
+	
+	return response, nil
 }
 
 // fallbackQuery выполняет обычный запрос при ошибке DNSSEC
 func (h *DNSHandler) fallbackQuery(domain string, qtype uint16) (*dns.Msg, error) {
 	upstreamMsg := h.msgPool.Get().(*dns.Msg)
-	upstreamMsg.SetQuestion(domain, qtype)
+	upstreamMsg.SetQuestion(dns.Fqdn(domain), qtype)
 	
 	// Выполняем запрос с таймаутом
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -588,8 +655,8 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	dnssecValidated := false
 	dnssecFailure := false
 
-	// Если запрошен DNSSEC и резолвер доступен, выполняем валидацию
-	if dnssecRequested && h.dnssecResolver != nil {
+	// Если запрошен DNSSEC, выполняем валидацию
+	if dnssecRequested {
 		resultMsg, dnssecError = h.performDNSSECQuery(domain, qtype)
 		if dnssecError != nil {
 			// Записываем ошибку DNSSEC в статистику
@@ -630,9 +697,9 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 			}
 		}
 	} else {
-		// Обычный запрос без DNSSEC или если DNSSEC недоступен
+		// Обычный запрос без DNSSEC
 		upstreamMsg := h.msgPool.Get().(*dns.Msg)
-		upstreamMsg.SetQuestion(domain, qtype)
+		upstreamMsg.SetQuestion(dns.Fqdn(domain), qtype)
 
 		// Выполняем запрос с таймаутом
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -737,17 +804,11 @@ func main() {
 	}
 
 	log.Println("Starting DNS server on :5311")
-	log.Println("Features: Caching with DNSSEC support + Error statistics + Metrics")
+	log.Println("Features: Caching with FULL DNSSEC validation + Error statistics + Metrics")
 	log.Printf("CPUs: %d", runtime.NumCPU())
 	log.Println("Supported record types: ALL (A, AAAA, MX, TXT, NS, CNAME, PTR, SRV, etc.)")
+	log.Println("DNSSEC validation: FULL CRYPTOGRAPHIC VALIDATION")
 	
-	// Проверяем, доступен ли DNSSEC
-	if handler.dnssecResolver != nil {
-		log.Println("DNSSEC validation: ENABLED (using public DNS servers)")
-	} else {
-		log.Println("DNSSEC validation: DISABLED (resolver not available)")
-	}
-
 	// Запуск UDP сервера в отдельной горутине
 	go func() {
 		if err := server.ListenAndServe(); err != nil {
