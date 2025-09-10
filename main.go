@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"math/rand"
 	"net"
@@ -11,7 +10,6 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -313,7 +311,8 @@ func iterativeResolve(ctx context.Context, qname string, qtype uint16) (*dns.Msg
 		o.Option = append(o.Option, &dns.EDNS0_PADDING{Padding: make([]byte, 128)})
 		m.Extra = append(m.Extra, o)
 
-		in, _, err := dns.ExchangeContext(ctx, m, server)
+		// Исправлено: dns.ExchangeContext возвращает 2 значения
+		in, err := dns.ExchangeContext(ctx, m, server)
 		if err != nil {
 			continue
 		}
