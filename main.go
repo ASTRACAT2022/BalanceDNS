@@ -1,39 +1,43 @@
-// iterative_resolver.go
+// optimized_resolver.go
 package main
 
 import (
 	"context"
+	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/nsmithuk/resolver"
 )
 
 const (
-	ListenPort       = "5454"
-	DefaultCacheTTL  = 300 * time.Second
-	ShardCount       = 256
-	WorkerMultiplier = 50
-	MaxUpstreamConns = 500
-
-	PrefetchInterval   = 30 * time.Second
-	PrefetchThreshold  = 0.1 // обновляем если TTL <10% от исходного
+	ListenPort        = "5454"
+	DefaultCacheTTL   = 300 * time.Second
+	ShardCount        = 256 // power of two recommended
+	DefaultUpstreamTO = 5 * time.Second
+	UDPDefaultSize    = 4096
+	MaxUDPSize        = 65535
+	WorkerMultiplier  = 50 // workers = GOMAXPROCS * multiplier
+	MaxUpstreamConns  = 500 // protect apis/roots from overload
 )
 
+// CacheItem хранит копию dns.Msg и метаданные
 type CacheItem struct {
-	Msg         *dns.Msg
-	ExpireAt    int64
-	Auth        bool
-	OriginalTTL uint32
+	Msg      *dns.Msg
+	ExpireAt int64 // unix nano
+	Auth     bool
 }
 
+// shard for concurrent cache
 type cacheShard struct {
 	sync.RWMutex
 	m map[string]*CacheItem
@@ -51,6 +55,12 @@ func NewShardedCache() *ShardedCache {
 	return &ShardedCache{shards: s}
 }
 
+func (c *ShardedCache) shardFor(key string) *cacheShard {
+	// simple xor-based hash
+	h := fnv32a(key)
+	return c.shards[int(h)&(ShardCount-1)]
+}
+
 func fnv32a(s string) uint32 {
 	const (
 		offset32 = 2166136261
@@ -64,11 +74,6 @@ func fnv32a(s string) uint32 {
 	return h
 }
 
-func (c *ShardedCache) shardFor(key string) *cacheShard {
-	h := fnv32a(key)
-	return c.shards[int(h)&(ShardCount-1)]
-}
-
 func (c *ShardedCache) Get(key string) *dns.Msg {
 	sh := c.shardFor(key)
 	sh.RLock()
@@ -77,13 +82,16 @@ func (c *ShardedCache) Get(key string) *dns.Msg {
 		sh.RUnlock()
 		return nil
 	}
-	if time.Now().UnixNano() > item.ExpireAt {
+	// check expiration
+	if atomic.LoadInt64(&item.ExpireAt) < time.Now().UnixNano() {
 		sh.RUnlock()
+		// Lazy delete
 		sh.Lock()
 		delete(sh.m, key)
 		sh.Unlock()
 		return nil
 	}
+	// return copy to avoid races
 	msg := item.Msg.Copy()
 	if item.Auth {
 		msg.AuthenticatedData = true
@@ -92,32 +100,31 @@ func (c *ShardedCache) Get(key string) *dns.Msg {
 	return msg
 }
 
-func (c *ShardedCache) Set(key string, msg *dns.Msg, auth bool, ttl uint32) {
+func (c *ShardedCache) Set(key string, msg *dns.Msg, auth bool, ttlSeconds uint32) {
 	if msg == nil {
 		return
 	}
 	sh := c.shardFor(key)
 	sh.Lock()
 	sh.m[key] = &CacheItem{
-		Msg:         msg.Copy(),
-		ExpireAt:    time.Now().Add(time.Duration(ttl) * time.Second).UnixNano(),
-		Auth:        auth,
-		OriginalTTL: ttl,
+		Msg:      msg.Copy(),
+		ExpireAt: time.Now().Add(time.Duration(ttlSeconds) * time.Second).UnixNano(),
+		Auth:     auth,
 	}
 	sh.Unlock()
 }
 
 func (c *ShardedCache) CleanupLoop(interval time.Duration, stop <-chan struct{}) {
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 	for {
 		select {
-		case <-t.C:
+		case <-ticker.C:
 			now := time.Now().UnixNano()
 			for _, sh := range c.shards {
 				sh.Lock()
 				for k, v := range sh.m {
-					if v.ExpireAt < now {
+					if atomic.LoadInt64(&v.ExpireAt) < now {
 						delete(sh.m, k)
 					}
 				}
@@ -129,110 +136,105 @@ func (c *ShardedCache) CleanupLoop(interval time.Duration, stop <-chan struct{})
 	}
 }
 
-func (c *ShardedCache) PrefetchLoop(stop <-chan struct{}) {
-	t := time.NewTicker(PrefetchInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-t.C:
-			now := time.Now().UnixNano()
-			for _, sh := range c.shards {
-				sh.RLock()
-				for k, v := range sh.m {
-					remaining := float64(v.ExpireAt-now) / 1e9
-					if remaining <= PrefetchThreshold*float64(v.OriginalTTL) {
-						// запускаем фоновое обновление
-						go prefetchRecord(k, v)
-					}
-				}
-				sh.RUnlock()
-			}
-		case <-stop:
-			return
-		}
-	}
-}
-
+// global state
 var (
-	cache       = NewShardedCache()
+	cache        = NewShardedCache()
+	resolverPool = sync.Pool{
+		New: func() any {
+			// configure resolver with reasonable defaults; the resolver package
+			// will use system roots / defaults but you may configure custom transports here.
+			return resolver.NewResolver()
+		},
+	}
 	upstreamSem = make(chan struct{}, MaxUpstreamConns)
-	workerWG    sync.WaitGroup
-	stopCh      = make(chan struct{})
+	upstreamTO  = DefaultUpstreamTO
+
+	workerWG sync.WaitGroup
+	stopCh   = make(chan struct{})
+	stats    = struct {
+		hits    uint64
+		misses  uint64
+		queries uint64
+	}{}
 )
 
+func main() {
+	runtime.GOMAXPROCS(runtime.GOMAXPROCS(0)) // keep default
+	workers := runtime.GOMAXPROCS(0) * WorkerMultiplier
+	queueSize := 100000 // large queue; backpressure handled by UDP handler
+
+	requestQueue := make(chan *Request, queueSize)
+
+	// start cleanup
+	go cache.CleanupLoop(30*time.Second, stopCh)
+
+	// start workers
+	for i := 0; i < workers; i++ {
+		workerWG.Add(1)
+		go worker(requestQueue)
+	}
+
+	// graceful shutdown
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	udpServer := &dns.Server{
+		Addr:    ":" + ListenPort,
+		Net:     "udp",
+		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) { enqueue(requestQueue, w, r) }),
+		UDPSize: UDPDefaultSize,
+	}
+
+	tcpServer := &dns.Server{
+		Addr:    ":" + ListenPort,
+		Net:     "tcp",
+		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) { enqueue(requestQueue, w, r) }),
+	}
+
+	go func() {
+		log.Printf("Starting UDP server on :%s", ListenPort)
+		if err := udpServer.ListenAndServe(); err != nil {
+			log.Fatalf("UDP ListenAndServe: %v", err)
+		}
+	}()
+
+	go func() {
+		log.Printf("Starting TCP server on :%s", ListenPort)
+		if err := tcpServer.ListenAndServe(); err != nil {
+			log.Fatalf("TCP ListenAndServe: %v", err)
+		}
+	}()
+
+	log.Printf("Workers: %d, QueueSize: %d, UpstreamLimit: %d", workers, queueSize, MaxUpstreamConns)
+
+	<-sig
+	log.Println("Shutting down...")
+
+	// stop servers
+	_ = udpServer.Shutdown()
+	_ = tcpServer.Shutdown()
+
+	// stop workers
+	close(requestQueue)
+	workerWG.Wait()
+
+	// stop cleanup
+	close(stopCh)
+	log.Println("Shutdown complete")
+}
+
+// Request wrapper
 type Request struct {
 	w dns.ResponseWriter
 	r *dns.Msg
 }
 
-var rootServers = []string{
-	"a.root-servers.net:53",
-	"b.root-servers.net:53",
-	"c.root-servers.net:53",
-	"d.root-servers.net:53",
-	"e.root-servers.net:53",
-	"f.root-servers.net:53",
-	"g.root-servers.net:53",
-	"h.root-servers.net:53",
-	"i.root-servers.net:53",
-	"j.root-servers.net:53",
-	"k.root-servers.net:53",
-	"l.root-servers.net:53",
-	"m.root-servers.net:53",
-}
-
-func main() {
-	workers := WorkerMultiplier
-	queue := make(chan *Request, 10000)
-
-	go cache.CleanupLoop(30*time.Second, stopCh)
-	go cache.PrefetchLoop(stopCh)
-
-	for i := 0; i < workers; i++ {
-		workerWG.Add(1)
-		go worker(queue)
-	}
-
-	udpServer := &dns.Server{
-		Addr:    ":" + ListenPort,
-		Net:     "udp",
-		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) { enqueue(queue, w, r) }),
-		UDPSize: 4096,
-	}
-	tcpServer := &dns.Server{
-		Addr:    ":" + ListenPort,
-		Net:     "tcp",
-		Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) { enqueue(queue, w, r) }),
-	}
-
-	go func() {
-		if err := udpServer.ListenAndServe(); err != nil {
-			log.Fatal(err)
-		}
-	}()
-	go func() {
-		if err := tcpServer.ListenAndServe(); err != nil {
-			log.Fatal(err)
-		}
-	}()
-
-	log.Println("DNS Recursive Resolver with Prefetch running on port", ListenPort)
-
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-
-	_ = udpServer.Shutdown()
-	_ = tcpServer.Shutdown()
-	close(queue)
-	workerWG.Wait()
-	close(stopCh)
-}
-
+// enqueue with drop policy when full (returns RcodeRefused)
 func enqueue(queue chan *Request, w dns.ResponseWriter, r *dns.Msg) {
 	select {
-	case queue <- &Request{w, r}:
+	case queue <- &Request{w: w, r: r}:
 	default:
+		// queue full -> refuse
 		reply := new(dns.Msg)
 		reply.SetReply(r)
 		reply.SetRcode(r, dns.RcodeRefused)
@@ -243,11 +245,18 @@ func enqueue(queue chan *Request, w dns.ResponseWriter, r *dns.Msg) {
 func worker(queue chan *Request) {
 	defer workerWG.Done()
 	for req := range queue {
+		if req == nil || req.r == nil {
+			continue
+		}
 		process(req.w, req.r)
 	}
 }
 
+// process - core request handling (fast path for cache)
 func process(w dns.ResponseWriter, r *dns.Msg) {
+	atomic.AddUint64(&stats.queries, 1)
+
+	// basic validation
 	if len(r.Question) == 0 {
 		reply := new(dns.Msg)
 		reply.SetReply(r)
@@ -256,18 +265,58 @@ func process(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
+	// build cache key
 	q := r.Question[0]
-	cacheKey := strings.ToLower(q.Name) + ":" + dns.TypeToString[q.Qtype]
+	qname := strings.ToLower(q.Name)
+	qtype := dns.TypeToString[q.Qtype]
+	cacheKey := qname + ":" + qtype
+
+	// check cache
 	if msg := cache.Get(cacheKey); msg != nil {
+		atomic.AddUint64(&stats.hits, 1)
 		msg.Id = r.Id
-		_ = w.WriteMsg(msg)
+		msg.Response = true
+		// set AD flag already preserved on Get
+		writeWithDeadline(w, msg)
 		return
 	}
+	atomic.AddUint64(&stats.misses, 1)
 
+	// get resolver from pool
+	res := resolverPool.Get().(*resolver.Resolver)
+	defer resolverPool.Put(res)
+
+	// limit concurrent upstream queries with semaphore
 	select {
 	case upstreamSem <- struct{}{}:
-		defer func() { <-upstreamSem }()
+		// got slot
 	default:
+		// upstream overloaded, respond SERVFAIL immediately
+		reply := new(dns.Msg)
+		reply.SetReply(r)
+		reply.SetRcode(r, dns.RcodeServerFailure)
+		_ = w.WriteMsg(reply)
+		return
+	}
+	// release slot at end
+	defer func() { <-upstreamSem }()
+
+	// prepare message for upstream
+	msg := new(dns.Msg)
+	msg.SetQuestion(q.Name, q.Qtype)
+	isTCP := w.RemoteAddr().Network() == "tcp"
+
+	udpSize := uint16(UDPDefaultSize)
+	if isTCP {
+		udpSize = MaxUDPSize
+	}
+	msg.SetEdns0(udpSize, true) // set DO bit for DNSSEC
+
+	ctx, cancel := context.WithTimeout(context.Background(), upstreamTO)
+	defer cancel()
+
+	result := res.Exchange(ctx, msg)
+	if result.Err != nil || result.Msg == nil {
 		reply := new(dns.Msg)
 		reply.SetReply(r)
 		reply.SetRcode(r, dns.RcodeServerFailure)
@@ -275,117 +324,56 @@ func process(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	resp, ttl := iterativeResolve(ctx, q.Name, q.Qtype)
-	if resp == nil {
-		reply := new(dns.Msg)
-		reply.SetReply(r)
-		reply.SetRcode(r, dns.RcodeServerFailure)
-		_ = w.WriteMsg(reply)
-		return
+	// check auth (resolver returns Auth field as int; treat 1 = secure)
+	isAuthenticated := result.Auth == 1
+	if isAuthenticated {
+		result.Msg.AuthenticatedData = true
 	}
 
-	resp.Id = r.Id
-	resp.Response = true
-	cache.Set(cacheKey, resp, false, ttl)
+	// determine TTL to cache (min of answers or default)
+	ttl := uint32(DefaultCacheTTL / time.Second)
+	if len(result.Msg.Answer) > 0 {
+		for _, rr := range result.Msg.Answer {
+			h := rr.Header()
+			if h.Ttl > 0 && h.Ttl < ttl {
+				ttl = h.Ttl
+			}
+		}
+	}
+	// shorten TTL for DNSSEC-authenticated if desired (example)
+	if isAuthenticated && ttl > 300 {
+		ttl = 300
+	}
 
-	_ = w.WriteMsg(resp)
+	// store to cache
+	cache.Set(cacheKey, result.Msg, isAuthenticated, ttl)
+
+	// prepare reply
+	result.Msg.Id = r.Id
+	result.Msg.Response = true
+
+	// UDP truncation handling (miekg/dns will do Truncate if Len>udp size)
+	if !isTCP {
+		// we already asked for EDNS0 size; but still ensure truncation
+		if result.Msg.Len() > int(udpSize) {
+			result.Msg.Truncate(int(udpSize))
+		}
+	}
+
+	writeWithDeadline(w, result.Msg)
 }
 
-func iterativeResolve(ctx context.Context, qname string, qtype uint16) (*dns.Msg, uint32) {
-	servers := make([]string, len(rootServers))
-	copy(servers, rootServers)
-
-	for {
-		server := servers[rand.Intn(len(servers))]
-
-		m := new(dns.Msg)
-		m.SetQuestion(qname, qtype)
-		o := new(dns.OPT)
-		o.Hdr.Name = "."
-		o.Hdr.Rrtype = dns.TypeOPT
-		o.SetDo()
-		o.SetUDPSize(4096)
-		o.Option = append(o.Option, &dns.EDNS0_PADDING{Padding: make([]byte, 128)})
-		m.Extra = append(m.Extra, o)
-
-		// Исправлено: dns.ExchangeContext возвращает 2 значения
-		in, err := dns.ExchangeContext(ctx, m, server)
-		if err != nil {
-			continue
-		}
-		if in.Rcode != dns.RcodeSuccess && in.Rcode != dns.RcodeNameError {
-			continue
-		}
-
-		if in.Rcode == dns.RcodeNameError || (len(in.Answer) == 0 && len(in.Ns) > 0) {
-			return in, 60
-		}
-
-		if len(in.Answer) > 0 {
-			ttl := uint32(DefaultCacheTTL.Seconds())
-			for _, rr := range in.Answer {
-				if rr.Header().Ttl < ttl {
-					ttl = rr.Header().Ttl
-				}
-			}
-			return in, ttl
-		}
-
-		var ns []string
-		for _, rr := range in.Ns {
-			if rr.Header().Rrtype == dns.TypeNS {
-				ns = append(ns, rr.(*dns.NS).Ns)
-			}
-		}
-		var addrs []string
-		for _, rr := range in.Extra {
-			switch a := rr.(type) {
-			case *dns.A:
-				addrs = append(addrs, net.JoinHostPort(a.A.String(), "53"))
-			case *dns.AAAA:
-				addrs = append(addrs, net.JoinHostPort(a.AAAA.String(), "53"))
-			}
-		}
-		if len(addrs) > 0 {
-			servers = addrs
-		} else if len(ns) > 0 {
-			servers = make([]string, 0, len(ns))
-			for _, n := range ns {
-				servers = append(servers, n+":53")
-			}
-		} else {
-			return in, 60
+// writeWithDeadline sets a short write deadline to avoid slow clients stalling writers
+func writeWithDeadline(w dns.ResponseWriter, msg *dns.Msg) {
+	// set a small write deadline (helps under high QPS with slow clients)
+	if conn, ok := w.RemoteAddr().(*net.TCPAddr); ok && conn != nil {
+		// for TCP set deadline on underlying conn if possible
+		// dns.ResponseWriter might implement SetWriteDeadline; try type assertion
+		if sd, ok := w.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			_ = sd.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		}
 	}
-}
+	// UDP underlying writer doesn't implement SetWriteDeadline via iface reliably, so ignore
 
-// Prefetch обновляет запись в кэше до истечения TTL
-func prefetchRecord(key string, item *CacheItem) {
-	select {
-	case upstreamSem <- struct{}{}:
-		defer func() { <-upstreamSem }()
-	default:
-		return
-	}
-
-	qParts := strings.SplitN(key, ":", 2)
-	if len(qParts) != 2 {
-		return
-	}
-	qname, qtypeStr := qParts[0], qParts[1]
-	qtype, ok := dns.StringToType[qtypeStr]
-	if !ok {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	resp, ttl := iterativeResolve(ctx, qname, qtype)
-	if resp != nil {
-		cache.Set(key, resp, false, ttl)
-	}
+	_ = w.WriteMsg(msg)
 }
