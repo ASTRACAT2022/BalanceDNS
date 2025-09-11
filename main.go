@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"runtime"
