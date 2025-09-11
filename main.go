@@ -1,4 +1,4 @@
-// optimized_resolver_zero_copy.go
+// main.go — безопасный вариант: только WriteMsg, логирование ошибок
 package main
 
 import (
@@ -18,26 +18,28 @@ import (
 )
 
 const (
-	ListenPort        = "5454"
-	DefaultCacheTTL   = 300 * time.Second
-	ShardCount        = 256
-	DefaultUpstreamTO = 5 * time.Second
-	UDPDefaultSize    = 4096
-	MaxUDPSize        = 65535
-	WorkerMultiplier  = 50
-	MaxUpstreamConns  = 500
+	ListenPort           = "5454"
+	DefaultCacheTTL      = 300 * time.Second
+	ShardCount           = 256
+	DefaultUpstreamTO    = 5 * time.Second
+	RootUpstreamTO       = 10 * time.Second
+	UDPDefaultSize       = 4096
+	MaxUDPSize           = 65535
+	WorkerMultiplier     = 20
+	MaxUpstreamConns     = 1000
+	RootMaxUpstreamConns = 2000
+	QueueSizeDefault     = 100000
 )
 
-// CacheItem now stores packed wire bytes to avoid repeated Pack/Copy.
 type CacheItem struct {
-	Wire     []byte // packed DNS wire format, header bytes included
-	ExpireAt int64  // unix nano
+	Wire     []byte
+	ExpireAt int64
 	Auth     bool
 }
 
 type cacheShard struct {
 	sync.RWMutex
-	m map[string]*CacheItem
+	m map[uint64]*CacheItem
 }
 
 type ShardedCache struct {
@@ -47,44 +49,46 @@ type ShardedCache struct {
 func NewShardedCache() *ShardedCache {
 	s := make([]*cacheShard, ShardCount)
 	for i := 0; i < ShardCount; i++ {
-		s[i] = &cacheShard{m: make(map[string]*CacheItem)}
+		s[i] = &cacheShard{m: make(map[uint64]*CacheItem)}
 	}
 	return &ShardedCache{shards: s}
 }
 
-func fnv32a(s string) uint32 {
+func fnv64aLower(s string) uint64 {
 	const (
-		offset32 = 2166136261
-		prime32  = 16777619
+		offset64 = uint64(14695981039346656037)
+		prime64  = uint64(1099511628211)
 	)
-	var h uint32 = offset32
+	var h uint64 = offset64
 	for i := 0; i < len(s); i++ {
-		h ^= uint32(s[i])
-		h *= prime32
+		b := s[i]
+		if b >= 'A' && b <= 'Z' {
+			b += 32
+		}
+		h ^= uint64(b)
+		h *= prime64
 	}
 	return h
 }
 
-func (c *ShardedCache) shardFor(key string) *cacheShard {
-	h := fnv32a(key)
+func (c *ShardedCache) shardForHash(h uint64) *cacheShard {
 	return c.shards[int(h)&(ShardCount-1)]
 }
 
-func (c *ShardedCache) Get(key string) *CacheItem {
-	sh := c.shardFor(key)
+func (c *ShardedCache) GetHashKey(hash uint64) *CacheItem {
+	sh := c.shardForHash(hash)
 	sh.RLock()
-	item, ok := sh.m[key]
+	item, ok := sh.m[hash]
 	if !ok {
 		sh.RUnlock()
 		return nil
 	}
-	// expiration check under RLock (Set writes under Lock)
-	if item.ExpireAt < time.Now().UnixNano() {
+	now := time.Now().UnixNano()
+	if item.ExpireAt < now {
 		sh.RUnlock()
-		// promote to write lock to delete stale entry
 		sh.Lock()
-		if v, ok2 := sh.m[key]; ok2 && v.ExpireAt < time.Now().UnixNano() {
-			delete(sh.m, key)
+		if v, ok2 := sh.m[hash]; ok2 && v.ExpireAt < now {
+			delete(sh.m, hash)
 		}
 		sh.Unlock()
 		return nil
@@ -93,25 +97,15 @@ func (c *ShardedCache) Get(key string) *CacheItem {
 	return item
 }
 
-// Set will pack msg to wire and store the wire bytes
-func (c *ShardedCache) Set(key string, msg *dns.Msg, auth bool, ttlSeconds uint32) {
-	if msg == nil {
-		return
-	}
-	// Pack with large size (MaxUDPSize) to keep full message in cache.
-	wire, err := msg.Pack()
-	if err != nil {
-		// packing failed, skip cache store
+func (c *ShardedCache) SetHashKey(hash uint64, wire []byte, auth bool, ttlSeconds uint32) {
+	if wire == nil {
 		return
 	}
 	exp := time.Now().Add(time.Duration(ttlSeconds) * time.Second).UnixNano()
-	sh := c.shardFor(key)
+	sh := c.shardForHash(hash)
 	sh.Lock()
-	// store a copy of wire to ensure immutability
-	newWire := make([]byte, len(wire))
-	copy(newWire, wire)
-	sh.m[key] = &CacheItem{
-		Wire:     newWire,
+	sh.m[hash] = &CacheItem{
+		Wire:     wire,
 		ExpireAt: exp,
 		Auth:     auth,
 	}
@@ -151,13 +145,14 @@ var (
 		New: func() any { return &Request{} },
 	}
 
-	// small pool for temporary small buffers (not crucial, but helps)
-	bufPool = sync.Pool{
-		New: func() any { return make([]byte, 0, 512) },
+	msgPool = sync.Pool{
+		New: func() any { return new(dns.Msg) },
 	}
 
-	upstreamSem = make(chan struct{}, MaxUpstreamConns)
-	upstreamTO  = DefaultUpstreamTO
+	upstreamSem     = make(chan struct{}, MaxUpstreamConns)
+	rootUpstreamSem = make(chan struct{}, RootMaxUpstreamConns)
+
+	upstreamTO = DefaultUpstreamTO
 
 	workerWG sync.WaitGroup
 	stopCh   = make(chan struct{})
@@ -171,7 +166,7 @@ var (
 func main() {
 	_ = runtime.GOMAXPROCS(runtime.GOMAXPROCS(0))
 	workers := runtime.GOMAXPROCS(0) * WorkerMultiplier
-	queueSize := 100000
+	queueSize := QueueSizeDefault
 	requestQueue := make(chan *Request, queueSize)
 
 	go cache.CleanupLoop(30*time.Second, stopCh)
@@ -209,7 +204,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("Workers: %d, QueueSize: %d, UpstreamLimit: %d", workers, queueSize, MaxUpstreamConns)
+	log.Printf("Workers: %d, QueueSize: %d, UpstreamLimit: %d, RootUpstreamLimit: %d", workers, queueSize, MaxUpstreamConns, RootMaxUpstreamConns)
 
 	<-sig
 	log.Println("Shutting down...")
@@ -262,6 +257,11 @@ func worker(queue chan *Request) {
 	}
 }
 
+func isRootQuestion(q dns.Question) bool {
+	name := strings.TrimSpace(q.Name)
+	return name == "." || name == ""
+}
+
 func process(w dns.ResponseWriter, r *dns.Msg) {
 	atomic.AddUint64(&stats.queries, 1)
 
@@ -274,40 +274,15 @@ func process(w dns.ResponseWriter, r *dns.Msg) {
 	}
 
 	q := r.Question[0]
-	qname := strings.ToLower(q.Name)
-	qtype := dns.TypeToString[q.Qtype]
-	cacheKey := qname + ":" + qtype
+	nameHash := fnv64aLower(q.Name)
+	keyHash := nameHash ^ (uint64(q.Qtype) << 32)
 
-	// fast cached wire path
-	if item := cache.Get(cacheKey); item != nil {
+	// cache hit: unpack -> set Id -> WriteMsg (no raw writes)
+	if item := cache.GetHashKey(keyHash); item != nil {
 		atomic.AddUint64(&stats.hits, 1)
-		// item.Wire is immutable slice owned by cache
-		// We need to set request ID. Instead of copying full slice, we write:
-		// 1) ID bytes (2)
-		// 2) rest of wire (from byte index 2)
-		// This avoids allocating full copy to change first two bytes.
-		id := r.Id
-		idb := [2]byte{byte(id >> 8), byte(id & 0xff)}
-
-		// check if we need to truncate for UDP
-		isTCP := w.RemoteAddr().Network() == "tcp"
-		udpSize := uint16(UDPDefaultSize)
-		if isTCP {
-			udpSize = MaxUDPSize
-		}
-		// fast path: if len fits UDP size or connection is TCP -> just write as two writes
-		if isTCP || len(item.Wire) <= int(udpSize) {
-			// Attempt to write without extra copies:
-			// Some dns.ResponseWriters may buffer/expect WriteMsg, but ResponseWriter implements io.Writer in miekg/dns.
-			// We ignore write errors here (like previous code).
-			_, _ = w.Write(idb[:])
-			_, _ = w.Write(item.Wire[2:])
-			return
-		}
-		// else: wire too large for UDP -> parse and truncate (rare)
 		var parsed dns.Msg
 		if err := parsed.Unpack(item.Wire); err != nil {
-			// fallback: send SERVFAIL
+			log.Printf("cache unpack error: %v", err)
 			reply := new(dns.Msg)
 			reply.SetReply(r)
 			reply.SetRcode(r, dns.RcodeServerFailure)
@@ -316,49 +291,74 @@ func process(w dns.ResponseWriter, r *dns.Msg) {
 		}
 		parsed.Id = r.Id
 		parsed.Response = true
-		parsed.Truncate(int(udpSize))
-		// set AD if cached as auth
 		if item.Auth {
 			parsed.AuthenticatedData = true
 		}
-		_ = w.WriteMsg(&parsed)
+
+		isTCP := false
+		if addr := w.RemoteAddr(); addr != nil && addr.Network() == "tcp" {
+			isTCP = true
+		}
+		udpSize := uint16(UDPDefaultSize)
+		if isTCP {
+			udpSize = MaxUDPSize
+		}
+		if !isTCP && parsed.Len() > int(udpSize) {
+			parsed.Truncate(int(udpSize))
+		}
+		if err := w.WriteMsg(&parsed); err != nil {
+			log.Printf("WriteMsg (cache hit) error: %v", err)
+		}
 		return
 	}
 	atomic.AddUint64(&stats.misses, 1)
 
-	// get resolver
-	res := resolverPool.Get().(*resolver.Resolver)
+	// choose sem & timeout
+	useRootSem := isRootQuestion(q)
+	var sem chan struct{}
+	var timeout time.Duration
+	if useRootSem {
+		sem = rootUpstreamSem
+		timeout = RootUpstreamTO
+	} else {
+		sem = upstreamSem
+		timeout = upstreamTO
+	}
 
-	// upstream semaphore
 	select {
-	case upstreamSem <- struct{}{}:
+	case sem <- struct{}{}:
 	default:
-		resolverPool.Put(res)
 		reply := new(dns.Msg)
 		reply.SetReply(r)
 		reply.SetRcode(r, dns.RcodeServerFailure)
 		_ = w.WriteMsg(reply)
 		return
 	}
+	defer func() { <-sem }()
 
-	// prepare upstream query
-	msg := new(dns.Msg)
+	res := resolverPool.Get().(*resolver.Resolver)
+	defer resolverPool.Put(res)
+
+	msg := msgPool.Get().(*dns.Msg)
+	*msg = dns.Msg{}
 	msg.SetQuestion(q.Name, q.Qtype)
-	isTCP := w.RemoteAddr().Network() == "tcp"
+	isTCP := false
+	if addr := w.RemoteAddr(); addr != nil && addr.Network() == "tcp" {
+		isTCP = true
+	}
 	udpSize := uint16(UDPDefaultSize)
 	if isTCP {
 		udpSize = MaxUDPSize
 	}
 	msg.SetEdns0(udpSize, true)
 
-	ctx, cancel := context.WithTimeout(context.Background(), upstreamTO)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	result := res.Exchange(ctx, msg)
 	cancel()
-	// return resolver asap
-	resolverPool.Put(res)
-	<-upstreamSem
+	msgPool.Put(msg)
 
 	if result.Err != nil || result.Msg == nil {
+		log.Printf("upstream error: %v", result.Err)
 		reply := new(dns.Msg)
 		reply.SetReply(r)
 		reply.SetRcode(r, dns.RcodeServerFailure)
@@ -371,7 +371,6 @@ func process(w dns.ResponseWriter, r *dns.Msg) {
 		result.Msg.AuthenticatedData = true
 	}
 
-	// determine TTL
 	ttl := uint32(DefaultCacheTTL / time.Second)
 	if len(result.Msg.Answer) > 0 {
 		for _, rr := range result.Msg.Answer {
@@ -385,10 +384,13 @@ func process(w dns.ResponseWriter, r *dns.Msg) {
 		ttl = 300
 	}
 
-	// store in cache as packed wire
-	cache.Set(cacheKey, result.Msg, isAuthenticated, ttl)
+	wire, err := result.Msg.Pack()
+	if err == nil {
+		cache.SetHashKey(keyHash, wire, isAuthenticated, ttl)
+	} else {
+		log.Printf("pack error: %v", err)
+	}
 
-	// send reply (normal path)
 	result.Msg.Id = r.Id
 	result.Msg.Response = true
 	if !isTCP {
@@ -396,5 +398,7 @@ func process(w dns.ResponseWriter, r *dns.Msg) {
 			result.Msg.Truncate(int(udpSize))
 		}
 	}
-	_ = w.WriteMsg(result.Msg)
+	if err := w.WriteMsg(result.Msg); err != nil {
+		log.Printf("WriteMsg (upstream reply) error: %v", err)
+	}
 }
