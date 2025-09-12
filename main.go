@@ -87,6 +87,9 @@ type CacheItem struct {
 	Data     interface{}
 	ExpireAt int64
 	Type     int
+	// Add a field to explicitly store the Authenticated status if needed,
+	// although we can often rely on the msg's AD flag if cached correctly.
+	// IsAuthenticated bool
 }
 
 // ServerStats holds various server statistics
@@ -178,7 +181,7 @@ type Request struct {
 // upstreamResult returned via singleflight
 type upstreamResult struct {
 	Msg  *dns.Msg
-	Auth bool // This will be the upstream AD flag
+	Auth bool // This will be the upstream AD flag or our interpretation of security
 	TTL  uint32
 }
 
@@ -789,7 +792,7 @@ func queryRecursive(ctx context.Context, name string, qtype uint16, servers []st
 	// Создаем запрос один раз
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(name), qtype)
-	m.SetEdns0(4096, true) // Request DNSSEC data
+	m.SetEdns0(4096, true) // Request DNSSEC data (upstream might set AD if validated)
 
 	// Канал для получения первого результата
 	resultChan := make(chan struct {
@@ -840,13 +843,18 @@ func queryRecursive(ctx context.Context, name string, qtype uint16, servers []st
 				return
 			}
 
+			// --- Use Upstream AD Flag ---
+			// This is the core of the "improved" approach: trust the AD flag from the upstream resolver
+			// if it was able to validate. This is not full validation but uses the information provided.
+			isAuth := in.AuthenticatedData
+			// --- End Use Upstream AD Flag ---
+
 			switch in.Rcode {
 			case dns.RcodeSuccess:
 				hasAnswer := len(in.Answer) > 0
 				hasAuthority := len(in.Ns) > 0
 
 				if hasAnswer {
-					isAuth := in.AuthenticatedData
 					logDebug("Parallel query got answer from %s for %s %s, AD=%v", server, name, dns.TypeToString[qtype], isAuth)
 					select {
 					case resultChan <- struct {
@@ -859,7 +867,6 @@ func queryRecursive(ctx context.Context, name string, qtype uint16, servers []st
 					}
 					return
 				} else if hasAuthority {
-					isAuth := in.AuthenticatedData
 					logDebug("Parallel query got referral/NXDOMAIN from %s for %s %s, AD=%v", server, name, dns.TypeToString[qtype], isAuth)
 					select {
 					case resultChan <- struct {
@@ -878,7 +885,7 @@ func queryRecursive(ctx context.Context, name string, qtype uint16, servers []st
 						msg  *dns.Msg
 						auth bool
 						err  error
-					}{msg: in, auth: false, err: nil}: // err=nil
+					}{msg: in, auth: isAuth, err: nil}: // err=nil
 						atomic.StoreInt32(&done, 1)
 					default:
 					}
@@ -890,9 +897,9 @@ func queryRecursive(ctx context.Context, name string, qtype uint16, servers []st
 				select {
 				case resultChan <- struct {
 					msg  *dns.Msg
-					auth bool
+					auth bool // Still pass the AD flag, NXDOMAIN can be validated
 					err  error
-				}{msg: in, auth: false, err: nil}: // NXDOMAIN это валидный ответ, err=nil
+				}{msg: in, auth: isAuth, err: nil}: // NXDOMAIN это валидный ответ, err=nil
 					atomic.StoreInt32(&done, 1)
 				default:
 				}
@@ -901,10 +908,9 @@ func queryRecursive(ctx context.Context, name string, qtype uint16, servers []st
 			case dns.RcodeServerFailure:
 				logDebug("Parallel query SERVFAIL from %s for %s %s", server, name, dns.TypeToString[qtype])
 				// SERVFAIL от сервера - это ошибка ответа, не сетевая ошибка.
-				// Мы можем вернуть его, или попробовать другой сервер.
-				// Для простоты, пробуем следующий сервер.
-				// Но если все серверы вернут SERVFAIL, нужно как-то это обработать.
-				// Пока просто логируем и продолжаем.
+				// We can still pass the AD flag if it was set before the failure occurred,
+				// but often SERVFAIL means validation failed upstream.
+				// For simplicity, we don't treat it specially here, just log and try next.
 				return // Пробуем следующий сервер
 
 			default:
@@ -915,7 +921,7 @@ func queryRecursive(ctx context.Context, name string, qtype uint16, servers []st
 					msg  *dns.Msg
 					auth bool
 					err  error
-				}{msg: in, auth: false, err: nil}: // err=nil, так как это ответ сервера
+				}{msg: in, auth: isAuth, err: nil}: // err=nil, так как это ответ сервера
 					atomic.StoreInt32(&done, 1)
 				default:
 				}
@@ -1077,31 +1083,28 @@ func queryRecursive(ctx context.Context, name string, qtype uint16, servers []st
 			if len(nextServers) > 0 {
 				logDebug("Following referral for %s %s to %v (improved)", name, dns.TypeToString[qtype], nextServers)
 				// Создаем новый glueCache для следующего уровня рекурсии
-				// Он будет содержать glue из текущего ответа, относящийся к следующему уровню
 				newGlueCache := make(map[string][]string)
-				// Заполняем новый glueCache glue-записями из Additional секции
-				// которые относятся к NS в Authority секции *следующего* уровня.
-				// Это сложно сделать точно без знания следующего уровня.
-				// Упрощаем: передаем glue, найденный для текущих NS, на следующий уровень.
-				// Это не идеально, но может помочь.
 				for nsName, addrs := range glueFromResponse {
 					newGlueCache[nsName] = addrs
 				}
-				// Также передаем glue из оригинального glueCache
 				if glueCache != nil {
 					for k, v := range glueCache {
 						newGlueCache[k] = v
 					}
 				}
 				// Рекурсивный вызов
-				return queryRecursive(ctx, name, qtype, nextServers, newGlueCache, depth+1)
+				// Pass the auth status from the referral response
+				nextMsg, nextAuth, nextErr := queryRecursive(ctx, name, qtype, nextServers, newGlueCache, depth+1)
+				return nextMsg, nextAuth, nextErr // Return the final auth status
 			} else {
 				logError("No referral targets found (even after resolving NS) for %s %s", name, dns.TypeToString[qtype])
 				// Возвращаем исходный ответ (referral или NXDOMAIN)
+				// Return the auth status associated with the referral response.
 				return res.msg, res.auth, nil
 			}
 		}
 		// Иначе возвращаем финальный ответ (Answer section не пуст или это NXDOMAIN)
+		// The 'auth' field here is the upstream AD flag.
 		return res.msg, res.auth, nil
 
 	case <-doneChan:
@@ -1143,10 +1146,16 @@ func process(w dns.ResponseWriter, r *dns.Msg) {
 			reply := cachedMsg.Copy()
 			reply.Id = r.Id
 			reply.Response = true
-			// Set AD flag based on the cached upstream AD flag
+			// --- Set AD flag based on cached message's AD flag ---
+			// This relies on the AD flag being correctly set when the message was cached.
 			if cachedMsg.AuthenticatedData {
 				reply.AuthenticatedData = true
+				logDebug("Setting AD flag from CACHED MESSAGE AD flag for %s %s", q.Name, dns.TypeToString[q.Qtype])
+			} else {
+				reply.AuthenticatedData = false
+				logDebug("NOT setting AD flag from CACHED MESSAGE AD flag for %s %s", q.Name, dns.TypeToString[q.Qtype])
 			}
+			// --- End Set AD flag ---
 
 			isTCP := false
 			if addr := w.RemoteAddr(); addr != nil && addr.Network() == "tcp" {
@@ -1211,6 +1220,7 @@ func process(w dns.ResponseWriter, r *dns.Msg) {
 			}
 		}
 		// Применяем ограничение TTL для авторитетных записей
+		// Only apply short TTL if the data is authenticated
 		if isAuth && ttl > 300 {
 			ttl = 300
 		}
@@ -1245,13 +1255,15 @@ func process(w dns.ResponseWriter, r *dns.Msg) {
 	reply := ur.Msg.Copy()
 	reply.Id = r.Id
 	reply.Response = true
-	// Set AD flag based on the upstream resolver's AD flag
+	// --- Set AD flag based on the resolution result ---
+	// Set AD flag based on the upstream resolver's AD flag or our interpretation
 	if ur.Auth {
 		reply.AuthenticatedData = true
-		logDebug("Setting AD flag in response for %s %s", q.Name, dns.TypeToString[q.Qtype])
+		logDebug("Setting AD flag in response for %s %s (upstream/authenticated)", q.Name, dns.TypeToString[q.Qtype])
 	} else {
-		logDebug("NOT setting AD flag in response for %s %s", q.Name, dns.TypeToString[q.Qtype])
+		logDebug("NOT setting AD flag in response for %s %s (not authenticated/upstream)", q.Name, dns.TypeToString[q.Qtype])
 	}
+	// --- End Set AD flag ---
 
 	isTCP := false
 	if addr := w.RemoteAddr(); addr != nil && addr.Network() == "tcp" {
