@@ -1,162 +1,180 @@
-// main.go
 package main
 
 import (
+	"container/list"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/golang/groupcache/lru"
 	"github.com/miekg/dns"
-	"github.com/miekg/unbound"
 )
 
-// CacheEntry представляет запись в кэше
-type CacheEntry struct {
-	Msg      *dns.Msg
-	ExpireAt int64 // Unix timestamp
-}
-
-// ValidationError ошибка валидации DNSSEC
+// ValidationError represents DNSSEC validation error
 type ValidationError struct {
 	Reason string
+	Err    error
 }
 
 func (e *ValidationError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("DNSSEC validation error (%s): %v", e.Reason, e.Err)
+	}
 	return fmt.Sprintf("DNSSEC validation error: %s", e.Reason)
 }
 
-// ErrorStats статистика ошибок по доменам
+// ErrorStats tracks error statistics
 type ErrorStats struct {
 	errors map[string]int64
 	mutex  sync.RWMutex
 }
 
-// DNSHandler обрабатывает DNS-запросы
+// DNSHandler handles DNS queries
 type DNSHandler struct {
-	// Кэши
-	cache    *lru.Cache
-	cacheMu  sync.RWMutex
-	cacheTTL int64
-
-	// Unbound context (libunbound wrapper)
-	u *unbound.Unbound
-
-	// Статистика
-	errorStats *ErrorStats
-
-	// Метрики
+	cache           *LRUCache
+	cacheTTL        int64
+	cacheMu         sync.RWMutex
+	errorStats      *ErrorStats
 	totalQueries    int64
 	cachedQueries   int64
 	dnssecQueries   int64
 	validationError int64
+	client          *dns.Client
+	rootServers     []string
+	enableDNSSEC    bool
+	strictDNSSEC    bool
 }
 
-// NewDNSHandler создает новый обработчик
+// NewDNSHandler creates new DNS handler
 func NewDNSHandler() *DNSHandler {
-	h := &DNSHandler{
-		cache:    lru.New(30000),
+	handler := &DNSHandler{
+		cache: NewLRUCache(30000),
 		cacheTTL: 300,
-		errorStats: &ErrorStats{
-			errors: make(map[string]int64),
+		errorStats: &ErrorStats{errors: make(map[string]int64)},
+		client: &dns.Client{
+			Net:          "udp",
+			UDPSize:      4096,
+			ReadTimeout:  2 * time.Second,
+			WriteTimeout: 2 * time.Second,
 		},
+		rootServers: []string{
+			"198.41.0.4:53",    // a.root-servers.net
+			"199.9.14.201:53",  // b.root-servers.net
+			"192.33.4.12:53",   // c.root-servers.net
+			"199.7.91.13:53",   // d.root-servers.net
+			"192.203.230.10:53",// e.root-servers.net
+			"192.5.5.241:53",   // f.root-servers.net
+			"192.112.36.4:53",  // g.root-servers.net
+			"198.97.190.53:53", // h.root-servers.net
+			"192.36.148.17:53", // i.root-servers.net
+			"192.58.128.30:53", // j.root-servers.net
+			"193.0.14.129:53",  // k.root-servers.net
+			"199.7.83.42:53",   // l.root-servers.net
+			"202.12.27.33:53",  // m.root-servers.net
+		},
+		enableDNSSEC: true,
+		strictDNSSEC: true,
 	}
 
-	// Инициализируем unbound
-	u := unbound.New()
-	h.u = u
+	go handler.cleanupCache()
+	go handler.printMetrics()
+	go handler.printErrorSummary()
 
-	// Попробуем прочитать /etc/resolv.conf (необязательно)
-	if err := u.ResolvConf("/etc/resolv.conf"); err != nil {
-		// не критично — просто логируем
-		log.Printf("unbound: failed to read /etc/resolv.conf: %v", err)
-	}
-
-	// Попробуем загрузить trust anchor (root key) — путь можно задать через UNBOUND_TA_FILE
-	taFile := os.Getenv("UNBOUND_TA_FILE")
-	if taFile == "" {
-		taFile = "/var/lib/unbound/root.key"
-	}
-	if _, err := os.Stat(taFile); err == nil {
-		if err := u.AddTaFile(taFile); err != nil {
-			log.Printf("unbound: AddTaFile(%s) failed: %v", taFile, err)
-		} else {
-			log.Printf("unbound: loaded trust anchor from %s", taFile)
-		}
-	} else {
-		log.Printf("unbound: trust anchor file not found at %s (consider running unbound-anchor or set UNBOUND_TA_FILE)", taFile)
-	}
-
-	// Опционально можно установить дополнительные опции через u.SetOption(...)
-	// Например: u.SetOption("num-threads", "2")
-
-	// Запускаем периодический вывод метрик и ошибок
-	go h.printMetrics()
-	go h.printErrorSummary()
-
-	return h
+	return handler
 }
 
+// cleanupCache periodically cleans expired entries
+func (h *DNSHandler) cleanupCache() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now().Unix()
+			h.cacheMu.Lock()
+			keysToRemove := make([]string, 0)
+			for key, entry := range h.cache.cache {
+				if now > entry.expireAt {
+					keysToRemove = append(keysToRemove, key)
+				}
+			}
+			for _, key := range keysToRemove {
+				h.cache.Remove(key)
+			}
+			h.cacheMu.Unlock()
+		}
+	}
+}
+
+// printMetrics prints metrics
 func (h *DNSHandler) printMetrics() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
-		total := atomic.LoadInt64(&h.totalQueries)
-		cached := atomic.LoadInt64(&h.cachedQueries)
-		dnssec := atomic.LoadInt64(&h.dnssecQueries)
-		validationErr := atomic.LoadInt64(&h.validationError)
+	for {
+		select {
+		case <-ticker.C:
+			total := atomic.LoadInt64(&h.totalQueries)
+			cached := atomic.LoadInt64(&h.cachedQueries)
+			dnssec := atomic.LoadInt64(&h.dnssecQueries)
+			validationErr := atomic.LoadInt64(&h.validationError)
 
-		cacheHitRate := float64(0)
-		dnssecRate := float64(0)
-		validationErrRate := float64(0)
-		if total > 0 {
-			cacheHitRate = float64(cached) / float64(total) * 100
-			dnssecRate = float64(dnssec) / float64(total) * 100
-			validationErrRate = float64(validationErr) / float64(total) * 100
+			cacheHitRate := float64(0)
+			dnssecRate := float64(0)
+			validationErrRate := float64(0)
+			if total > 0 {
+				cacheHitRate = float64(cached) / float64(total) * 100
+				dnssecRate = float64(dnssec) / float64(total) * 100
+				validationErrRate = float64(validationErr) / float64(total) * 100
+			}
+
+			log.Printf("METRICS - Total: %d, Cached: %d (%.2f%%), DNSSEC Queries: %d (%.2f%%), Validation Errors: %d (%.2f%%)",
+				total, cached, cacheHitRate, dnssec, dnssecRate, validationErr, validationErrRate)
 		}
-		log.Printf("METRICS - Total: %d, Cached: %d (%.2f%%), DNSSEC: %.2f%%, Validation Errors: %.2f%%",
-			total, cached, cacheHitRate, dnssecRate, validationErrRate)
 	}
 }
 
+// printErrorSummary prints error summary
 func (h *DNSHandler) printErrorSummary() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		h.errorStats.mutex.Lock()
-		if len(h.errorStats.errors) > 0 {
-			log.Printf("ERROR SUMMARY - Top problematic domains:")
-			type de struct {
-				d string
-				c int64
+	for {
+		select {
+		case <-ticker.C:
+			h.errorStats.mutex.Lock()
+			if len(h.errorStats.errors) > 0 {
+				type domainError struct {
+					domain string
+					count  int64
+				}
+
+				var errors []domainError
+				for domain, count := range h.errorStats.errors {
+					errors = append(errors, domainError{domain, count})
+				}
+
+				sort.Slice(errors, func(i, j int) bool {
+					return errors[i].count > errors[j].count
+				})
+
+				for i := 0; i < len(errors) && i < 10; i++ {
+					log.Printf("  %s: %d errors", errors[i].domain, errors[i].count)
+				}
+
+				h.errorStats.errors = make(map[string]int64)
 			}
-			var arr []de
-			for d, c := range h.errorStats.errors {
-				arr = append(arr, de{d, c})
-			}
-			sort.Slice(arr, func(i, j int) bool { return arr[i].c > arr[j].c })
-			for i := 0; i < len(arr) && i < 10; i++ {
-				log.Printf("  %s: %d errors", arr[i].d, arr[i].c)
-			}
-			h.errorStats.errors = make(map[string]int64)
+			h.errorStats.mutex.Unlock()
 		}
-		h.errorStats.mutex.Unlock()
 	}
 }
 
-func (h *DNSHandler) recordError(domain string) {
-	h.errorStats.mutex.Lock()
-	h.errorStats.errors[domain]++
-	h.errorStats.mutex.Unlock()
-}
-
+// getCacheKey generates cache key
 func (h *DNSHandler) getCacheKey(name string, qtype uint16, dnssec bool) string {
 	if dnssec {
 		return name + "|" + fmt.Sprintf("%d|dnssec", qtype)
@@ -164,281 +182,514 @@ func (h *DNSHandler) getCacheKey(name string, qtype uint16, dnssec bool) string 
 	return name + "|" + fmt.Sprintf("%d", qtype)
 }
 
-func (h *DNSHandler) isExpired(exp int64) bool {
-	return time.Now().Unix() > exp
+// isExpired checks if cache entry is expired
+func (h *DNSHandler) isExpired(expireAt int64) bool {
+	return time.Now().Unix() > expireAt
 }
 
-func (h *DNSHandler) getCachedResponse(key string, req *dns.Msg) *dns.Msg {
+// getCachedResponse gets response from cache
+func (h *DNSHandler) getCachedResponse(key string, request *dns.Msg) *dns.Msg {
 	h.cacheMu.RLock()
-	v, ok := h.cache.Get(key)
-	h.cacheMu.RUnlock()
+	defer h.cacheMu.RUnlock()
+
+	entry, ok := h.cache.Get(key)
 	if !ok {
 		return nil
 	}
-	entry := v.(*CacheEntry)
-	if h.isExpired(entry.ExpireAt) {
+
+	if h.isExpired(entry.expireAt) {
+		h.cacheMu.RUnlock()
 		h.cacheMu.Lock()
 		h.cache.Remove(key)
 		h.cacheMu.Unlock()
+		h.cacheMu.RLock()
 		return nil
 	}
-	msg := entry.Msg.Copy()
-	msg.Id = req.Id
 
-	// copy EDNS0 options from request
-	if edns0 := req.IsEdns0(); edns0 != nil {
+	cachedMsg := entry.value.Copy()
+	cachedMsg.Id = request.Id
+
+	if edns0 := request.IsEdns0(); edns0 != nil {
 		newOpt := new(dns.OPT)
 		newOpt.Hdr.Name = "."
 		newOpt.Hdr.Rrtype = dns.TypeOPT
 		newOpt.SetUDPSize(edns0.UDPSize())
 		newOpt.SetDo(edns0.Do())
-		msg.Extra = append(msg.Extra, newOpt)
+		cachedMsg.Extra = append(cachedMsg.Extra, newOpt)
 	}
 
-	// update TTLs based on expireAt
-	timeLeft := entry.ExpireAt - time.Now().Unix()
+	timeLeft := entry.expireAt - time.Now().Unix()
 	if timeLeft < 0 {
 		timeLeft = 0
 	}
-	ttl := uint32(timeLeft)
-	for _, rr := range msg.Answer {
-		rr.Header().Ttl = ttl
+	ttlSeconds := uint32(timeLeft)
+
+	for _, rr := range cachedMsg.Answer {
+		rr.Header().Ttl = ttlSeconds
 	}
-	for _, rr := range msg.Ns {
-		rr.Header().Ttl = ttl
+	for _, rr := range cachedMsg.Ns {
+		rr.Header().Ttl = ttlSeconds
 	}
-	for _, rr := range msg.Extra {
+	for _, rr := range cachedMsg.Extra {
 		if rr.Header().Rrtype != dns.TypeOPT {
-			rr.Header().Ttl = ttl
+			rr.Header().Ttl = ttlSeconds
 		}
 	}
 
 	atomic.AddInt64(&h.cachedQueries, 1)
-	return msg
+	return cachedMsg
 }
 
+// cacheResponse caches response
 func (h *DNSHandler) cacheResponse(key string, msg *dns.Msg) {
-	// determine min TTL
 	minTTL := int64(300)
 	if msg.Rcode == dns.RcodeNameError {
 		minTTL = 30
 	} else {
-		for _, sec := range [][]dns.RR{msg.Answer, msg.Ns, msg.Extra} {
-			for _, rr := range sec {
-				if rr.Header().Rrtype != dns.TypeOPT && rr.Header().Ttl > 0 && int64(rr.Header().Ttl) < minTTL {
+		sections := [][]dns.RR{msg.Answer, msg.Ns, msg.Extra}
+		for _, section := range sections {
+			for _, rr := range section {
+				if rr.Header().Rrtype != dns.TypeOPT && int64(rr.Header().Ttl) < minTTL && rr.Header().Ttl > 0 {
 					minTTL = int64(rr.Header().Ttl)
 				}
 			}
 		}
 	}
+
 	if minTTL > 86400 {
 		minTTL = 86400
 	}
 
-	cached := msg.Copy()
-	// remove OPT before caching
-	extra := make([]dns.RR, 0, len(cached.Extra))
-	for _, rr := range cached.Extra {
+	cachedMsg := msg.Copy()
+	extra := make([]dns.RR, 0, len(cachedMsg.Extra))
+	for _, rr := range cachedMsg.Extra {
 		if rr.Header().Rrtype != dns.TypeOPT {
 			extra = append(extra, rr)
 		}
 	}
-	cached.Extra = extra
-	exp := time.Now().Unix() + minTTL
+	cachedMsg.Extra = extra
+
+	expireAt := time.Now().Unix() + minTTL
 
 	h.cacheMu.Lock()
-	h.cache.Add(key, &CacheEntry{Msg: cached, ExpireAt: exp})
-	h.cacheMu.Unlock()
+	defer h.cacheMu.Unlock()
+	h.cache.Set(key, &CacheEntry{
+		value:    cachedMsg,
+		expireAt: expireAt,
+	})
 }
 
-// resolveUsingUnbound использует libunbound для рекурсивного резолвинга (и для DNSSEC)
-func (h *DNSHandler) resolveUsingUnbound(name string, qtype uint16, wantDNSSEC bool) (*dns.Msg, error) {
-	// unbound expects fully-qualified name with trailing dot
-	qname := dns.Fqdn(name)
-	if wantDNSSEC {
-		atomic.AddInt64(&h.dnssecQueries, 1)
-	}
+// recordError records error
+func (h *DNSHandler) recordError(domain string) {
+	h.errorStats.mutex.Lock()
+	defer h.errorStats.mutex.Unlock()
+	h.errorStats.errors[domain]++
+}
 
-	res, err := h.u.Resolve(qname, qtype, dns.ClassINET)
+// isNormalError checks if error is normal
+func (h *DNSHandler) isNormalError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "Refused") ||
+		strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "i/o timeout") ||
+		strings.Contains(errStr, "no answer from DNS server")
+}
+
+// queryNS sends query to nameserver
+func (h *DNSHandler) queryNS(server string, msg *dns.Msg) (*dns.Msg, error) {
+	resp, _, err := h.client.Exchange(msg, server)
 	if err != nil {
-		// Unbound может вернуть ошибку если что-то не так с libunbound
-		return nil, fmt.Errorf("unbound resolve error: %v", err)
-	}
-	if res == nil {
-		return nil, fmt.Errorf("unbound returned nil result")
-	}
-
-	// Если Unbound пометил как Bogus -> DNSSEC fail
-	if res.Bogus {
-		atomic.AddInt64(&h.validationError, 1)
-		return nil, &ValidationError{Reason: res.WhyBogus}
-	}
-
-	// Если есть full answer packet — используем его
-	if res.AnswerPacket != nil {
-		// Устанавливаем AD флаг если secure
-		if res.Secure {
-			res.AnswerPacket.MsgHdr.AuthenticatedData = true
-		} else {
-			res.AnswerPacket.MsgHdr.AuthenticatedData = false
+		if err == dns.ErrBuf || strings.Contains(err.Error(), "overflow") {
+			h.client.Net = "tcp"
+			resp, _, err = h.client.Exchange(msg, server)
+			h.client.Net = "udp"
+			return resp, err
 		}
-		return res.AnswerPacket.Copy(), nil
+		return nil, err
 	}
 
-	// Если AnswerPacket отсутствует, но есть Rr (parsed RRs) — сформируем сообщение
-	if len(res.Rr) > 0 {
-		msg := new(dns.Msg)
-		msg.SetReply(&dns.Msg{MsgHdr: dns.MsgHdr{Id: 0}})
-		msg.Authoritative = false
-		msg.RecursionAvailable = false
-		msg.Rcode = dns.RcodeSuccess
-		msg.Answer = res.Rr
-		if res.Secure {
-			msg.MsgHdr.AuthenticatedData = true
-		}
-		return msg, nil
+	if resp != nil && resp.Truncated && h.client.Net == "udp" {
+		h.client.Net = "tcp"
+		resp, _, err = h.client.Exchange(msg, server)
+		h.client.Net = "udp"
 	}
 
-	// NXDOMAIN
-	if res.NxDomain {
-		m := new(dns.Msg)
-		m.SetRcode(&dns.Msg{}, dns.RcodeNameError)
-		return m, nil
-	}
-
-	return nil, fmt.Errorf("unbound: no data for %s (type %d)", name, qtype)
+	return resp, err
 }
 
-// ServeDNS обрабатывает входящие DNS-запросы
+// getNSServers gets NS servers
+func (h *DNSHandler) getNSServers(name string) ([]string, error) {
+	resp, err := h.resolve(name, dns.TypeNS, false)
+	if err != nil {
+		return nil, err
+	}
+
+	var servers []string
+	for _, rr := range resp.Answer {
+		if ns, ok := rr.(*dns.NS); ok {
+			servers = append(servers, ns.Ns+":53")
+		}
+	}
+	if len(servers) == 0 {
+		for _, rr := range resp.Ns {
+			if ns, ok := rr.(*dns.NS); ok {
+				servers = append(servers, ns.Ns+":53")
+			}
+		}
+	}
+	return servers, nil
+}
+
+// verifyDNSSEC verifies DNSSEC (stub)
+func (h *DNSHandler) verifyDNSSEC(name string, resp *dns.Msg) error {
+	if !h.enableDNSSEC {
+		return nil
+	}
+
+	atomic.AddInt64(&h.dnssecQueries, 1)
+
+	hasRRSIG := false
+	for _, section := range [][]dns.RR{resp.Answer, resp.Ns, resp.Extra} {
+		for _, rr := range section {
+			if rr.Header().Rrtype == dns.TypeRRSIG {
+				hasRRSIG = true
+				break
+			}
+		}
+		if hasRRSIG {
+			break
+		}
+	}
+
+	if !hasRRSIG {
+		return &ValidationError{Reason: "No RRSIG records found"}
+	}
+
+	log.Printf("DNSSEC verification (stub) successful for %s", name)
+	return nil
+}
+
+// resolve resolves domain recursively
+func (h *DNSHandler) resolve(name string, qtype uint16, dnssec bool) (*dns.Msg, error) {
+	servers := h.rootServers
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(name), qtype)
+	m.RecursionDesired = false
+
+	if dnssec && h.enableDNSSEC {
+		m.SetEdns0(4096, true)
+	}
+
+	maxDepth := 20
+	for depth := 0; depth < maxDepth; depth++ {
+		type result struct {
+			resp *dns.Msg
+			err  error
+		}
+
+		results := make(chan result, len(servers))
+		var wg sync.WaitGroup
+
+		for _, server := range servers {
+			wg.Add(1)
+			go func(s string) {
+				defer wg.Done()
+				resp, err := h.queryNS(s, m)
+				results <- result{resp, err}
+			}(server)
+		}
+
+		go func() {
+			wg.Wait()
+			close(results)
+		}()
+
+		var bestResp *dns.Msg
+		for res := range results {
+			if res.err != nil {
+				if !h.isNormalError(res.err) {
+					log.Printf("ERROR querying %s: %v", name, res.err)
+				}
+				continue
+			}
+
+			if res.resp != nil {
+				if (res.resp.Rcode == dns.RcodeSuccess && len(res.resp.Answer) > 0) ||
+					(res.resp.Rcode == dns.RcodeNameError) {
+
+					if dnssec && h.enableDNSSEC {
+						if err := h.verifyDNSSEC(name, res.resp); err != nil {
+							atomic.AddInt64(&h.validationError, 1)
+							return res.resp, &ValidationError{Reason: "verification failed", Err: err}
+						}
+					}
+
+					return res.resp, nil
+				} else if len(res.resp.Ns) > 0 {
+					var newServers []string
+					for _, rr := range res.resp.Ns {
+						if ns, ok := rr.(*dns.NS); ok {
+							newServers = append(newServers, ns.Ns+":53")
+						}
+					}
+					if len(newServers) > 0 {
+						servers = newServers
+						bestResp = res.resp
+						break
+					}
+				}
+
+				if bestResp == nil {
+					bestResp = res.resp
+				}
+			}
+		}
+
+		if bestResp == nil {
+			return nil, fmt.Errorf("no response from nameservers for %s", name)
+		}
+	}
+
+	return nil, fmt.Errorf("recursion depth exceeded for %s", name)
+}
+
+// ServeDNS handles DNS requests
 func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	atomic.AddInt64(&h.totalQueries, 1)
 
-	// Проверка наличия вопроса
+	m := new(dns.Msg)
+	m.SetReply(r)
+	m.Compress = true
+
 	if len(r.Question) == 0 {
-		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeFormatError)
-		w.WriteMsg(m)
+		_ = w.WriteMsg(m)
 		return
 	}
 
 	question := r.Question[0]
 	domain := question.Name
-
-	// DNSSEC запрошен?
 	dnssecRequested := false
-	if edns0 := r.IsEdns0(); edns0 != nil && edns0.Do() {
+	if edns0 := r.IsEdns0(); edns0 != nil && edns0.Do() && h.enableDNSSEC {
 		dnssecRequested = true
 	}
 
 	cacheKey := h.getCacheKey(domain, question.Qtype, dnssecRequested)
-	if cached := h.getCachedResponse(cacheKey, r); cached != nil {
-		w.WriteMsg(cached)
+	if cachedResponse := h.getCachedResponse(cacheKey, r); cachedResponse != nil {
+		_ = w.WriteMsg(cachedResponse)
 		return
 	}
 
-	// Используем unbound для резолва (он делает рекурсивную работу + валидацию)
-	resp, err := h.resolveUsingUnbound(domain, question.Qtype, dnssecRequested)
+	resp, err := h.resolve(domain, question.Qtype, dnssecRequested)
+
 	if err != nil {
 		h.recordError(domain)
-		// Если это DNSSEC-ошибка — вернём SERVFAIL (такое поведение можно менять)
-		if _, ok := err.(*ValidationError); ok {
+
+		if dnssecErr, ok := err.(*ValidationError); ok {
 			atomic.AddInt64(&h.validationError, 1)
-			log.Printf("DNSSEC validation error for %s: %v", domain, err)
-			// Возвратим SERVFAIL
-			m := new(dns.Msg)
+			log.Printf("DNSSEC validation error for %s: %v", domain, dnssecErr)
+
+			if h.strictDNSSEC {
+				m.SetRcode(r, dns.RcodeServerFailure)
+				m.AuthenticatedData = false
+				_ = w.WriteMsg(m)
+				return
+			}
+		} else if !h.isNormalError(err) {
+			log.Printf("ERROR resolving %s: %v", domain, err)
+		}
+
+		if resp == nil {
 			m.SetRcode(r, dns.RcodeServerFailure)
-			w.WriteMsg(m)
+			m.AuthenticatedData = false
+			_ = w.WriteMsg(m)
 			return
 		}
-		// Иные ошибки — логируем и возвращаем SERVFAIL
-		log.Printf("resolve error for %s: %v", domain, err)
-		m := new(dns.Msg)
-		m.SetRcode(r, dns.RcodeServerFailure)
-		w.WriteMsg(m)
-		return
 	}
 
-	// Кэширование и копирование EDNS из запроса
 	if resp != nil {
-		// Сохраняем в кэш (ключ = qname|type|dnssec)
-		h.cacheResponse(cacheKey, resp)
+		m.Answer = resp.Answer
+		m.Ns = resp.Ns
+		m.Extra = resp.Extra
+		m.MsgHdr.RecursionAvailable = resp.MsgHdr.RecursionAvailable
+		m.MsgHdr.Response = resp.MsgHdr.Response
+		m.MsgHdr.Authoritative = resp.MsgHdr.Authoritative
+		m.Rcode = resp.Rcode
 
-		// Перед записью в сокет — убедимся, что в ответе есть OPT если клиент запросил его
+		if dnssecRequested {
+			_, isDNSSecError := err.(*ValidationError)
+			if isDNSSecError {
+				m.AuthenticatedData = false
+			} else if err == nil {
+				m.AuthenticatedData = true
+			} else {
+				m.AuthenticatedData = false
+			}
+		} else {
+			m.AuthenticatedData = false
+		}
+
 		if edns0 := r.IsEdns0(); edns0 != nil {
 			hasOpt := false
-			for _, rr := range resp.Extra {
+			for _, rr := range m.Extra {
 				if rr.Header().Rrtype == dns.TypeOPT {
 					hasOpt = true
+					if opt, ok := rr.(*dns.OPT); ok {
+						opt.SetDo(edns0.Do())
+					}
 					break
 				}
 			}
+
 			if !hasOpt {
 				newOpt := new(dns.OPT)
 				newOpt.Hdr.Name = "."
 				newOpt.Hdr.Rrtype = dns.TypeOPT
 				newOpt.SetUDPSize(edns0.UDPSize())
 				newOpt.SetDo(edns0.Do())
-				resp.Extra = append(resp.Extra, newOpt)
+				m.Extra = append(m.Extra, newOpt)
 			}
 		}
-
-		// Установим правильный ID запроса
-		resp.Id = r.Id
-
-		w.WriteMsg(resp)
+		
+		// Cache the response
+		h.cacheResponse(cacheKey, resp)
+	} else {
+		m.SetRcode(r, dns.RcodeServerFailure)
+		m.AuthenticatedData = false
+		_ = w.WriteMsg(m)
 		return
 	}
 
-	// Если попали сюда — что-то странное
-	m := new(dns.Msg)
-	m.SetRcode(r, dns.RcodeServerFailure)
-	w.WriteMsg(m)
+	_ = w.WriteMsg(m)
 }
 
+// CacheEntry represents cache entry
+type CacheEntry struct {
+	key       string
+	value     *dns.Msg
+	listEntry *list.Element
+	expireAt  int64
+}
+
+// LRUCache is a simple LRU cache
+type LRUCache struct {
+	maxEntries int
+	cache      map[string]*CacheEntry
+	list       *list.List
+	mu         sync.RWMutex
+}
+
+func NewLRUCache(size int) *LRUCache {
+	return &LRUCache{
+		maxEntries: size,
+		cache:      make(map[string]*CacheEntry),
+		list:       list.New(),
+	}
+}
+
+func (c *LRUCache) Set(key string, value *CacheEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if ce, ok := c.cache[key]; ok {
+		c.list.MoveToFront(ce.listEntry)
+		ce.value = value.value
+		ce.expireAt = value.expireAt
+		return
+	}
+
+	if len(c.cache) >= c.maxEntries {
+		// Remove least recently used item
+		if back := c.list.Back(); back != nil {
+			removedEntry := c.list.Remove(back)
+			if entry, ok := removedEntry.(*CacheEntry); ok {
+				delete(c.cache, entry.key)
+			}
+		}
+	}
+
+	// Add new entry
+	element := c.list.PushFront(&CacheEntry{
+		key:      key,
+		value:    value.value,
+		expireAt: value.expireAt,
+	})
+	entry := &CacheEntry{
+		key:       key,
+		value:     value.value,
+		expireAt:  value.expireAt,
+		listEntry: element,
+	}
+	c.cache[key] = entry
+}
+
+func (c *LRUCache) Get(key string) (value *CacheEntry, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if ce, exists := c.cache[key]; exists {
+		c.list.MoveToFront(ce.listEntry)
+		return ce, true
+	}
+	return nil, false
+}
+
+func (c *LRUCache) Remove(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if ce, ok := c.cache[key]; ok {
+		delete(c.cache, key)
+		c.list.Remove(ce.listEntry)
+	}
+}
+
+// Main execution
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	handler := NewDNSHandler()
 
-	// UDP сервер
-	udpSrv := &dns.Server{
+	server := &dns.Server{
 		Addr:    ":5353",
 		Net:     "udp",
 		Handler: handler,
 		UDPSize: 65535,
 	}
-	// TCP сервер
-	tcpSrv := &dns.Server{
+
+	tcpServer := &dns.Server{
 		Addr:    ":5353",
 		Net:     "tcp",
 		Handler: handler,
 	}
 
-	log.Println("Starting DNS server on :5353 (udp/tcp)")
+	log.Println("Starting DNS server on :5353")
+	log.Println("Features: Recursive DNS resolution with basic DNSSEC support (stub validation)")
 	log.Printf("CPUs: %d", runtime.NumCPU())
+	log.Printf("DNSSEC: %v, Strict Mode: %v", handler.enableDNSSEC, handler.strictDNSSEC)
 
 	go func() {
-		if err := udpSrv.ListenAndServe(); err != nil {
-			log.Fatalf("udp server failed: %v", err)
-		}
-	}()
-	go func() {
-		if err := tcpSrv.ListenAndServe(); err != nil {
-			log.Fatalf("tcp server failed: %v", err)
+		if err := server.ListenAndServe(); err != nil {
+			log.Fatalf("Failed to start UDP server: %v", err)
 		}
 	}()
 
-	// graceful shutdown
+	go func() {
+		if err := tcpServer.ListenAndServe(); err != nil {
+			log.Fatalf("Failed to start TCP server: %v", err)
+		}
+	}()
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
-	log.Println("Shutting down...")
-	udpSrv.Shutdown()
-	tcpSrv.Shutdown()
-	// destroy unbound context
-	if handler.u != nil {
-		handler.u.Destroy()
-	}
-	log.Println("Stopped")
+	log.Println("Shutting down DNS server...")
+	_ = server.Shutdown()
+	_ = tcpServer.Shutdown()
+	log.Println("DNS server stopped")
 }
