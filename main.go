@@ -1,7 +1,7 @@
 package main
 
 import (
-	"container/list"
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/miekg/dns"
 )
 
@@ -38,9 +39,8 @@ type ErrorStats struct {
 
 // DNSHandler handles DNS queries
 type DNSHandler struct {
-	cache           *LRUCache
-	cacheTTL        int64
-	cacheMu         sync.RWMutex
+	cache           *expirable.LRU[string, *CacheEntry]
+	cacheTTL        time.Duration
 	errorStats      *ErrorStats
 	totalQueries    int64
 	cachedQueries   int64
@@ -50,14 +50,31 @@ type DNSHandler struct {
 	rootServers     []string
 	enableDNSSEC    bool
 	strictDNSSEC    bool
+	workerPool      chan chan *dnsRequest
+}
+
+type dnsRequest struct {
+	w dns.ResponseWriter
+	r *dns.Msg
+}
+
+// CacheEntry represents cache entry
+type CacheEntry struct {
+	Msg   *dns.Msg
+	TTL   time.Time
 }
 
 // NewDNSHandler creates new DNS handler
 func NewDNSHandler() *DNSHandler {
+	// Создаем LRU кэш с expirable entries
+	cache := expirable.NewLRU[string, *CacheEntry](30000, nil, time.Hour)
+
 	handler := &DNSHandler{
-		cache: NewLRUCache(30000),
-		cacheTTL: 300,
-		errorStats: &ErrorStats{errors: make(map[string]int64)},
+		cache:    cache,
+		cacheTTL: 300 * time.Second,
+		errorStats: &ErrorStats{
+			errors: make(map[string]int64),
+		},
 		client: &dns.Client{
 			Net:          "udp",
 			UDPSize:      4096,
@@ -81,34 +98,29 @@ func NewDNSHandler() *DNSHandler {
 		},
 		enableDNSSEC: true,
 		strictDNSSEC: true,
+		workerPool:   make(chan chan *dnsRequest, runtime.NumCPU()*10),
 	}
 
-	go handler.cleanupCache()
+	// Запуск worker'ов
+	for i := 0; i < runtime.NumCPU()*2; i++ {
+		go handler.worker()
+	}
+
 	go handler.printMetrics()
 	go handler.printErrorSummary()
 
 	return handler
 }
 
-// cleanupCache periodically cleans expired entries
-func (h *DNSHandler) cleanupCache() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+// worker обрабатывает DNS запросы
+func (h *DNSHandler) worker() {
+	requestChannel := make(chan *dnsRequest)
 	for {
+		// Регистрация канала в пуле
+		h.workerPool <- requestChannel
 		select {
-		case <-ticker.C:
-			now := time.Now().Unix()
-			h.cacheMu.Lock()
-			keysToRemove := make([]string, 0)
-			for key, entry := range h.cache.cache {
-				if now > entry.expireAt {
-					keysToRemove = append(keysToRemove, key)
-				}
-			}
-			for _, key := range keysToRemove {
-				h.cache.Remove(key)
-			}
-			h.cacheMu.Unlock()
+		case req := <-requestChannel:
+			h.handleRequest(req.w, req.r)
 		}
 	}
 }
@@ -182,31 +194,21 @@ func (h *DNSHandler) getCacheKey(name string, qtype uint16, dnssec bool) string 
 	return name + "|" + fmt.Sprintf("%d", qtype)
 }
 
-// isExpired checks if cache entry is expired
-func (h *DNSHandler) isExpired(expireAt int64) bool {
-	return time.Now().Unix() > expireAt
-}
-
 // getCachedResponse gets response from cache
 func (h *DNSHandler) getCachedResponse(key string, request *dns.Msg) *dns.Msg {
-	h.cacheMu.RLock()
-	defer h.cacheMu.RUnlock()
-
 	entry, ok := h.cache.Get(key)
 	if !ok {
 		return nil
 	}
 
-	if h.isExpired(entry.expireAt) {
-		h.cacheMu.RUnlock()
-		h.cacheMu.Lock()
-		h.cache.Remove(key)
-		h.cacheMu.Unlock()
-		h.cacheMu.RLock()
+	// Проверка TTL
+	if time.Now().After(entry.TTL) {
+		// Асинхронное удаление
+		go h.cache.Remove(key)
 		return nil
 	}
 
-	cachedMsg := entry.value.Copy()
+	cachedMsg := entry.Msg.Copy()
 	cachedMsg.Id = request.Id
 
 	if edns0 := request.IsEdns0(); edns0 != nil {
@@ -218,11 +220,12 @@ func (h *DNSHandler) getCachedResponse(key string, request *dns.Msg) *dns.Msg {
 		cachedMsg.Extra = append(cachedMsg.Extra, newOpt)
 	}
 
-	timeLeft := entry.expireAt - time.Now().Unix()
+	// Обновление TTL в ответе
+	timeLeft := time.Until(entry.TTL)
 	if timeLeft < 0 {
 		timeLeft = 0
 	}
-	ttlSeconds := uint32(timeLeft)
+	ttlSeconds := uint32(timeLeft.Seconds())
 
 	for _, rr := range cachedMsg.Answer {
 		rr.Header().Ttl = ttlSeconds
@@ -242,22 +245,22 @@ func (h *DNSHandler) getCachedResponse(key string, request *dns.Msg) *dns.Msg {
 
 // cacheResponse caches response
 func (h *DNSHandler) cacheResponse(key string, msg *dns.Msg) {
-	minTTL := int64(300)
+	minTTL := h.cacheTTL
 	if msg.Rcode == dns.RcodeNameError {
-		minTTL = 30
+		minTTL = 30 * time.Second
 	} else {
 		sections := [][]dns.RR{msg.Answer, msg.Ns, msg.Extra}
 		for _, section := range sections {
 			for _, rr := range section {
-				if rr.Header().Rrtype != dns.TypeOPT && int64(rr.Header().Ttl) < minTTL && rr.Header().Ttl > 0 {
-					minTTL = int64(rr.Header().Ttl)
+				if rr.Header().Rrtype != dns.TypeOPT && time.Duration(rr.Header().Ttl)*time.Second < minTTL && rr.Header().Ttl > 0 {
+					minTTL = time.Duration(rr.Header().Ttl) * time.Second
 				}
 			}
 		}
 	}
 
-	if minTTL > 86400 {
-		minTTL = 86400
+	if minTTL > 24*time.Hour {
+		minTTL = 24 * time.Hour
 	}
 
 	cachedMsg := msg.Copy()
@@ -269,13 +272,11 @@ func (h *DNSHandler) cacheResponse(key string, msg *dns.Msg) {
 	}
 	cachedMsg.Extra = extra
 
-	expireAt := time.Now().Unix() + minTTL
+	expireAt := time.Now().Add(minTTL)
 
-	h.cacheMu.Lock()
-	defer h.cacheMu.Unlock()
-	h.cache.Set(key, &CacheEntry{
-		value:    cachedMsg,
-		expireAt: expireAt,
+	h.cache.Add(key, &CacheEntry{
+		Msg: cachedMsg,
+		TTL: expireAt,
 	})
 }
 
@@ -300,48 +301,31 @@ func (h *DNSHandler) isNormalError(err error) bool {
 }
 
 // queryNS sends query to nameserver
-func (h *DNSHandler) queryNS(server string, msg *dns.Msg) (*dns.Msg, error) {
-	resp, _, err := h.client.Exchange(msg, server)
+func (h *DNSHandler) queryNS(ctx context.Context, server string, msg *dns.Msg) (*dns.Msg, error) {
+	// Создаем новый клиент с контекстом
+	c := &dns.Client{
+		Net:          h.client.Net,
+		UDPSize:      h.client.UDPSize,
+		ReadTimeout:  h.client.ReadTimeout,
+		WriteTimeout: h.client.WriteTimeout,
+	}
+	
+	resp, _, err := c.ExchangeContext(ctx, msg, server)
 	if err != nil {
 		if err == dns.ErrBuf || strings.Contains(err.Error(), "overflow") {
-			h.client.Net = "tcp"
-			resp, _, err = h.client.Exchange(msg, server)
-			h.client.Net = "udp"
+			c.Net = "tcp"
+			resp, _, err = c.ExchangeContext(ctx, msg, server)
 			return resp, err
 		}
 		return nil, err
 	}
 
-	if resp != nil && resp.Truncated && h.client.Net == "udp" {
-		h.client.Net = "tcp"
-		resp, _, err = h.client.Exchange(msg, server)
-		h.client.Net = "udp"
+	if resp != nil && resp.Truncated && c.Net == "udp" {
+		c.Net = "tcp"
+		resp, _, err = c.ExchangeContext(ctx, msg, server)
 	}
 
 	return resp, err
-}
-
-// getNSServers gets NS servers
-func (h *DNSHandler) getNSServers(name string) ([]string, error) {
-	resp, err := h.resolve(name, dns.TypeNS, false)
-	if err != nil {
-		return nil, err
-	}
-
-	var servers []string
-	for _, rr := range resp.Answer {
-		if ns, ok := rr.(*dns.NS); ok {
-			servers = append(servers, ns.Ns+":53")
-		}
-	}
-	if len(servers) == 0 {
-		for _, rr := range resp.Ns {
-			if ns, ok := rr.(*dns.NS); ok {
-				servers = append(servers, ns.Ns+":53")
-			}
-		}
-	}
-	return servers, nil
 }
 
 // verifyDNSSEC verifies DNSSEC (stub)
@@ -375,6 +359,9 @@ func (h *DNSHandler) verifyDNSSEC(name string, resp *dns.Msg) error {
 
 // resolve resolves domain recursively
 func (h *DNSHandler) resolve(name string, qtype uint16, dnssec bool) (*dns.Msg, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
 	servers := h.rootServers
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(name), qtype)
@@ -391,14 +378,15 @@ func (h *DNSHandler) resolve(name string, qtype uint16, dnssec bool) (*dns.Msg, 
 			err  error
 		}
 
-		results := make(chan result, len(servers))
+		// Увеличенный буфер канала
+		results := make(chan result, len(servers)*2)
 		var wg sync.WaitGroup
 
 		for _, server := range servers {
 			wg.Add(1)
 			go func(s string) {
 				defer wg.Done()
-				resp, err := h.queryNS(s, m)
+				resp, err := h.queryNS(ctx, s, m)
 				results <- result{resp, err}
 			}(server)
 		}
@@ -428,6 +416,9 @@ func (h *DNSHandler) resolve(name string, qtype uint16, dnssec bool) (*dns.Msg, 
 						}
 					}
 
+					// Кэшируем ответ
+					cacheKey := h.getCacheKey(name, qtype, dnssec)
+					h.cacheResponse(cacheKey, res.resp)
 					return res.resp, nil
 				} else if len(res.resp.Ns) > 0 {
 					var newServers []string
@@ -457,8 +448,8 @@ func (h *DNSHandler) resolve(name string, qtype uint16, dnssec bool) (*dns.Msg, 
 	return nil, fmt.Errorf("recursion depth exceeded for %s", name)
 }
 
-// ServeDNS handles DNS requests
-func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
+// handleRequest обрабатывает DNS запрос
+func (h *DNSHandler) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 	atomic.AddInt64(&h.totalQueries, 1)
 
 	m := new(dns.Msg)
@@ -554,9 +545,6 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 				m.Extra = append(m.Extra, newOpt)
 			}
 		}
-		
-		// Cache the response
-		h.cacheResponse(cacheKey, resp)
 	} else {
 		m.SetRcode(r, dns.RcodeServerFailure)
 		m.AuthenticatedData = false
@@ -567,85 +555,12 @@ func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	_ = w.WriteMsg(m)
 }
 
-// CacheEntry represents cache entry
-type CacheEntry struct {
-	key       string
-	value     *dns.Msg
-	listEntry *list.Element
-	expireAt  int64
-}
-
-// LRUCache is a simple LRU cache
-type LRUCache struct {
-	maxEntries int
-	cache      map[string]*CacheEntry
-	list       *list.List
-	mu         sync.RWMutex
-}
-
-func NewLRUCache(size int) *LRUCache {
-	return &LRUCache{
-		maxEntries: size,
-		cache:      make(map[string]*CacheEntry),
-		list:       list.New(),
-	}
-}
-
-func (c *LRUCache) Set(key string, value *CacheEntry) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if ce, ok := c.cache[key]; ok {
-		c.list.MoveToFront(ce.listEntry)
-		ce.value = value.value
-		ce.expireAt = value.expireAt
-		return
-	}
-
-	if len(c.cache) >= c.maxEntries {
-		// Remove least recently used item
-		if back := c.list.Back(); back != nil {
-			removedEntry := c.list.Remove(back)
-			if entry, ok := removedEntry.(*CacheEntry); ok {
-				delete(c.cache, entry.key)
-			}
-		}
-	}
-
-	// Add new entry
-	element := c.list.PushFront(&CacheEntry{
-		key:      key,
-		value:    value.value,
-		expireAt: value.expireAt,
-	})
-	entry := &CacheEntry{
-		key:       key,
-		value:     value.value,
-		expireAt:  value.expireAt,
-		listEntry: element,
-	}
-	c.cache[key] = entry
-}
-
-func (c *LRUCache) Get(key string) (value *CacheEntry, ok bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if ce, exists := c.cache[key]; exists {
-		c.list.MoveToFront(ce.listEntry)
-		return ce, true
-	}
-	return nil, false
-}
-
-func (c *LRUCache) Remove(key string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if ce, ok := c.cache[key]; ok {
-		delete(c.cache, key)
-		c.list.Remove(ce.listEntry)
-	}
+// ServeDNS handles DNS requests
+func (h *DNSHandler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
+	// Получение свободного worker'а
+	worker := <-h.workerPool
+	// Отправка запроса worker'у
+	worker <- &dnsRequest{w: w, r: r}
 }
 
 // Main execution
