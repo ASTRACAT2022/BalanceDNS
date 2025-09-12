@@ -24,7 +24,7 @@ const int UDP_PORT = 5318;
 const int TCP_PORT = 5318;
 const string CACHE_DB = "dns_cache.db";
 const size_t MAX_CACHE_SIZE = 10000;
-const bool BIND_TO_LOCALHOST_ONLY = true; // Новое: Привязка только к 127.0.0.1 и ::1
+const bool BIND_TO_LOCALHOST_ONLY = true; // Привязка только к 127.0.0.1 и ::1
 
 // === LRU CACHE IMPLEMENTATION ===
 template<typename Key, typename Value>
@@ -278,7 +278,6 @@ bool validate_dnssec(ldns_pkt* pkt, const string& qname) {
         ldns_status status = ldns_verify_rrsig_keylist(rrset, rrsig, dnskeys, NULL);
         if (status != LDNS_STATUS_OK) {
             all_valid = false;
-            // cout << "DNSSEC validation failed for " << qname << " with status: " << status << endl; // Для отладки
             break;
         }
     }
@@ -292,7 +291,50 @@ bool validate_dnssec(ldns_pkt* pkt, const string& qname) {
     return all_valid;
 }
 
-// === ОТПРАВКА ЗАПРОСА ===
+// === ФУНКЦИИ ДЛЯ РАБОТЫ С ECS ===
+
+// Извлекает ECS-опцию из OPT RR пакета
+bool has_ecs_option(const ldns_pkt* query_pkt) {
+    // ldns_pkt_edns возвращает bool, а не ldns_rr*
+    if (!ldns_pkt_edns(query_pkt)) {
+        return false; // Нет OPT RR
+    }
+
+    // Получаем OPT RR напрямую из секции дополнительных записей
+    ldns_rr_list* additional = ldns_pkt_additional(query_pkt);
+    if (!additional) {
+        return false;
+    }
+
+    ldns_rr* opt_rr = nullptr;
+    for (size_t i = 0; i < ldns_rr_list_rr_count(additional); i++) {
+        ldns_rr* rr = ldns_rr_list_rr(additional, i);
+        if (rr && ldns_rr_get_type(rr) == LDNS_RR_TYPE_OPT) {
+            opt_rr = rr;
+            break;
+        }
+    }
+
+    if (!opt_rr) {
+        return false;
+    }
+
+    for (size_t i = 0; i < ldns_rr_rd_count(opt_rr); i++) {
+        ldns_rdf* opt_rdata = ldns_rr_rdf(opt_rr, i);
+        if (!opt_rdata) continue;
+
+        // Проверяем, является ли это опцией (состоит из 2 полей: код и данные)
+        if (ldns_rdf_size(opt_rdata) >= 4) {
+            uint16_t option_code = ldns_read_uint16(ldns_rdf_data(opt_rdata));
+            if (option_code == 8) { // ECS option code is 8
+                return true; // Найдена ECS-опция
+            }
+        }
+    }
+    return false;
+}
+
+// === ОТПРАВКА ЗАПРОСА (БЕЗ ECS) ===
 ldns_pkt* send_dns_query(const string& qname, ldns_rr_type qtype) {
     ldns_resolver* res = nullptr;
     ldns_rdf* domain = ldns_dname_new_frm_str(qname.c_str());
@@ -304,8 +346,9 @@ ldns_pkt* send_dns_query(const string& qname, ldns_rr_type qtype) {
     }
     
     ldns_resolver_set_dnssec(res, 1);
-    ldns_resolver_set_dnssec_cd(res, 1); // Checking Disabled
-    
+    ldns_resolver_set_dnssec_cd(res, 1);
+
+    // Отправляем стандартный запрос
     ldns_pkt* pkt = ldns_resolver_query(res, domain, qtype, LDNS_RR_CLASS_IN, LDNS_RD);
     
     ldns_rdf_deep_free(domain);
@@ -317,7 +360,7 @@ ldns_pkt* send_dns_query(const string& qname, ldns_rr_type qtype) {
 // === ОБРАБОТКА ЗАПРОСА ===
 ldns_pkt* handle_dns_query(const string& qname, ldns_rr_type qtype, bool& dnssec_valid) {
     string cache_key = qname + "_" + to_string(qtype);
-    
+
     ldns_pkt* cached = cache_lookup(cache_key, dnssec_valid);
     if (cached) {
         cout << "[CACHE HIT] " << qname << " type " << qtype << endl;
@@ -372,9 +415,15 @@ void handle_udp_request(int sockfd, bool is_ipv6 = false) {
         return;
     }
     
+    // --- ПРОВЕРКА НАЛИЧИЯ ECS В ЗАПРОСЕ ---
+    if (has_ecs_option(query)) {
+        cout << "[ECS] Client Subnet option found in UDP query for " << qname << endl;
+    }
+    // --- КОНЕЦ ПРОВЕРКИ ECS ---
+
     bool dnssec_valid = false;
     ldns_pkt* response = handle_dns_query(qname, qtype, dnssec_valid);
-    
+
     if (response) {
         ldns_pkt_set_id(response, ldns_pkt_id(query));
         
@@ -464,9 +513,15 @@ void handle_tcp_request(int client_fd, bool is_ipv6 = false) {
         return;
     }
     
+    // --- ПРОВЕРКА НАЛИЧИЯ ECS В ЗАПРОСЕ ---
+    if (has_ecs_option(query)) {
+        cout << "[ECS] Client Subnet option found in TCP query for " << qname << endl;
+    }
+    // --- КОНЕЦ ПРОВЕРКИ ECS ---
+
     bool dnssec_valid = false;
     ldns_pkt* response = handle_dns_query(qname, qtype, dnssec_valid);
-    
+
     if (response) {
         ldns_pkt_set_id(response, ldns_pkt_id(query));
         
