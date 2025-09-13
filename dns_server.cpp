@@ -1,692 +1,570 @@
+// ultra_fast_dns_server.cpp
+#include <ares.h>
 #include <iostream>
-#include <unordered_map>
-#include <string>
-#include <chrono>
-#include <thread>
 #include <vector>
-#include <cstring>
-#include <memory>
-#include <mutex>
-#include <list>
-#include <sqlite3.h>
+#include <thread>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <poll.h>
-#include <ldns/ldns.h>
+#include <cstring>
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
+#include <queue>
+#include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <memory>
+#include <shared_mutex>
 
-using namespace std;
+#define DNS_PORT 5311
+#define BUF_SIZE 512
+#define CACHE_SIZE 10000
+#define CACHE_TTL 300 // 5 минут
 
-// === КОНФИГУРАЦИЯ ===
-const int UDP_PORT = 5318;
-const int TCP_PORT = 5318;
-const string CACHE_DB = "dns_cache.db";
-const size_t MAX_CACHE_SIZE = 10000;
-const bool BIND_TO_LOCALHOST_ONLY = true; // Привязка только к 127.0.0.1 и ::1
+// DNS RCODE значения
+#define RCODE_NOERROR 0
+#define RCODE_FORMERR 1
+#define RCODE_SERVFAIL 2
+#define RCODE_NXDOMAIN 3
 
-// === LRU CACHE IMPLEMENTATION ===
-template<typename Key, typename Value>
-class LRUCache {
+// DNS заголовок
+#pragma pack(push, 1)
+struct DNSHeader {
+    uint16_t id;
+    uint16_t flags;
+    uint16_t qdcount;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
+};
+#pragma pack(pop)
+
+// Высокопроизводительный DNS-кэш
+class UltraFastCache {
 private:
-    struct Node {
-        Key key;
-        Value value;
-        time_t expiry;
-        bool dnssec_valid;
-        typename list<Key>::iterator list_it;
+    struct CacheEntry {
+        std::vector<uint8_t> data;
+        std::chrono::steady_clock::time_point expiry_time;
+        uint64_t last_access;
+        uint64_t access_count;
+        
+        CacheEntry(const std::vector<uint8_t>& d, std::chrono::steady_clock::time_point expiry)
+            : data(d), expiry_time(expiry), last_access(0), access_count(0) {}
     };
     
-    unordered_map<Key, shared_ptr<Node>> cache_map;
-    list<Key> cache_list;
-    size_t max_size;
-    mutex cache_mutex;
+    // Хэш-таблица для быстрого поиска
+    std::unordered_map<std::string, std::unique_ptr<CacheEntry>> cache_map;
+    
+    // Очередь для LRU (Least Recently Used) eviction
+    std::deque<std::pair<std::string, std::chrono::steady_clock::time_point>> lru_queue;
+    
+    // Мьютекс для потокобезопасности
+    mutable std::shared_mutex cache_mutex;
+    
+    // Счетчики для статистики
+    std::atomic<uint64_t> hits{0};
+    std::atomic<uint64_t> misses{0};
+    std::atomic<uint64_t> evictions{0};
+    
+    // Генератор временных меток
+    std::atomic<uint64_t> timestamp_counter{0};
 
 public:
-    LRUCache(size_t size) : max_size(size) {}
-    
-    bool get(const Key& key, Value& value, bool& valid) {
-        lock_guard<mutex> lock(cache_mutex);
+    void put(const std::string& key, const std::vector<uint8_t>& data) {
+        auto expiry = std::chrono::steady_clock::now() + std::chrono::seconds(CACHE_TTL);
+        uint64_t timestamp = timestamp_counter.fetch_add(1);
         
-        auto it = cache_map.find(key);
-        if (it == cache_map.end()) return false;
+        std::unique_lock<std::shared_mutex> lock(cache_mutex);
         
-        auto node = it->second;
-        if (time(nullptr) > node->expiry) {
-            cache_list.erase(node->list_it);
-            cache_map.erase(it);
-            return false;
+        // Если кэш переполнен, удаляем наименее используемые записи
+        if (cache_map.size() >= CACHE_SIZE) {
+            evict_expired_entries();
+            if (cache_map.size() >= CACHE_SIZE) {
+                evict_lru_entry();
+            }
         }
         
-        cache_list.erase(node->list_it);
-        cache_list.push_front(key);
-        node->list_it = cache_list.begin();
+        // Создаем новую запись
+        auto entry = std::make_unique<CacheEntry>(data, expiry);
+        entry->last_access = timestamp;
+        entry->access_count = 1;
         
-        value = node->value;
-        valid = node->dnssec_valid;
-        return true;
+        cache_map[key] = std::move(entry);
+        lru_queue.emplace_back(key, expiry);
     }
-    
-    void put(const Key& key, const Value& value, time_t ttl, bool valid) {
-        lock_guard<mutex> lock(cache_mutex);
+
+    std::vector<uint8_t> get(const std::string& key) {
+        std::shared_lock<std::shared_mutex> lock(cache_mutex);
         
         auto it = cache_map.find(key);
         if (it != cache_map.end()) {
-            auto node = it->second;
-            node->value = value;
-            node->expiry = time(nullptr) + ttl;
-            node->dnssec_valid = valid;
+            auto now = std::chrono::steady_clock::now();
             
-            cache_list.erase(node->list_it);
-            cache_list.push_front(key);
-            node->list_it = cache_list.begin();
-        } else {
-            if (cache_map.size() >= max_size) {
-                Key old_key = cache_list.back();
-                cache_list.pop_back();
-                cache_map.erase(old_key);
+            // Проверяем, не истекло ли время жизни
+            if (now < it->second->expiry_time) {
+                // Обновляем метрики доступа
+                uint64_t timestamp = timestamp_counter.fetch_add(1);
+                it->second->last_access = timestamp;
+                it->second->access_count++;
+                hits.fetch_add(1, std::memory_order_relaxed);
+                
+                return it->second->data;
+            } else {
+                // Запись устарела
+                misses.fetch_add(1, std::memory_order_relaxed);
             }
-            
-            auto node = make_shared<Node>();
-            node->key = key;
-            node->value = value;
-            node->expiry = time(nullptr) + ttl;
-            node->dnssec_valid = valid;
-            
-            cache_list.push_front(key);
-            node->list_it = cache_list.begin();
-            cache_map[key] = node;
+        } else {
+            misses.fetch_add(1, std::memory_order_relaxed);
+        }
+        
+        return {};
+    }
+    
+    // Удаление устаревших записей
+    void evict_expired_entries() {
+        auto now = std::chrono::steady_clock::now();
+        std::unique_lock<std::shared_mutex> lock(cache_mutex);
+        
+        for (auto it = cache_map.begin(); it != cache_map.end();) {
+            if (now >= it->second->expiry_time) {
+                it = cache_map.erase(it);
+                evictions.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                ++it;
+            }
         }
     }
     
-    size_t size() {
-        lock_guard<mutex> lock(cache_mutex);
-        return cache_map.size();
+    // Удаление наименее используемой записи (LRU)
+    void evict_lru_entry() {
+        if (cache_map.empty()) return;
+        
+        std::unique_lock<std::shared_mutex> lock(cache_mutex);
+        if (cache_map.empty()) return;
+        
+        // Находим запись с наименьшим счетчиком доступа и старой меткой времени
+        auto lru_it = cache_map.begin();
+        uint64_t min_access = lru_it->second->access_count;
+        uint64_t oldest_timestamp = lru_it->second->last_access;
+        
+        for (auto it = cache_map.begin(); it != cache_map.end(); ++it) {
+            if (it->second->access_count < min_access || 
+                (it->second->access_count == min_access && it->second->last_access < oldest_timestamp)) {
+                lru_it = it;
+                min_access = it->second->access_count;
+                oldest_timestamp = it->second->last_access;
+            }
+        }
+        
+        cache_map.erase(lru_it);
+        evictions.fetch_add(1, std::memory_order_relaxed);
+    }
+    
+    // Получение статистики
+    struct CacheStats {
+        uint64_t hits;
+        uint64_t misses;
+        uint64_t evictions;
+        size_t size;
+    };
+    
+    CacheStats get_stats() const {
+        std::shared_lock<std::shared_mutex> lock(cache_mutex);
+        return {
+            hits.load(std::memory_order_relaxed),
+            misses.load(std::memory_order_relaxed),
+            evictions.load(std::memory_order_relaxed),
+            cache_map.size()
+        };
+    }
+    
+    // Очистка всего кэша
+    void clear() {
+        std::unique_lock<std::shared_mutex> lock(cache_mutex);
+        cache_map.clear();
+        lru_queue.clear();
     }
 };
 
-// === ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ===
-sqlite3* cache_db = nullptr;
-LRUCache<string, string> lru_cache(MAX_CACHE_SIZE);
-ldns_rr_list* trust_anchors = nullptr;
+// Пул потоков
+class ThreadPool {
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    std::atomic<bool> stop{false};
 
-// === ИНИЦИАЛИЗАЦИЯ ===
-void init_cache() {
-    int rc = sqlite3_open(CACHE_DB.c_str(), &cache_db);
-    if (rc) {
-        cerr << "Can't open database: " << sqlite3_errmsg(cache_db) << endl;
-        exit(1);
-    }
-    
-    const char* create_table = R"(
-        CREATE TABLE IF NOT EXISTS dns_cache (
-            key TEXT PRIMARY KEY,
-            data BLOB,
-            expiry INTEGER,
-            dnssec_valid INTEGER
-        );
-    )";
-    
-    char* errMsg = 0;
-    rc = sqlite3_exec(cache_db, create_table, 0, 0, &errMsg);
-    if (rc != SQLITE_OK) {
-        cerr << "SQL error: " << errMsg << endl;
-        sqlite3_free(errMsg);
-        exit(1);
-    }
-    
-    trust_anchors = ldns_rr_list_new();
-    ldns_rr *root_ds;
-    // RFC 5011 Trust Anchor
-    ldns_status status = ldns_rr_new_frm_str(&root_ds,
-        ". IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D",
-        0, NULL, NULL);
-    if (status == LDNS_STATUS_OK && root_ds) {
-        ldns_rr_list_push_rr(trust_anchors, root_ds);
-    } else {
-        cerr << "Warning: Failed to create root DS record" << endl;
-    }
-}
-
-// === РАБОТА С КЭШЕМ ===
-void cache_store(const string& key, ldns_pkt* pkt, bool valid) {
-    string wire_data;
-    size_t wire_len = 0;
-    uint8_t* wire = nullptr;
-    ldns_status status = ldns_pkt2wire(&wire, pkt, &wire_len);
-    if (status == LDNS_STATUS_OK && wire) {
-        wire_data.assign((char*)wire, wire_len);
-        LDNS_FREE(wire);
-    }
-    
-    time_t ttl = 300;
-    ldns_rr_list* answers = ldns_pkt_answer(pkt);
-    if (answers && ldns_rr_list_rr_count(answers) > 0) {
-        ldns_rr* first = ldns_rr_list_rr(answers, 0);
-        ttl = ldns_rr_ttl(first);
-    }
-    
-    lru_cache.put(key, wire_data, ttl, valid);
-    
-    sqlite3_stmt* stmt;
-    const char* sql = "INSERT OR REPLACE INTO dns_cache (key, data, expiry, dnssec_valid) VALUES (?, ?, ?, ?)";
-    int rc = sqlite3_prepare_v2(cache_db, sql, -1, &stmt, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, key.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_blob(stmt, 2, wire_data.data(), wire_data.size(), SQLITE_STATIC);
-        sqlite3_bind_int64(stmt, 3, time(nullptr) + ttl);
-        sqlite3_bind_int(stmt, 4, valid ? 1 : 0);
-        
-        sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-    }
-}
-
-ldns_pkt* cache_lookup(const string& key, bool& valid) {
-    string wire_data;
-    if (lru_cache.get(key, wire_data, valid)) {
-        ldns_pkt* pkt = nullptr;
-        ldns_wire2pkt(&pkt, (const uint8_t*)wire_data.data(), wire_data.size());
-        return pkt;
-    }
-    
-    sqlite3_stmt* stmt;
-    const char* sql = "SELECT data, dnssec_valid FROM dns_cache WHERE key = ? AND expiry > ?";
-    int rc = sqlite3_prepare_v2(cache_db, sql, -1, &stmt, NULL);
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, key.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(stmt, 2, time(nullptr));
-        
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            const void* data = sqlite3_column_blob(stmt, 0);
-            int data_len = sqlite3_column_bytes(stmt, 0);
-            valid = sqlite3_column_int(stmt, 1);
-            
-            ldns_pkt* pkt = nullptr;
-            ldns_wire2pkt(&pkt, (const uint8_t*)data, data_len);
-            sqlite3_finalize(stmt);
-            
-            if (pkt) {
-                string data_str((const char*)data, data_len);
-                time_t ttl = 300;
-                ldns_rr_list* answers = ldns_pkt_answer(pkt);
-                if (answers && ldns_rr_list_rr_count(answers) > 0) {
-                    ttl = ldns_rr_ttl(ldns_rr_list_rr(answers, 0));
+public:
+    ThreadPool(size_t threads) {
+        for(size_t i = 0; i < threads; ++i) {
+            workers.emplace_back([this] {
+                while(true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex);
+                        this->condition.wait(lock, [this]{ return this->stop.load() || !this->tasks.empty(); });
+                        if(this->stop.load() && this->tasks.empty()) return;
+                        task = std::move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+                    task();
                 }
-                lru_cache.put(key, data_str, ttl, valid);
-            }
+            });
+        }
+    }
+
+    template<class F>
+    void enqueue(F&& f) {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            if(stop.load()) throw std::runtime_error("enqueue on stopped ThreadPool");
+            tasks.emplace(std::forward<F>(f));
+        }
+        condition.notify_one();
+    }
+
+    ~ThreadPool() {
+        stop.store(true);
+        condition.notify_all();
+        for(std::thread &worker: workers) worker.join();
+    }
+};
+
+// Высокопроизводительный DNS-сервер
+class UltraFastDNSServer {
+private:
+    int server_socket;
+    UltraFastCache cache;
+    std::unique_ptr<ThreadPool> thread_pool;
+    std::atomic<uint64_t> queries_processed{0};
+    std::atomic<uint64_t> errors_occurred{0};
+
+public:
+    UltraFastDNSServer() : server_socket(-1) {
+        // Создаем пул потоков
+        size_t thread_count = std::thread::hardware_concurrency();
+        if (thread_count == 0) thread_count = 4;
+        thread_pool = std::make_unique<ThreadPool>(thread_count);
+        std::cout << "Thread pool initialized with " << thread_count << " threads" << std::endl;
+
+        // Создаем сокет
+        server_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (server_socket < 0) {
+            throw std::runtime_error("Failed to create socket");
+        }
+
+        // Увеличиваем размеры буферов
+        int buffer_size = 4 * 1024 * 1024; // 4MB
+        setsockopt(server_socket, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
+        setsockopt(server_socket, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(DNS_PORT);
+
+        if (bind(server_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            close(server_socket);
+            throw std::runtime_error("Failed to bind socket: " + std::to_string(errno));
+        }
+
+        std::cout << "Ultra Fast DNS Server started on port " << DNS_PORT << std::endl;
+        std::cout << "Custom high-performance cache size: " << CACHE_SIZE << " entries" << std::endl;
+        std::cout << "Cache TTL: " << CACHE_TTL << " seconds" << std::endl;
+        
+        // Запускаем поток для периодической очистки кэша
+        start_cache_cleanup_thread();
+    }
+
+    ~UltraFastDNSServer() {
+        if (server_socket >= 0) {
+            close(server_socket);
+        }
+    }
+
+    void run() {
+        uint8_t buffer[BUF_SIZE];
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+
+        std::cout << "Server is ready to handle requests..." << std::endl;
+
+        while (true) {
+            ssize_t bytes_received = recvfrom(server_socket, buffer, BUF_SIZE, 0,
+                                              (struct sockaddr*)&client_addr, &client_len);
             
-            return pkt;
-        }
-        sqlite3_finalize(stmt);
-    }
-    
-    valid = false;
-    return nullptr;
-}
-
-// === DNSSEC ВАЛИДАЦИЯ ===
-bool validate_dnssec(ldns_pkt* pkt, const string& qname) {
-    if (!trust_anchors || !pkt) return false;
-    
-    ldns_resolver* res = nullptr;
-    ldns_resolver_new_frm_file(&res, NULL);
-    if (!res) return false;
-    
-    ldns_resolver_set_dnssec(res, 1);
-    ldns_resolver_set_dnssec_cd(res, 1); // Checking Disabled - мы проверяем сами
-    ldns_resolver_set_dnssec_anchors(res, ldns_rr_list_clone(trust_anchors));
-    
-    ldns_rdf* qname_rdf = ldns_dname_new_frm_str(qname.c_str());
-    if (!qname_rdf) {
-        ldns_resolver_deep_free(res);
-        return false;
-    }
-    
-    // Запрашиваем DNSKEY для домена
-    ldns_pkt* dnskey_response = ldns_resolver_query(res, qname_rdf, LDNS_RR_TYPE_DNSKEY, LDNS_RR_CLASS_IN, LDNS_RD);
-    ldns_rr_list* dnskeys = nullptr;
-    if (dnskey_response) {
-        dnskeys = ldns_pkt_rr_list_by_type(dnskey_response, LDNS_RR_TYPE_DNSKEY, LDNS_SECTION_ANSWER);
-    }
-    
-    // Получаем RRset для валидации
-    ldns_rr_list* rrset = ldns_pkt_rr_list_by_name_and_type(pkt, 
-        qname_rdf, 
-        LDNS_RR_TYPE_ANY, 
-        LDNS_SECTION_ANSWER);
-    
-    // Получаем RRSIG записи
-    ldns_rr_list* rrsigs = ldns_pkt_rr_list_by_type(pkt, LDNS_RR_TYPE_RRSIG, LDNS_SECTION_ANSWER);
-    
-    ldns_rdf_deep_free(qname_rdf);
-    
-    if (!rrset || !rrsigs || ldns_rr_list_rr_count(rrsigs) == 0) {
-        if(dnskey_response) ldns_pkt_free(dnskey_response);
-        if(dnskeys) ldns_rr_list_deep_free(dnskeys);
-        if(rrset) ldns_rr_list_deep_free(rrset);
-        if(rrsigs) ldns_rr_list_deep_free(rrsigs);
-        ldns_resolver_deep_free(res);
-        return false;
-    }
-    
-    // Проверяем каждую RRSIG запись
-    bool all_valid = true;
-    for (size_t i = 0; i < ldns_rr_list_rr_count(rrsigs); i++) {
-        ldns_rr* rrsig = ldns_rr_list_rr(rrsigs, i);
-        ldns_status status = ldns_verify_rrsig_keylist(rrset, rrsig, dnskeys, NULL);
-        if (status != LDNS_STATUS_OK) {
-            all_valid = false;
-            break;
-        }
-    }
-    
-    ldns_rr_list_deep_free(rrset);
-    ldns_rr_list_deep_free(rrsigs);
-    if(dnskey_response) ldns_pkt_free(dnskey_response);
-    if(dnskeys) ldns_rr_list_deep_free(dnskeys);
-    ldns_resolver_deep_free(res);
-    
-    return all_valid;
-}
-
-// === ФУНКЦИИ ДЛЯ РАБОТЫ С ECS ===
-
-// Извлекает ECS-опцию из OPT RR пакета
-bool has_ecs_option(const ldns_pkt* query_pkt) {
-    // ldns_pkt_edns возвращает bool, а не ldns_rr*
-    if (!ldns_pkt_edns(query_pkt)) {
-        return false; // Нет OPT RR
-    }
-
-    // Получаем OPT RR напрямую из секции дополнительных записей
-    ldns_rr_list* additional = ldns_pkt_additional(query_pkt);
-    if (!additional) {
-        return false;
-    }
-
-    ldns_rr* opt_rr = nullptr;
-    for (size_t i = 0; i < ldns_rr_list_rr_count(additional); i++) {
-        ldns_rr* rr = ldns_rr_list_rr(additional, i);
-        if (rr && ldns_rr_get_type(rr) == LDNS_RR_TYPE_OPT) {
-            opt_rr = rr;
-            break;
-        }
-    }
-
-    if (!opt_rr) {
-        return false;
-    }
-
-    for (size_t i = 0; i < ldns_rr_rd_count(opt_rr); i++) {
-        ldns_rdf* opt_rdata = ldns_rr_rdf(opt_rr, i);
-        if (!opt_rdata) continue;
-
-        // Проверяем, является ли это опцией (состоит из 2 полей: код и данные)
-        if (ldns_rdf_size(opt_rdata) >= 4) {
-            uint16_t option_code = ldns_read_uint16(ldns_rdf_data(opt_rdata));
-            if (option_code == 8) { // ECS option code is 8
-                return true; // Найдена ECS-опция
+            if (bytes_received > 0) {
+                // Копируем данные для передачи в пул потоков
+                std::vector<uint8_t> data(buffer, buffer + bytes_received);
+                
+                // Отправляем задачу в пул потоков
+                thread_pool->enqueue([this, data, client_addr, client_len]() {
+                    handle_request(data, client_addr, client_len);
+                });
             }
         }
     }
-    return false;
-}
 
-// === ОТПРАВКА ЗАПРОСА (БЕЗ ECS) ===
-ldns_pkt* send_dns_query(const string& qname, ldns_rr_type qtype) {
-    ldns_resolver* res = nullptr;
-    ldns_rdf* domain = ldns_dname_new_frm_str(qname.c_str());
-    
-    ldns_resolver_new_frm_file(&res, NULL);
-    if (!res) {
-        if(domain) ldns_rdf_deep_free(domain);
-        return nullptr;
-    }
-    
-    ldns_resolver_set_dnssec(res, 1);
-    ldns_resolver_set_dnssec_cd(res, 1);
-
-    // Отправляем стандартный запрос
-    ldns_pkt* pkt = ldns_resolver_query(res, domain, qtype, LDNS_RR_CLASS_IN, LDNS_RD);
-    
-    ldns_rdf_deep_free(domain);
-    ldns_resolver_deep_free(res);
-    
-    return pkt;
-}
-
-// === ОБРАБОТКА ЗАПРОСА ===
-ldns_pkt* handle_dns_query(const string& qname, ldns_rr_type qtype, bool& dnssec_valid) {
-    string cache_key = qname + "_" + to_string(qtype);
-
-    ldns_pkt* cached = cache_lookup(cache_key, dnssec_valid);
-    if (cached) {
-        cout << "[CACHE HIT] " << qname << " type " << qtype << endl;
-        return cached;
-    }
-    
-    cout << "[QUERYING] " << qname << " type " << qtype << endl;
-    
-    ldns_pkt* response = send_dns_query(qname, qtype);
-    if (!response) return nullptr;
-    
-    dnssec_valid = validate_dnssec(response, qname);
-    
-    cache_store(cache_key, response, dnssec_valid);
-    
-    return response;
-}
-
-// === UDP ОБРАБОТЧИК ===
-void handle_udp_request(int sockfd, bool is_ipv6 = false) {
-    char buffer[4096];
-    struct sockaddr_storage client_addr{};
-    socklen_t len = is_ipv6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
-    
-    int n = recvfrom(sockfd, buffer, sizeof(buffer), 0, 
-                     (struct sockaddr*)&client_addr, &len);
-    if (n <= 0) return;
-    
-    ldns_pkt* query = nullptr;
-    ldns_status status = ldns_wire2pkt(&query, (uint8_t*)buffer, n);
-    if (status != LDNS_STATUS_OK || !query) {
-        cerr << "Failed to parse incoming UDP packet" << endl;
-        return;
-    }
-    
-    ldns_rr_list* questions = ldns_pkt_question(query);
-    if (!questions || ldns_rr_list_rr_count(questions) == 0) {
-        ldns_pkt_free(query);
-        return;
-    }
-    
-    ldns_rr* question = ldns_rr_list_rr(questions, 0);
-    ldns_rdf* qname_rdf = ldns_rr_owner(question);
-    ldns_rr_type qtype = ldns_rr_get_type(question);
-    
-    char* qname_cstr = ldns_rdf2str(qname_rdf);
-    string qname(qname_cstr ? qname_cstr : "");
-    if(qname_cstr) free(qname_cstr);
-    
-    if(qname.empty()) {
-        ldns_pkt_free(query);
-        return;
-    }
-    
-    // --- ПРОВЕРКА НАЛИЧИЯ ECS В ЗАПРОСЕ ---
-    if (has_ecs_option(query)) {
-        cout << "[ECS] Client Subnet option found in UDP query for " << qname << endl;
-    }
-    // --- КОНЕЦ ПРОВЕРКИ ECS ---
-
-    bool dnssec_valid = false;
-    ldns_pkt* response = handle_dns_query(qname, qtype, dnssec_valid);
-
-    if (response) {
-        ldns_pkt_set_id(response, ldns_pkt_id(query));
-        
-        if (dnssec_valid) {
-            ldns_pkt_set_ad(response, 1);
-        }
-        
-        size_t wire_len = 0;
-        uint8_t* wire_data = nullptr;
-        ldns_pkt2wire(&wire_data, response, &wire_len);
-        
-        if (wire_data && wire_len <= 512) {
-            sendto(sockfd, wire_data, wire_len, 0, 
-                   (struct sockaddr*)&client_addr, len);
-        } else {
-            ldns_pkt* truncated = ldns_pkt_new();
-            ldns_pkt_set_id(truncated, ldns_pkt_id(query));
-            ldns_pkt_set_tc(truncated, 1);
-            
-            size_t trunc_len = 0;
-            uint8_t* trunc_data = nullptr;
-            ldns_pkt2wire(&trunc_data, truncated, &trunc_len);
-            
-            if (trunc_data) {
-                sendto(sockfd, trunc_data, trunc_len, 0,
-                       (struct sockaddr*)&client_addr, len);
-                LDNS_FREE(trunc_data);
+private:
+    void start_cache_cleanup_thread() {
+        std::thread cleanup_thread([this]() {
+            while (true) {
+                std::this_thread::sleep_for(std::chrono::seconds(60));
+                
+                // Очищаем устаревшие записи
+                cache.evict_expired_entries();
+                
+                // Выводим статистику каждые 5 минут
+                static int counter = 0;
+                if (++counter % 5 == 0) {
+                    auto stats = cache.get_stats();
+                    std::cout << "[CACHE STATS] Size: " << stats.size 
+                              << ", Hits: " << stats.hits 
+                              << ", Misses: " << stats.misses
+                              << ", Evictions: " << stats.evictions << std::endl;
+                    
+                    std::cout << "[SERVER STATS] Processed: " << queries_processed.load()
+                              << ", Errors: " << errors_occurred.load() << std::endl;
+                }
             }
-            ldns_pkt_free(truncated);
+        });
+        cleanup_thread.detach();
+    }
+
+    std::string parse_domain_name(const std::vector<uint8_t>& data, size_t& offset) {
+        std::string domain;
+        if (offset >= data.size()) return "";
+
+        while (offset < data.size() && data[offset] != 0) {
+            if ((data[offset] & 0xC0) == 0xC0) {
+                offset += 2;
+                break;
+            }
+            uint8_t len = data[offset++];
+            if (offset + len > data.size()) {
+                return "";
+            }
+            if (!domain.empty()) domain += ".";
+            domain.append(reinterpret_cast<const char*>(data.data() + offset), len);
+            offset += len;
         }
         
-        if (wire_data) LDNS_FREE(wire_data);
-        ldns_pkt_free(response);
-    } else {
-        cerr << "No response for " << qname << " type " << qtype << endl;
-    }
-    
-    ldns_pkt_free(query);
-}
+        if (offset < data.size() && data[offset] == 0) {
+            offset++;
+        }
 
-// === TCP ОБРАБОТЧИК ===
-void handle_tcp_request(int client_fd, bool is_ipv6 = false) {
-    uint16_t len_nbo;
-    if (recv(client_fd, &len_nbo, 2, MSG_WAITALL) != 2) {
-        close(client_fd);
-        return;
+        return domain;
     }
-    
-    uint16_t len = ntohs(len_nbo);
-    if (len > 4096) {
-        close(client_fd);
-        return;
-    }
-    
-    vector<uint8_t> buffer(len);
-    if (recv(client_fd, buffer.data(), len, MSG_WAITALL) != len) {
-        close(client_fd);
-        return;
-    }
-    
-    ldns_pkt* query = nullptr;
-    ldns_status status = ldns_wire2pkt(&query, buffer.data(), len);
-    if (status != LDNS_STATUS_OK || !query) {
-        cerr << "Failed to parse incoming TCP packet" << endl;
-        close(client_fd);
-        return;
-    }
-    
-    ldns_rr_list* questions = ldns_pkt_question(query);
-    if (!questions || ldns_rr_list_rr_count(questions) == 0) {
-        ldns_pkt_free(query);
-        close(client_fd);
-        return;
-    }
-    
-    ldns_rr* question = ldns_rr_list_rr(questions, 0);
-    ldns_rdf* qname_rdf = ldns_rr_owner(question);
-    ldns_rr_type qtype = ldns_rr_get_type(question);
-    
-    char* qname_cstr = ldns_rdf2str(qname_rdf);
-    string qname(qname_cstr ? qname_cstr : "");
-    if(qname_cstr) free(qname_cstr);
-    
-    if(qname.empty()) {
-        ldns_pkt_free(query);
-        close(client_fd);
-        return;
-    }
-    
-    // --- ПРОВЕРКА НАЛИЧИЯ ECS В ЗАПРОСЕ ---
-    if (has_ecs_option(query)) {
-        cout << "[ECS] Client Subnet option found in TCP query for " << qname << endl;
-    }
-    // --- КОНЕЦ ПРОВЕРКИ ECS ---
 
-    bool dnssec_valid = false;
-    ldns_pkt* response = handle_dns_query(qname, qtype, dnssec_valid);
+    void handle_request(const std::vector<uint8_t>& data,
+                       const struct sockaddr_in& client_addr, 
+                       socklen_t client_len) {
+        try {
+            if (data.size() < sizeof(DNSHeader)) {
+                return;
+            }
 
-    if (response) {
-        ldns_pkt_set_id(response, ldns_pkt_id(query));
+            DNSHeader header;
+            std::memcpy(&header, data.data(), sizeof(header));
+            header.id = ntohs(header.id);
+            header.flags = ntohs(header.flags);
+            header.qdcount = ntohs(header.qdcount);
+
+            // Проверяем, что это запрос
+            if ((header.flags & 0x8000) != 0) {
+                return;
+            }
+
+            size_t offset = sizeof(DNSHeader);
+            std::string domain = parse_domain_name(data, offset);
+            if (domain.empty() || offset + 4 > data.size()) {
+                send_error_response(header.id, RCODE_FORMERR, client_addr, client_len);
+                errors_occurred.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+
+            uint16_t qtype, qclass;
+            std::memcpy(&qtype, data.data() + offset, 2);
+            std::memcpy(&qclass, data.data() + offset + 2, 2);
+            qtype = ntohs(qtype);
+            qclass = ntohs(qclass);
+
+            // Создаем ключ кэша
+            std::string cache_key = domain + "_" + std::to_string(qtype);
+
+            // Проверяем кэш
+            auto cached_response = cache.get(cache_key);
+            if (!cached_response.empty()) {
+                // Восстанавливаем ID
+                if (cached_response.size() >= 2) {
+                    cached_response[0] = (header.id >> 8) & 0xFF;
+                    cached_response[1] = header.id & 0xFF;
+                }
+                
+                sendto(server_socket, cached_response.data(), cached_response.size(), 0,
+                       (struct sockaddr*)&client_addr, client_len);
+                queries_processed.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+
+            // Выполняем рекурсивный запрос
+            auto response = perform_recursive_lookup(domain, qtype, qclass);
+            
+            if (!response.empty()) {
+                // Сохраняем в кэш (без ID)
+                std::vector<uint8_t> cache_data = response;
+                if (cache_data.size() >= 2) {
+                    cache_data[0] = 0;
+                    cache_data[1] = 0;
+                }
+                cache.put(cache_key, cache_data);
+                
+                // Восстанавливаем ID
+                if (response.size() >= 2) {
+                    response[0] = (header.id >> 8) & 0xFF;
+                    response[1] = header.id & 0xFF;
+                }
+                
+                sendto(server_socket, response.data(), response.size(), 0,
+                       (struct sockaddr*)&client_addr, client_len);
+            } else {
+                send_error_response(header.id, RCODE_SERVFAIL, client_addr, client_len);
+                errors_occurred.fetch_add(1, std::memory_order_relaxed);
+            }
+            
+            queries_processed.fetch_add(1, std::memory_order_relaxed);
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Error handling request: " << e.what() << std::endl;
+            errors_occurred.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    std::vector<uint8_t> perform_recursive_lookup(const std::string& domain, 
+                                                 uint16_t qtype, 
+                                                 uint16_t qclass) {
+        ares_channel channel;
+        struct ares_options options = {};
+        options.timeout = 2000; // 2 секунды
+        options.tries = 2; // 2 попытки
         
-        if (dnssec_valid) {
-            ldns_pkt_set_ad(response, 1);
+        int status = ares_init_options(&channel, &options, 
+                                      ARES_OPT_TIMEOUTMS | ARES_OPT_TRIES);
+        if (status != ARES_SUCCESS) {
+            std::cerr << "c-ares init failed: " << ares_strerror(status) << std::endl;
+            return {};
+        }
+
+        // Настраиваем корневые сервера
+        struct ares_addr_node root_servers[13];
+        
+        const char* root_ips[] = {
+            "198.41.0.4",    // a.root-servers.net
+            "199.9.14.201",  // b.root-servers.net
+            "192.33.4.12",   // c.root-servers.net
+            "199.7.91.13",   // d.root-servers.net
+            "192.203.230.10", // e.root-servers.net
+            "192.5.5.241",   // f.root-servers.net
+            "192.112.36.4",  // g.root-servers.net
+            "198.97.190.53", // h.root-servers.net
+            "192.36.148.17", // i.root-servers.net
+            "192.58.128.30", // j.root-servers.net
+            "193.0.14.129",  // k.root-servers.net
+            "199.7.83.42",   // l.root-servers.net
+            "202.12.27.33"   // m.root-servers.net
+        };
+        
+        for (int i = 0; i < 13; i++) {
+            root_servers[i].next = (i < 12) ? &root_servers[i+1] : nullptr;
+            root_servers[i].family = AF_INET;
+            inet_pton(AF_INET, root_ips[i], &root_servers[i].addr.addr4);
         }
         
-        size_t wire_len = 0;
-        uint8_t* wire_data = nullptr;
-        ldns_pkt2wire(&wire_data, response, &wire_len);
+        ares_set_servers(channel, root_servers);
+
+        std::vector<uint8_t> result;
+        bool completed = false;
+
+        ares_query(channel, domain.c_str(), qclass, qtype,
+                  [](void* arg, int status, int timeouts, unsigned char* abuf, int alen) {
+                      auto* result_vec = static_cast<std::vector<uint8_t>*>(arg);
+                      
+                      if (status == ARES_SUCCESS && abuf && alen > 0) {
+                          result_vec->assign(abuf, abuf + alen);
+                      }
+                      // Отмечаем завершение
+                      static bool dummy = true;
+                      dummy = true;
+                  }, 
+                  &result);
+
+        auto start_time = std::chrono::steady_clock::now();
+        while (result.empty()) {
+            fd_set readers, writers;
+            FD_ZERO(&readers);
+            FD_ZERO(&writers);
+            
+            int nfds = ares_fds(channel, &readers, &writers);
+            if (nfds > 0) {
+                struct timeval tv;
+                tv.tv_sec = 0;
+                tv.tv_usec = 50000; // 50ms
+                
+                if (select(nfds, &readers, &writers, NULL, &tv) >= 0) {
+                    ares_process(channel, &readers, &writers);
+                }
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count() > 3000) {
+                break;
+            }
+        }
+
+        ares_destroy(channel);
+        return result;
+    }
+
+    void send_error_response(uint16_t id, uint16_t rcode,
+                           const struct sockaddr_in& client_addr, 
+                           socklen_t client_len) {
+        std::vector<uint8_t> response(12, 0);
         
-        if (wire_data) {
-            uint16_t send_len = htons(wire_len);
-            send(client_fd, &send_len, 2, 0);
-            send(client_fd, wire_data, wire_len, 0);
-            LDNS_FREE(wire_data);
-        }
+        uint16_t flags = 0x8000; // QR bit
+        flags |= (rcode & 0x000F); // RCODE
         
-        ldns_pkt_free(response);
-    } else {
-        cerr << "No response for " << qname << " type " << qtype << " (TCP)" << endl;
+        response[0] = (id >> 8) & 0xFF;
+        response[1] = id & 0xFF;
+        response[2] = (flags >> 8) & 0xFF;
+        response[3] = flags & 0xFF;
+        
+        sendto(server_socket, response.data(), response.size(), 0,
+               (struct sockaddr*)&client_addr, client_len);
     }
-    
-    ldns_pkt_free(query);
-    close(client_fd);
-}
+};
 
-// === СОЗДАНИЕ И НАСТРОЙКА СОКЕТОВ ===
-bool setup_socket(int& sock, int domain, int type, int port, bool is_loopback) {
-    sock = socket(domain, type, 0);
-    if (sock < 0) {
-        perror(type == SOCK_DGRAM ? "UDP socket" : "TCP socket");
-        return false;
-    }
-    
-    // Разрешить повторное использование адреса
-    int opt = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt SO_REUSEADDR");
-        close(sock);
-        return false;
-    }
-    
-    if (domain == AF_INET6) {
-        // Для IPv6 также разрешаем повторное использование
-        if (setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt)) < 0) {
-            perror("setsockopt IPV6_V6ONLY");
-            close(sock);
-            return false;
-       }
-    }
-
-    struct sockaddr_storage addr_storage = {};
-    socklen_t addr_len;
-
-    if (domain == AF_INET) {
-        struct sockaddr_in* addr_v4 = (struct sockaddr_in*)&addr_storage;
-        addr_v4->sin_family = AF_INET;
-        addr_v4->sin_port = htons(port);
-        if (is_loopback) {
-            addr_v4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        } else {
-            addr_v4->sin_addr.s_addr = INADDR_ANY;
-        }
-        addr_len = sizeof(*addr_v4);
-    } else { // AF_INET6
-        struct sockaddr_in6* addr_v6 = (struct sockaddr_in6*)&addr_storage;
-        addr_v6->sin6_family = AF_INET6;
-        addr_v6->sin6_port = htons(port);
-        if (is_loopback) {
-            addr_v6->sin6_addr = in6addr_loopback;
-        } else {
-            addr_v6->sin6_addr = in6addr_any;
-        }
-        addr_len = sizeof(*addr_v6);
-    }
-
-    if (bind(sock, (struct sockaddr*)&addr_storage, addr_len) < 0) {
-        string type_str = (type == SOCK_DGRAM) ? "UDP" : "TCP";
-        string ip_str = (domain == AF_INET) ? "IPv4" : "IPv6";
-        string addr_str = is_loopback ? (domain == AF_INET ? "127.0.0.1" : "::1") : "all interfaces";
-        perror((type_str + " " + ip_str + " bind on " + addr_str).c_str());
-        close(sock);
-        return false;
-    }
-
-    if (type == SOCK_STREAM) {
-        if (listen(sock, 100) < 0) {
-            perror("TCP listen");
-            close(sock);
-            return false;
-        }
-        int flags = fcntl(sock, F_GETFL, 0);
-        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-    }
-
-    return true;
-}
-
-
-// === ОСНОВНОЙ ЦИКЛ СЕРВЕРА ===
 int main() {
-    cout << "Initializing DNS server on port " << UDP_PORT << " (localhost only)..." << endl;
-    
-    init_cache();
-    
-    int udp_sock_v4, udp_sock_v6, tcp_sock_v4, tcp_sock_v6;
-    
-    if (!setup_socket(udp_sock_v4, AF_INET, SOCK_DGRAM, UDP_PORT, BIND_TO_LOCALHOST_ONLY)) return 1;
-    if (!setup_socket(udp_sock_v6, AF_INET6, SOCK_DGRAM, UDP_PORT, BIND_TO_LOCALHOST_ONLY)) return 1;
-    if (!setup_socket(tcp_sock_v4, AF_INET, SOCK_STREAM, TCP_PORT, BIND_TO_LOCALHOST_ONLY)) return 1;
-    if (!setup_socket(tcp_sock_v6, AF_INET6, SOCK_STREAM, TCP_PORT, BIND_TO_LOCALHOST_ONLY)) return 1;
-    
-    cout << "DNS server listening on UDP/TCP ports " << UDP_PORT << " (127.0.0.1 and ::1)" << endl;
-    
-    struct pollfd fds[4];
-    fds[0].fd = udp_sock_v4;
-    fds[0].events = POLLIN;
-    fds[1].fd = udp_sock_v6;
-    fds[1].events = POLLIN;
-    fds[2].fd = tcp_sock_v4;
-    fds[2].events = POLLIN;
-    fds[3].fd = tcp_sock_v6;
-    fds[3].events = POLLIN;
-    
-    while (true) {
-        int ret = poll(fds, 4, -1);
-        if (ret < 0) {
-            perror("poll");
-            break;
-        }
-        
-        if (fds[0].revents & POLLIN) {
-            handle_udp_request(udp_sock_v4, false);
-        }
-        
-        if (fds[1].revents & POLLIN) {
-            handle_udp_request(udp_sock_v6, true);
-        }
-        
-        if (fds[2].revents & POLLIN) {
-            struct sockaddr_in6 client_addr;
-            socklen_t client_len = sizeof(client_addr);
-            int client_fd = accept(tcp_sock_v4, (struct sockaddr*)&client_addr, &client_len);
-            if (client_fd >= 0) {
-                thread(handle_tcp_request, client_fd, false).detach();
-            }
-        }
-        
-        if (fds[3].revents & POLLIN) {
-            struct sockaddr_in6 client_addr;
-            socklen_t client_len = sizeof(client_addr);
-            int client_fd = accept(tcp_sock_v6, (struct sockaddr*)&client_addr, &client_len);
-            if (client_fd >= 0) {
-                thread(handle_tcp_request, client_fd, true).detach();
-            }
-        }
+    try {
+        UltraFastDNSServer server;
+        std::cout << "Ultra-fast DNS server features:" << std::endl;
+        std::cout << "  - Custom LRU cache with " << CACHE_SIZE << " entries" << std::endl;
+        std::cout << "  - Multi-threaded processing" << std::endl;
+        std::cout << "  - Atomic counters for performance" << std::endl;
+        std::cout << "  - Large socket buffers (4MB)" << std::endl;
+        std::cout << "\nTest commands:" << std::endl;
+        std::cout << "  dig @127.0.0.1 -p 5311 google.com" << std::endl;
+        std::cout << "  dig @127.0.0.1 -p 5311 github.com" << std::endl;
+        server.run();
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
     }
-    
-    close(udp_sock_v4);
-    close(udp_sock_v6);
-    close(tcp_sock_v4);
-    close(tcp_sock_v6);
-    sqlite3_close(cache_db);
-    if(trust_anchors) ldns_rr_list_deep_free(trust_anchors);
     
     return 0;
 }
