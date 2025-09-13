@@ -1,198 +1,93 @@
-# DNS Resolver
+# resolver
 
-Полноценный DNS resolver, использующий библиотеку [dnsr](https://github.com/domainr/dnsr), созданный как аналог PowerDNS с высокой производительностью и кэшированием.
+A recursive DNS resolver with a Go-based API, designed to handle domain name resolution from the root nameservers.
+It includes support for DNSSEC validation via the dnssec package, which ensures the authenticity 
+and integrity of DNS responses. Please note that the dnssec package will eventually be moved to its own 
+dedicated project.
 
-## Особенности
+> [!WARNING]
+> This is an alpha release and remains a work in progress. Users should expect potential
+> changes and improvements as development continues. It is not recommended to rely on this project for
+> security-critical applications at this stage.
 
-- **Высокая производительность**: Обработка запросов за микросекунды благодаря эффективному кэшированию
-- **Многоуровневое кэширование**: 
-  - Внутренний кэш dnsr библиотеки (10,000 записей)
-  - Кэш приложения с TTL 5 минут
-- **Поддержка всех основных типов записей**: A, AAAA, CNAME, MX, NS, TXT
-- **Конкурентная обработка**: Каждый запрос обрабатывается в отдельной горутине
-- **Автоматическое повторение по TCP**: При усечении UDP пакетов
-- **Детальное логирование**: Время обработки, статистика кэша, ошибки
-
-## Требования
-
-- Go 1.25.0+
-- Доступ к интернету для разрешения DNS запросов
-
-## Установка и запуск
-
-### Автоматическая установка (рекомендуется)
-
-```bash
-# Быстрая установка с автоматической настройкой сервиса
-curl -sSL https://raw.githubusercontent.com/ASTRACAT2022/dns-g/main/install.sh | sudo bash
-
-# Или клонировать и запустить локально
-git clone https://github.com/ASTRACAT2022/dns-g.git
-cd dns-g
-sudo ./install.sh
-```
-
-Автоматический установщик:
-- ✅ Устанавливает все зависимости (включая Go)
-- ✅ Создает системный сервис (systemd/launchd)
-- ✅ Настраивает автозапуск
-- ✅ Конфигурирует файрвол
-- ✅ Создает команды управления
-
-После установки используйте:
-```bash
-dns-g-ctl start     # Запуск сервиса
-dns-g-ctl status    # Проверка статуса
-dns-g-ctl test      # Тестирование DNS
-```
-
-### Ручная установка
-
-```bash
-# Клонирование репозитория
-git clone https://github.com/ASTRACAT2022/dns-g.git
-cd dns-g
-
-# Установка зависимостей
-go mod tidy
-
-# Сборка
-go build -o dns_resolver main.go
-
-# Запуск
-./dns_resolver
-```
-
-Сервер запустится на порту **5454** (изменен с 5353 для избежания конфликта с системным mDNS).
-
-## Использование
-
-### Тестирование с помощью dig
-
-```bash
-# A записи
-dig @localhost -p 5454 google.com A +short
-
-# AAAA записи
-dig @localhost -p 5454 ipv6.google.com AAAA +short
-
-# MX записи
-dig @localhost -p 5454 gmail.com MX +short
-
-# TXT записи
-dig @localhost -p 5454 example.com TXT +short
-
-# CNAME записи
-dig @localhost -p 5454 www.example.com CNAME +short
-```
-
-### Автоматическое тестирование
-
-Запустите тестовый скрипт для комплексной проверки:
-
-```bash
-./test_dns_resolver.sh
-```
-
-### Юнит-тесты
-
-```bash
-go test -v
-```
-
-## Производительность
-
-Результаты тестирования показывают отличную производительность:
-
-- **Первый запрос**: ~300-900ms (время разрешения через интернет)
-- **Кэшированный запрос**: ~40-100µs (в тысячи раз быстрее!)
-
-### Пример результатов тестирования
-
-```
-Testing example.com A record...
-  example.com A - First query: OK (Time: .910319000 seconds)
-  example.com A - Second query: OK (Time: .007494000 seconds)
-
-Testing ipv6.google.com AAAA record...
-  ipv6.google.com AAAA - First query: OK (Time: .730056000 seconds)
-  ipv6.google.com AAAA - Second query: OK (Time: .008414000 seconds)
-```
-
-## Архитектура
-
-### Основные компоненты
-
-1. **UDP Сервер**: Слушает на порту 5454, обрабатывает DNS запросы
-2. **dnsr.Resolver**: Библиотека для разрешения DNS запросов с собственным кэшем
-3. **Кэш приложения**: Дополнительный уровень кэширования с настраиваемым TTL
-4. **Конкурентная обработка**: Каждый запрос обрабатывается в отдельной горутине
-
-### Конфигурация
+# Usage
 
 ```go
-const (
-    listenPort = 5454               // Порт для прослушивания
-    cacheTTL   = 5 * time.Minute    // TTL кэша приложения
+package main
+
+import (
+	"context"
+	"fmt"
+	"github.com/davecgh/go-spew/spew"
+	"github.com/miekg/dns"
+	"github.com/nsmithuk/resolver"
 )
 
-// Настройки dnsr.Resolver
-resolver = dnsr.NewResolver(
-    dnsr.WithCache(10000),            // Кэш на 10000 записей
-    dnsr.WithTimeout(10*time.Second), // Таймаут 10 секунд
-    dnsr.WithExpiry(),                // Очистка устаревших записей
-    dnsr.WithTCPRetry(),              // Повтор по TCP при усечении
-)
+func main() {
+	
+	// Override the default logging hook on resolver.
+	// Query to print each outgoing query to stdout.
+	// (So you can see what's happening.)
+	resolver.Query = func(s string) {
+		fmt.Println("Query: " + s)
+	}
+
+
+	r := resolver.NewResolver()
+
+	// Prepare a new DNS message struct.
+	msg := new(dns.Msg)
+	
+	// Set it up as a question for the A record of “test.qazz.uk.” (Fqdn adds trailing dot).
+	msg.SetQuestion(dns.Fqdn("test.qazz.uk"), dns.TypeA)
+
+	// Add an OPT record to enable EDNS0 with a 4096‐byte UDP payload and DNSSEC OK bit.
+	msg.SetEdns0(4096, true)
+
+	// Perform the DNS query, using a background Context (no timeout/cancel).
+	// Returns a resolver.Result, or error info embedded inside it.
+	result := r.Exchange(context.Background(), msg)
+
+	// Dump the full Result struct (including Response Msg, error, timings, etc.)
+	// to stdout in a human-readable form.
+	spew.Dump(result)
+}
 ```
 
-## Поддерживаемые типы записей
+Outputs something along the lines of:
 
-| Тип | Описание | Поддержка |
-|-----|----------|-----------|
-| A | IPv4 адреса | ✅ |
-| AAAA | IPv6 адреса | ✅ |
-| CNAME | Канонические имена | ✅ |
-| MX | Mail exchange | ✅ |
-| NS | Name servers | ✅ |
-| TXT | Текстовые записи | ✅ |
-| SOA | Start of authority | ⏭️ (пропускается) |
+```shell
+Query: 649949c-1: 12.616666ms taken querying [test.qazz.uk.] A in zone [.] on udp://a.root-servers.net. ([2001:503:ba3e::2:30]:53)
+Query: 649949c-1: 5.895667ms taken querying [uk.] DNSKEY in zone [uk.] on udp://dns3.nic.uk. ([2a01:618:404::1]:53)
+Query: 649949c-1: 6.14325ms taken querying [test.qazz.uk.] A in zone [uk.] on udp://dns1.nic.uk. ([2a01:618:400::1]:53)
+Query: 649949c-1: 15.660209ms taken querying [qazz.uk.] DNSKEY in zone [qazz.uk.] on udp://ns2.qazz.uk. ([2600:9000:5300:7d00::1]:53)
+Query: 649949c-1: 16.85725ms taken querying [test.qazz.uk.] A in zone [qazz.uk.] on udp://ns1.qazz.uk. ([2600:9000:5303:4800::1]:53)
+Query: 649949c-1: 87.384083ms taken querying [.] DNSKEY in zone [.] on udp://c.root-servers.net. ([2001:500:2::c]:53)
+Query: 649949c-1: 82.208416ms taken querying [.] DNSKEY in zone [.] on tcp://c.root-servers.net. ([2001:500:2::c]:53)
 
-## Мониторинг
+(*resolver.Response)(0x140000a82a0)({
+ Msg: (*dns.Msg)(0x140000982d0)(;; opcode: QUERY, status: NOERROR, id: 44134
+;; flags: qr aa rd ra ad; QUERY: 1, ANSWER: 2, AUTHORITY: 0, ADDITIONAL: 1
 
-Сервер предоставляет детальное логирование:
+;; OPT PSEUDOSECTION:
+; EDNS: version 0; flags: do; udp: 4096
 
-- Время обработки каждого запроса
-- Статистика попаданий/промахов кэша
-- Ошибки разрешения DNS
-- Информация о клиентах
+;; QUESTION SECTION:
+;test.qazz.uk.  IN       A
 
-### Пример логов
-
+;; ANSWER SECTION:
+test.qazz.uk.   60      IN      A       192.0.2.53
+test.qazz.uk.   60      IN      RRSIG   A 13 3 60 20250623072623 20250623052523 6938 qazz.uk. zMzm+gyHbQGc8D3pZYmcQ/r6UGoh2VZEjNHfqAHrHsupYvr2/hKzUC4XIA3H7JM4gTz0YnZDT6u25eSFKVsztw==
+),
+ Err: (error) <nil>,
+ Duration: (time.Duration) 258.376875ms,
+ Doe: (dnssec.DenialOfExistenceState) NotFound,
+ Auth: (dnssec.AuthenticationResult) Secure
+})
 ```
-2025/08/21 13:36:16 Cache miss for example.com._1 from [::1]:50366
-2025/08/21 13:36:17 Resolved example.com. A: 8 records
-2025/08/21 13:36:17 Request from [::1]:50366 processed in 891.967167ms
-2025/08/21 13:36:17 Cache hit for example.com._1 from [::1]:51216
-2025/08/21 13:36:17 Request from [::1]:51216 processed in 65.25µs
-```
 
-## Файлы проекта
+# Licence
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-- `main.go` - Основной код DNS сервера
-- `main_test.go` - Юнит-тесты
-- `test_dns_resolver.sh` - Скрипт для интеграционного тестирования
-- `go.mod` / `go.sum` - Управление зависимостями Go
-- `README.md` - Документация
-
-## Зависимости
-
-- [github.com/domainr/dnsr](https://github.com/domainr/dnsr) - DNS resolver библиотека
-- [github.com/miekg/dns](https://github.com/miekg/dns) - DNS протокол для Go
-
-## Лицензия
-
-Проект распространяется под лицензией MIT.
-
-## Автор
-
-Создано как высокопроизводительная альтернатива PowerDNS с использованием современных технологий Go.
+Also see:
+- [github.com/miekg/dns license](https://github.com/miekg/dns/blob/master/LICENSE)
