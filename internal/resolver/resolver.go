@@ -2,6 +2,7 @@ package resolver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/miekg/dns"
 	"net"
@@ -66,12 +67,13 @@ func (r *Resolver) Exchange(ctx context.Context, msg *dns.Msg) *Result {
 
 	err = r.validate(ctx, finalMsg)
 	if err != nil {
-		if err == ErrInsecure {
+		if errors.Is(err, ErrInsecure) {
 			fmt.Println("DNSSEC status: Insecure")
 			finalMsg.AuthenticatedData = false
 			return &Result{Msg: finalMsg}
 		}
 
+		// All other validation errors are considered bogus
 		fmt.Printf("DNSSEC validation failed: %v\n", err)
 		servFail := new(dns.Msg)
 		servFail.SetRcode(msg, dns.RcodeServerFailure)
@@ -138,17 +140,9 @@ func (r *Resolver) resolve(ctx context.Context, qname string, qtype uint16) (*dn
 
 // validate - выполняет DNSSEC-валидацию ответа.
 func (r *Resolver) validate(ctx context.Context, finalMsg *dns.Msg) error {
-	if finalMsg.Rcode != dns.RcodeSuccess {
-		return ErrInsecure // Не можем проверить, если нет ответа
-	}
-	if len(finalMsg.Answer) == 0 && len(finalMsg.Ns) > 0 {
+	if len(finalMsg.Answer) == 0 {
 		// TODO: Validate non-existence with NSEC/NSEC3
-		// Пока считаем это insecure
-		for _, rr := range finalMsg.Ns {
-			if _, ok := rr.(*dns.SOA); ok {
-				return ErrInsecure
-			}
-		}
+		return ErrInsecure
 	}
 
 	rootDS, err := dns.NewRR(rootTrustAnchorDS)
@@ -168,31 +162,29 @@ func (r *Resolver) validate(ctx context.Context, finalMsg *dns.Msg) error {
 		}
 		trustedKeys = keys
 
-		if i == 0 {
-			break
-		}
+		if i > 0 {
+			nextZone := zones[i-1]
+			dsMsg, err := r.resolve(ctx, nextZone, dns.TypeDS)
+			if err != nil {
+				// If we can't get the DS record, we can't prove anything.
+				return fmt.Errorf("could not get DS for %s: %w", nextZone, err)
+			}
 
-		nextZone := zones[i-1]
-		dsMsg, err := r.resolve(ctx, nextZone, dns.TypeDS)
-		if err != nil {
-			return fmt.Errorf("could not get DS for %s: %w", nextZone, err)
-		}
+			// If the DS record query results in NXDOMAIN or NOERROR with no answer,
+			// the child zone is unsigned.
+			if dsMsg.Rcode == dns.RcodeNameError || (dsMsg.Rcode == dns.RcodeSuccess && len(dsMsg.Answer) == 0) {
+				return ErrInsecure
+			}
 
-		if dsMsg.Rcode == dns.RcodeNameError {
-			return ErrInsecure
-		}
+			if err := verifyRRSIGs(dsMsg.Answer, trustedKeys); err != nil {
+				return fmt.Errorf("failed to verify DS RRset for %s: %w", nextZone, err)
+			}
 
-		if len(dsMsg.Answer) == 0 {
-			return ErrInsecure
-		}
-
-		if err := verifyRRSIGs(dsMsg.Answer, trustedKeys); err != nil {
-			return fmt.Errorf("failed to verify DS RRset for %s: %w", nextZone, err)
-		}
-
-		trustedDS = extractDSs(dsMsg.Answer)
-		if len(trustedDS) == 0 {
-			return ErrInsecure
+			trustedDS = extractDSs(dsMsg.Answer)
+			if len(trustedDS) == 0 {
+				// This should be caught by the check above, but as a fallback.
+				return ErrInsecure
+			}
 		}
 	}
 
@@ -209,12 +201,12 @@ func (r *Resolver) validateZone(ctx context.Context, zone string, parentDS []*dn
 	}
 	keys := extractDNSKEYs(dnskeyMsg.Answer)
 	if len(keys) == 0 {
-		return nil, fmt.Errorf("no DNSKEY records found for supposedly signed zone %s: %w", zone, ErrBogus)
+		return nil, fmt.Errorf("no DNSKEY records found for %s: %w", zone, ErrBogus)
 	}
 
 	var trustedKSK *dns.DNSKEY
 	for _, key := range keys {
-		if (key.Flags&dns.ZONE) != 0 && (key.Flags&dns.SEP) != 0 { // KSK
+		if (key.Flags&dns.ZONE) != 0 && (key.Flags&dns.SEP) != 0 {
 			ds := key.ToDS(dns.SHA256)
 			for _, anchor := range parentDS {
 				if ds != nil && strings.ToUpper(ds.Digest) == strings.ToUpper(anchor.Digest) && ds.KeyTag == anchor.KeyTag {
@@ -268,10 +260,11 @@ func verifyRRSIGs(records []dns.RR, keys []*dns.DNSKEY) error {
 	}
 
 	if len(sigs) == 0 {
+		// It's ok if there are no signatures for DNSKEY RRset at the root
 		if len(rrset) > 0 && rrset[0].Header().Rrtype == dns.TypeDNSKEY && rrset[0].Header().Name == "." {
 			return nil
 		}
-		return fmt.Errorf("no RRSIGs found in record set: %w", ErrBogus)
+		return fmt.Errorf("no RRSIGs found in the record set: %w", ErrBogus)
 	}
 
 	for _, sig := range sigs {
@@ -281,6 +274,7 @@ func verifyRRSIGs(records []dns.RR, keys []*dns.DNSKEY) error {
 		for _, key := range keys {
 			if key.KeyTag() == sig.KeyTag && key.Header().Name == sig.SignerName {
 				if err := sig.Verify(key, rrset); err == nil {
+					// fmt.Printf("RRSIG for %s validated with key %d.\n", dns.TypeToString[sig.TypeCovered], key.KeyTag())
 					return nil
 				}
 			}
