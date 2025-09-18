@@ -9,9 +9,9 @@ import (
 
 func main() {
 	domainsToTest := []string{
-		"verisign.com",      // Должен быть secure
-		"example.com",       // Должен быть insecure
-		"dnssec-failed.org", // Должен быть bogus (SERVFAIL)
+		"verisign.com",      // Should be secure
+		"example.com",       // Should be insecure
+		"dnssec-failed.org", // Should be bogus (fail)
 	}
 
 	r := resolver.NewResolver()
@@ -32,7 +32,6 @@ func main() {
 
 		if result.Err != nil {
 			fmt.Println("--- Error ---")
-			// Используем стандартный вывод ошибки для краткости
 			fmt.Println(result.Err)
 		}
 	}

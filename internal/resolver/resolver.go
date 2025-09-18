@@ -166,12 +166,9 @@ func (r *Resolver) validate(ctx context.Context, finalMsg *dns.Msg) error {
 			nextZone := zones[i-1]
 			dsMsg, err := r.resolve(ctx, nextZone, dns.TypeDS)
 			if err != nil {
-				// If we can't get the DS record, we can't prove anything.
 				return fmt.Errorf("could not get DS for %s: %w", nextZone, err)
 			}
 
-			// If the DS record query results in NXDOMAIN or NOERROR with no answer,
-			// the child zone is unsigned.
 			if dsMsg.Rcode == dns.RcodeNameError || (dsMsg.Rcode == dns.RcodeSuccess && len(dsMsg.Answer) == 0) {
 				return ErrInsecure
 			}
@@ -182,7 +179,6 @@ func (r *Resolver) validate(ctx context.Context, finalMsg *dns.Msg) error {
 
 			trustedDS = extractDSs(dsMsg.Answer)
 			if len(trustedDS) == 0 {
-				// This should be caught by the check above, but as a fallback.
 				return ErrInsecure
 			}
 		}
@@ -274,7 +270,6 @@ func verifyRRSIGs(records []dns.RR, keys []*dns.DNSKEY) error {
 		for _, key := range keys {
 			if key.KeyTag() == sig.KeyTag && key.Header().Name == sig.SignerName {
 				if err := sig.Verify(key, rrset); err == nil {
-					// fmt.Printf("RRSIG for %s validated with key %d.\n", dns.TypeToString[sig.TypeCovered], key.KeyTag())
 					return nil
 				}
 			}
