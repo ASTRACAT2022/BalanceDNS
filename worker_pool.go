@@ -10,113 +10,53 @@ type Job interface {
 	Execute()
 }
 
-// Worker represents a single worker in the pool.
-type Worker struct {
-	id         int
-	jobQueue   chan Job
-	workerPool chan chan Job
-	quit       chan bool
-}
-
-// NewWorker creates a new Worker.
-func NewWorker(id int, workerPool chan chan Job) *Worker {
-	return &Worker{
-		id:         id,
-		jobQueue:   make(chan Job),
-		workerPool: workerPool,
-		quit:       make(chan bool),
-	}
-}
-
-// Start begins the worker's loop, listening for jobs.
-func (w *Worker) Start() {
-	go func() {
-		for {
-			// Add ourselves to the worker pool
-			w.workerPool <- w.jobQueue
-
-			select {
-			case job := <-w.jobQueue:
-				// Received a job, execute it
-				job.Execute()
-			case <-w.quit:
-				// We have been asked to stop
-				log.Printf("Worker %d stopping", w.id)
-				return
-			}
-		}
-	}()
-}
-
-// Stop tells the worker to stop.
-func (w *Worker) Stop() {
-	go func() {
-		w.quit <- true
-	}()
-}
-
-// WorkerPool manages a pool of workers.
+// WorkerPool manages a pool of workers to execute jobs concurrently.
 type WorkerPool struct {
-	maxWorkers int
 	jobQueue   chan Job
-	workerPool chan chan Job
-	quit       chan bool
 	wg         sync.WaitGroup
+	maxWorkers int
 }
 
 // NewWorkerPool creates a new WorkerPool.
 func NewWorkerPool(maxWorkers int, jobQueueSize int) *WorkerPool {
+	if maxWorkers <= 0 {
+		maxWorkers = 1 // Ensure at least one worker
+	}
+	if jobQueueSize < 0 {
+		jobQueueSize = 0 // A job queue size of 0 is valid (unbuffered)
+	}
 	return &WorkerPool{
 		maxWorkers: maxWorkers,
 		jobQueue:   make(chan Job, jobQueueSize),
-		workerPool: make(chan chan Job, maxWorkers),
-		quit:       make(chan bool),
 	}
 }
 
-// Start begins the dispatching of jobs to workers.
+// Start initializes the worker pool and starts the workers.
 func (wp *WorkerPool) Start() {
-	// Start all workers
 	for i := 0; i < wp.maxWorkers; i++ {
-		worker := NewWorker(i+1, wp.workerPool)
-		worker.Start()
-	}
-
-	go wp.dispatch()
-}
-
-// dispatch listens for jobs and dispatches them to available workers.
-func (wp *WorkerPool) dispatch() {
-	for {
-		select {
-		case job := <-wp.jobQueue:
-			// A job has been received, wait for an available worker job queue
-			go func(job Job) {
-				workerJobQueue := <-wp.workerPool
-				workerJobQueue <- job
-			}(job)
-		case <-wp.quit:
-			// We have been asked to stop
-			log.Println("WorkerPool stopping")
-			return
-		}
+		wp.wg.Add(1)
+		go func(workerID int) {
+			defer wp.wg.Done()
+			log.Printf("Worker %d started", workerID)
+			for job := range wp.jobQueue {
+				job.Execute()
+			}
+			log.Printf("Worker %d stopping.", workerID)
+		}(i + 1)
 	}
 }
 
 // Submit adds a job to the job queue.
 func (wp *WorkerPool) Submit(job Job) {
-	wp.wg.Add(1)
-	go func() {
-		defer wp.wg.Done()
-		wp.jobQueue <- job
-	}()
+	wp.jobQueue <- job
 }
 
-// Stop stops the worker pool and waits for all jobs to complete.
+// Stop gracefully shuts down the worker pool.
 func (wp *WorkerPool) Stop() {
 	log.Println("Stopping WorkerPool...")
-	wp.quit <- true
-	wp.wg.Wait() // Wait for all submitted jobs to be processed
-	// TODO: Signal individual workers to stop
+	// Close the job queue. This signals workers to stop after processing remaining jobs.
+	close(wp.jobQueue)
+	// Wait for all worker goroutines to finish.
+	wp.wg.Wait()
 	log.Println("WorkerPool stopped.")
 }

@@ -11,8 +11,10 @@ import (
 )
 
 const (
-	port = ":5053"
-	defaultShards = 32 // Example: 32 shards
+	port                      = ":5053"
+	defaultShards             = 32              // Example: 32 shards
+	maxCacheEntriesPerShard   = 1000            // Max entries per cache shard
+	cacheCleanupInterval      = 5 * time.Minute // Interval for cleaning up expired cache entries
 )
 
 type DnsJob struct {
@@ -23,56 +25,58 @@ type DnsJob struct {
 }
 
 func (j *DnsJob) Execute() {
-	// Generate a cache key from the DNS question
-	cacheKey := j.req.Question[0].Name + ":" + dns.TypeToString[j.req.Question[0].Qtype]
+	// Generate a more robust cache key from the DNS question (Name, Type, Class)
+	q := j.req.Question[0]
+	cacheKey := fmt.Sprintf("%s:%s:%s", q.Name, dns.TypeToString[q.Qtype], dns.ClassToString[q.Qclass])
 
 	// Try to get the response from cache
-	if cachedMsg, found, isNegative, _ := j.shardedCache.Get(cacheKey); found {
-		if isNegative {
-			log.Printf("Cache HIT (negative) for %s", cacheKey)
-			// If it's a negative cache entry, return SERVFAIL or NXDOMAIN directly
-			m := new(dns.Msg)
-			m.SetRcode(j.req, dns.RcodeServerFailure) // Or appropriate negative response
-			j.w.WriteMsg(m)
-			return
-		} else {
-			log.Printf("Cache HIT (positive) for %s", cacheKey)
-			// If it's a positive entry but not DNSSEC validated, and we want to re-check often,
-			// we could force a re-lookup here or use a very short TTL for such entries.
-			// For now, we just return the cached message.
-			cachedMsg.SetRcode(j.req, cachedMsg.Rcode) // Ensure the response code is set correctly
-			cachedMsg.Id = j.req.Id // Set the ID to match the request ID
-			j.w.WriteMsg(cachedMsg)
-			return
-		}
-	}
-	log.Printf("Cache MISS for %s", cacheKey)
-	// Create a new message to pass to the resolver, mimicking client behavior
-	msg := new(dns.Msg)
-	msg.SetQuestion(j.req.Question[0].Name, j.req.Question[0].Qtype)
-	msg.SetEdns0(4096, true) // Enable EDNS0 with DNSSEC OK bit on the new message
-
-	result := j.r.Exchange(context.Background(), msg)
-	if result.Err != nil {
-		log.Printf("Error exchanging DNS query: %v", result.Err)
-		m := new(dns.Msg)
-		// If there's an error, it's not DNSSEC validated
-		m.SetRcode(j.req, dns.RcodeServerFailure)
-		j.w.WriteMsg(m)
-		// Cache SERVFAIL with a short TTL and mark as not DNSSEC validated
-		j.shardedCache.Set(cacheKey, m, 30*time.Second, true, false)
+	if cachedMsg, found, _ := j.shardedCache.Get(cacheKey); found {
+		log.Printf("Cache HIT for %s", cacheKey)
+		// The cached message has the correct RCODE, just set the ID and send it.
+		cachedMsg.Id = j.req.Id
+		j.w.WriteMsg(cachedMsg)
 		return
 	}
 
-	// Set the Recursion Available (RA) flag
-	result.Msg.SetRcode(j.req, result.Msg.Rcode)
-	result.Msg.RecursionAvailable = true
+	log.Printf("Cache MISS for %s", cacheKey)
+	// Create a new message to pass to the resolver. It's good practice to create a new one
+	// rather than modifying the client's request.
+	msg := new(dns.Msg)
+	msg.SetQuestion(q.Name, q.Qtype)
+	msg.SetEdns0(4096, true) // Enable EDNS0 with DNSSEC OK bit
 
-	// Determine TTL for caching. Use the minimum TTL from answers, or a default.
-	ttl := 60 * time.Second // Default TTL
-	if len(result.Msg.Answer) > 0 {
-		minTTL := result.Msg.Answer[0].Header().Ttl
-		for _, rr := range result.Msg.Answer {
+	result := j.r.Exchange(context.Background(), msg)
+	if result.Err != nil {
+		log.Printf("Error exchanging DNS query for %s: %v", cacheKey, result.Err)
+		m := new(dns.Msg)
+		m.SetRcode(j.req, dns.RcodeServerFailure)
+		j.w.WriteMsg(m)
+		// Cache the SERVFAIL response for a short period to prevent hammering on errors.
+		j.shardedCache.Set(cacheKey, m, 30*time.Second, false) // Not DNSSEC validated
+		return
+	}
+
+	// The query was successful (no transport error), now process the response.
+	responseMsg := result.Msg
+	responseMsg.Id = j.req.Id
+	responseMsg.RecursionAvailable = true // We are a recursive resolver
+
+	// Determine TTL for caching.
+	// Use a small default TTL, but prefer the TTL from the SOA record for negative responses.
+	ttl := 60 * time.Second // Default TTL for positive responses
+	if responseMsg.Rcode != dns.RcodeSuccess {
+		// For negative responses (NXDOMAIN, etc.), find the SOA record for the TTL.
+		for _, ns := range responseMsg.Ns {
+			if soa, ok := ns.(*dns.SOA); ok {
+				// The negative TTL is the minimum of the SOA's TTL and the SOA's Minimum field.
+				ttl = time.Duration(min(soa.Header().Ttl, soa.Minttl)) * time.Second
+				break
+			}
+		}
+	} else if len(responseMsg.Answer) > 0 {
+		// For positive responses, use the minimum TTL from the answer section.
+		minTTL := responseMsg.Answer[0].Header().Ttl
+		for _, rr := range responseMsg.Answer {
 			if rr.Header().Ttl < minTTL {
 				minTTL = rr.Header().Ttl
 			}
@@ -80,18 +84,28 @@ func (j *DnsJob) Execute() {
 		ttl = time.Duration(minTTL) * time.Second
 	}
 
-	// Determine DNSSEC validation status
-	dnssecValidated := result.Msg.AuthenticatedData
+	dnssecValidated := responseMsg.AuthenticatedData
 
-	// If DNSSEC is not validated, use a very short TTL for re-checking
+	// If DNSSEC is not validated, it's good practice to use a shorter TTL
+	// to encourage re-validation sooner.
 	if !dnssecValidated {
-		ttl = 5 * time.Second // Very short TTL for unvalidated entries
+		// Let's be more conservative than 5s. 60s is a reasonable minimum.
+		if ttl > 60*time.Second {
+			ttl = 60 * time.Second
+		}
 	}
 
-	// Cache the positive response
-	j.shardedCache.Set(cacheKey, result.Msg, ttl, false, dnssecValidated)
+	// Cache the response (positive or negative, like NXDOMAIN)
+	j.shardedCache.Set(cacheKey, responseMsg, ttl, dnssecValidated)
 
-	j.w.WriteMsg(result.Msg)
+	j.w.WriteMsg(responseMsg)
+}
+
+func min(a, b uint32) uint32 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func main() {
@@ -101,7 +115,7 @@ func main() {
 	}
 
 	// Initialize Sharded Cache
-	shardedCache := NewShardedCache(defaultShards, 1*time.Minute)
+	shardedCache := NewShardedCache(defaultShards, maxCacheEntriesPerShard, cacheCleanupInterval)
 	defer shardedCache.Stop()
 
 	// Initialize Worker Pool
