@@ -19,8 +19,8 @@ func getMockFile(testName string, qname string, qtype uint16) (fileName string, 
 	return fileName, baseDir
 }
 
-func mockQueryUpdate(t *testing.T, qname string, qtype uint16) (*dns.Msg, error) {
-	r, err := localQuery(qname, qtype)
+func mockQueryUpdate(t *testing.T, resolver *Resolver, qname string, qtype uint16) (*dns.Msg, error) {
+	r, err := resolver.localQuery(qname, qtype)
 	if r == nil {
 		return nil, err
 	}
@@ -48,10 +48,10 @@ func newResolver(t *testing.T) (res *Resolver) {
 	resolver.queryFn = func(qname string, qtype uint16) (*dns.Msg, error) {
 		msg := &dns.Msg{}
 		if isMockQuery == false {
-			return localQuery(qname, qtype)
+			return resolver.localQuery(qname, qtype)
 		}
 		if isMockUpdate == true {
-			return mockQueryUpdate(t, qname, qtype)
+			return mockQueryUpdate(t, resolver, qname, qtype)
 		}
 		mockFile, _ := getMockFile(t.Name(), qname, qtype)
 		s, err := os.ReadFile(mockFile)

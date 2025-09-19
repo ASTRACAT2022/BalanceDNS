@@ -17,12 +17,12 @@ type SignedZone struct {
 }
 
 // lookupPubkey returns a DNSKEY by its keytag
-func (z SignedZone) lookupPubKey(keyTag uint16) *dns.DNSKEY {
+func (z *SignedZone) lookupPubKey(keyTag uint16) *dns.DNSKEY {
 	return z.pubKeyLookup[keyTag]
 }
 
 // addPubkey stores a DNSKEY in the keytag lookup table.
-func (z SignedZone) addPubKey(k *dns.DNSKEY) {
+func (z *SignedZone) addPubKey(k *dns.DNSKEY) {
 	z.pubKeyLookup[k.KeyTag()] = k
 }
 
@@ -31,7 +31,7 @@ func (z SignedZone) addPubKey(k *dns.DNSKEY) {
 // It returns nil if the RRSIG verifies and the signature
 // is valid, and the appropriate error value in case
 // of validation failure.
-func (z SignedZone) verifyRRSIG(signedRRset *RRSet) (err error) {
+func (z *SignedZone) verifyRRSIG(signedRRset *RRSet) (err error) {
 
 	if !signedRRset.IsSigned() {
 		return ErrInvalidRRsig
@@ -61,7 +61,7 @@ func (z SignedZone) verifyRRSIG(signedRRset *RRSet) (err error) {
 // (key signing key) of the zone.
 // Return nil if the DS record matches the digest of
 // the KSK.
-func (z SignedZone) verifyDS(dsRrset []dns.RR) (err error) {
+func (z *SignedZone) verifyDS(dsRrset []dns.RR) (err error) {
 
 	for _, rr := range dsRrset {
 
@@ -98,8 +98,9 @@ func (z *SignedZone) checkHasDnskeys() bool {
 // NewSignedZone initializes a new SignedZone and returns it.
 func NewSignedZone(domainName string) *SignedZone {
 	return &SignedZone{
-		zone:   domainName,
-		ds:     &RRSet{},
-		dnskey: &RRSet{},
+		zone:         domainName,
+		ds:           &RRSet{},
+		dnskey:       &RRSet{},
+		pubKeyLookup: make(map[uint16]*dns.DNSKEY),
 	}
 }

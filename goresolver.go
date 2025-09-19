@@ -50,8 +50,6 @@ var (
 	ErrInvalidQuery         = errors.New("invalid query input")
 )
 
-var CurrentResolver *Resolver
-
 // NewDNSMessage creates and initializes a dns.Msg object, with EDNS enabled
 // and the DO (DNSSEC OK) flag set.  It returns a pointer to the created
 // object.
@@ -139,9 +137,9 @@ func (r *Resolver) queryUpstream(name string, qtype uint16) (*dns.Msg, error) {
 
 	// Try all configured upstream servers
 	for _, server := range r.dnsClientConfig.Servers {
-		r, _, err := r.dnsClient.Exchange(m, net.JoinHostPort(server, r.dnsClientConfig.Port))
-		if err == nil && r != nil && r.Rcode == dns.RcodeSuccess {
-			return r, nil
+		resp, _, err := r.dnsClient.Exchange(m, net.JoinHostPort(server, r.dnsClientConfig.Port))
+		if err == nil && resp != nil && resp.Rcode == dns.RcodeSuccess {
+			return resp, nil
 		}
 	}
 	return nil, fmt.Errorf("failed to query upstream DNS servers for %s", name)
@@ -151,20 +149,20 @@ func (r *Resolver) queryUpstream(name string, qtype uint16) (*dns.Msg, error) {
 // performs a DNS lookup by calling dnsClient.Exchange.
 // It returns the answer in a *dns.Msg (or nil in case of an error, in which
 // case err will be set accordingly.)
-func localQuery(qname string, qtype uint16) (*dns.Msg, error) {
+func (r *Resolver) localQuery(qname string, qtype uint16) (*dns.Msg, error) {
 	dnsMessage := NewDNSMessage(qname, qtype)
 
-	if CurrentResolver.dnsClientConfig == nil {
+	if r.dnsClientConfig == nil {
 		return nil, errors.New("dns client not initialized")
 	}
 
-	for _, server := range CurrentResolver.dnsClientConfig.Servers {
-		r, _, err := CurrentResolver.dnsClient.Exchange(dnsMessage, server+":"+CurrentResolver.dnsClientConfig.Port)
+	for _, server := range r.dnsClientConfig.Servers {
+		resp, _, err := r.dnsClient.Exchange(dnsMessage, server+":"+r.dnsClientConfig.Port)
 		if err != nil {
 			return nil, err
 		}
-		if r == nil || r.Rcode == dns.RcodeNameError || r.Rcode == dns.RcodeSuccess {
-			return r, err
+		if resp == nil || resp.Rcode == dns.RcodeNameError || resp.Rcode == dns.RcodeSuccess {
+			return resp, err
 		}
 	}
 	return nil, ErrNsNotAvailable
@@ -172,20 +170,19 @@ func localQuery(qname string, qtype uint16) (*dns.Msg, error) {
 
 // queryDelegation takes a domain name and fetches the DS and DNSKEY records
 // in that zone.  Returns a SignedZone or nil in case of error.
-func queryDelegation(domainName string) (signedZone *SignedZone, err error) {
+func (r *Resolver) queryDelegation(domainName string) (signedZone *SignedZone, err error) {
 
 	signedZone = NewSignedZone(domainName)
 
-	signedZone.dnskey, err = CurrentResolver.queryRRset(domainName, dns.TypeDNSKEY)
+	signedZone.dnskey, err = r.queryRRset(domainName, dns.TypeDNSKEY)
 	if err != nil {
 		return nil, err
 	}
-	signedZone.pubKeyLookup = make(map[uint16]*dns.DNSKEY)
 	for _, rr := range signedZone.dnskey.rrSet {
 		signedZone.addPubKey(rr.(*dns.DNSKEY))
 	}
 
-	signedZone.ds, _ = CurrentResolver.queryRRset(domainName, dns.TypeDS)
+	signedZone.ds, _ = r.queryRRset(domainName, dns.TypeDS)
 
 	return signedZone, nil
 }
@@ -203,17 +200,18 @@ func (r *Resolver) RecursiveQuery(name string, qtype string) ([]*dnsr.RR, error)
 
 // NewResolver initializes the package Resolver instance using the default
 // dnsClientConfig.
-func NewResolver(resolvConf string) (res *Resolver, err error) {
-	CurrentResolver = &Resolver{}
-	CurrentResolver.dnsClient = &dns.Client{
+func NewResolver(resolvConf string) (*Resolver, error) {
+	resolver := &Resolver{}
+	resolver.dnsClient = &dns.Client{
 		ReadTimeout: DefaultTimeout,
 	}
-	CurrentResolver.dnsClientConfig, err = dns.ClientConfigFromFile(resolvConf)
+	var err error
+	resolver.dnsClientConfig, err = dns.ClientConfigFromFile(resolvConf)
 	if err != nil {
 		return nil, err
 	}
-	CurrentResolver.queryFn = localQuery
-	CurrentResolver.Cache = NewDNSCache(16) // Initialize cache with 16 shards
-	CurrentResolver.dnsrResolver = dnsr.NewResolver() // Initialize dnsr.Resolver without cache
-	return CurrentResolver, nil
+	resolver.queryFn = resolver.localQuery
+	resolver.Cache = NewDNSCache(16, 1024) // Initialize cache with 16 shards and 1024 max size per shard
+	resolver.dnsrResolver = dnsr.NewResolver() // Initialize dnsr.Resolver without cache
+	return resolver, nil
 }

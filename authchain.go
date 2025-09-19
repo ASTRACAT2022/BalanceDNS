@@ -20,7 +20,7 @@ type AuthenticationChain struct {
 // It begins the queries at the *domainName* zone and then walks
 // up the delegation tree all the way up to the root zone, thus
 // populating a linked list of SignedZone objects.
-func (authChain *AuthenticationChain) Populate(domainName string) error {
+func (authChain *AuthenticationChain) Populate(resolver *Resolver, domainName string) error {
 
 	qnameComponents := strings.Split(domainName, ".")
 	zonesToVerify := len(qnameComponents)
@@ -32,7 +32,7 @@ func (authChain *AuthenticationChain) Populate(domainName string) error {
 	authChain.delegationChain = make([]SignedZone, 0, zonesToVerify)
 	for i := 0; i < zonesToVerify; i++ {
 		zoneName := dns.Fqdn(strings.Join(qnameComponents[i:], "."))
-		delegation, err := queryDelegation(zoneName)
+		delegation, err := resolver.queryDelegation(zoneName)
 		if err != nil {
 			return err
 		}
