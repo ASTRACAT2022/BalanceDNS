@@ -19,6 +19,18 @@ fi
 echo "📁 Project directory: $PROJECT_DIR"
 cd "$PROJECT_DIR"
 
+echo "🔧 Installing required dependencies (libunbound-dev, unbound-anchor)..."
+if command -v apt-get &> /dev/null; then
+    sudo apt-get update
+    sudo apt-get install -y libunbound-dev unbound-anchor
+else
+    echo "⚠️  Warning: 'apt-get' not found. Please install 'libunbound-dev' and 'unbound-anchor' manually."
+fi
+
+echo "🔑 Generating DNSSEC root key..."
+sudo mkdir -p /etc/unbound
+sudo unbound-anchor -a /etc/unbound/root.key
+
 echo "🔨 Building the project..."
 go build -o "$SERVICE_NAME" .
 
