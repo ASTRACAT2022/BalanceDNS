@@ -30,6 +30,7 @@ type Resolver struct {
 	queryFn         queryFunc
 	Cache           *DNSCache
 	dnsrResolver    *dnsr.Resolver // Add dnsr.Resolver
+	WorkerPool      *WorkerPool
 }
 
 type queryFunc func(name string, qtype uint16) (*dns.Msg, error)
@@ -74,7 +75,7 @@ func (r *Resolver) Query(name string, qtype uint16) (*dns.Msg, error) {
 			}
 			// If the record is about to expire, prefetch it
 			if timeLeft < DefaultCacheTTL/2 && timeLeft > 0 {
-				go r.Prefetch(name, qtype)
+				r.WorkerPool.Submit(func() { r.Prefetch(name, qtype) })
 			}
 			return cachedMsg, nil
 		}
@@ -215,5 +216,11 @@ func NewResolver(resolvConf string) (res *Resolver, err error) {
 	CurrentResolver.queryFn = localQuery
 	CurrentResolver.Cache = NewDNSCache(16) // Initialize cache with 16 shards
 	CurrentResolver.dnsrResolver = dnsr.NewResolver() // Initialize dnsr.Resolver without cache
+	CurrentResolver.WorkerPool = NewWorkerPool(10, 100)
 	return CurrentResolver, nil
+}
+
+// Stop gracefully shuts down the resolver's worker pool.
+func (r *Resolver) Stop() {
+	r.WorkerPool.Stop()
 }

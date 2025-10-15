@@ -73,5 +73,6 @@ func main() {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	s := <-sig
-	log.Fatalf("Signal (%s) received, stopping\n", s.String())
+	log.Printf("Signal (%s) received, stopping\n", s.String())
+	res.Stop()
 }
