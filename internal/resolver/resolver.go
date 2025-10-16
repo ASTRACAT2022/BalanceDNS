@@ -125,8 +125,8 @@ func (r *Resolver) exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 	// Always record latency
 	r.metrics.RecordLatency(q.Name, latency)
 
-	if err != nil {
-		r.metrics.IncrementUnboundErrors() // Rename this metric later
+    if err != nil {
+        r.metrics.IncrementUpstreamErrors()
 		log.Printf("Upstream exchange error for %s: %v", q.Name, err)
 		// Create a SERVFAIL response on error.
 		failMsg := new(dns.Msg)

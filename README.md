@@ -25,6 +25,13 @@ A high-performance DNS resolver with caching, prefetching, and metrics.
 
 The resolver will listen on port 5053 by default.
 
+Ensure Knot Resolver is running and listening at `KNOT_RESOLVER_ADDR` (default `127.0.0.1:5353`). You can set it via environment variable:
+
+```bash
+export KNOT_RESOLVER_ADDR=127.0.0.1:5353
+./astracat-dns
+```
+
 ### Configuration
 
 Configuration is currently hardcoded in `internal/config/config.go`. Future versions will support configuration files.
@@ -174,7 +181,7 @@ ASTRACAT DNS Resolver exposes a Prometheus metrics endpoint at `/metrics` on the
 | `dns_resolver_top_latency_domains_ms`     | Top domains by average query latency in milliseconds.                       |
 | `dns_resolver_query_types_total`          | Total number of queries by type.                                            |
 | `dns_resolver_response_codes_total`       | Total number of responses by code.                                          |
-| `dns_resolver_unbound_errors_total`       | Total number of errors from the Unbound resolver.                           |
+| `dns_resolver_upstream_errors_total`      | Total number of errors from the upstream resolver.                          |
 | `dns_resolver_dnssec_validation_total`    | Total number of DNSSEC validation results by type (bogus, secure, insecure). |
 | `dns_resolver_cache_revalidations_total`  | Total number of cache revalidations.                                        |
 | `dns_resolver_cache_hits_total`           | Total number of cache hits.                                                 |

@@ -135,10 +135,11 @@ var (
 		Name: "dns_resolver_response_codes_total",
 		Help: "Total number of responses by code",
 	}, []string{"code"})
-	promUnboundErrors = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "dns_resolver_unbound_errors_total",
-		Help: "Total number of errors from the Unbound resolver",
-	})
+    // Count errors returned by the upstream recursive resolver (e.g., Knot Resolver)
+    promUpstreamErrors = promauto.NewCounter(prometheus.CounterOpts{
+        Name: "dns_resolver_upstream_errors_total",
+        Help: "Total number of errors from the upstream resolver",
+    })
 	promDNSSECValidation = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "dns_resolver_dnssec_validation_total",
 		Help: "Total number of DNSSEC validation results by type",
@@ -468,9 +469,9 @@ func (m *Metrics) RecordResponseCode(rcode string) {
 	promResponseCodes.WithLabelValues(rcode).Inc()
 }
 
-// IncrementUnboundErrors increments the Unbound error counter.
-func (m *Metrics) IncrementUnboundErrors() {
-	promUnboundErrors.Inc()
+// IncrementUpstreamErrors increments the upstream error counter.
+func (m *Metrics) IncrementUpstreamErrors() {
+    promUpstreamErrors.Inc()
 }
 
 // RecordDNSSECValidation records a DNSSEC validation result.

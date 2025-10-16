@@ -19,17 +19,16 @@ fi
 echo "📁 Project directory: $PROJECT_DIR"
 cd "$PROJECT_DIR"
 
-echo "🔧 Installing required dependencies (libunbound-dev, unbound-anchor)..."
+echo "🔧 Ensuring Knot Resolver is installed (knot-resolver package)..."
 if command -v apt-get &> /dev/null; then
     sudo apt-get update
-    sudo apt-get install -y libunbound-dev unbound-anchor
+    # Install Knot Resolver if available; ignore failure if package not found
+    if ! dpkg -s knot-resolver >/dev/null 2>&1; then
+        sudo apt-get install -y knot-resolver || echo "⚠️  Could not install knot-resolver automatically. Please install it manually."
+    fi
 else
-    echo "⚠️  Warning: 'apt-get' not found. Please install 'libunbound-dev' and 'unbound-anchor' manually."
+    echo "⚠️  Warning: 'apt-get' not found. Please ensure Knot Resolver is installed and running at \"$KNOT_RESOLVER_ADDR\"."
 fi
-
-echo "🔑 Generating DNSSEC root key..."
-sudo mkdir -p /etc/unbound
-sudo unbound-anchor -a /etc/unbound/root.key
 
 echo "🔨 Building the project..."
 go build -o "$SERVICE_NAME" .
@@ -69,3 +68,4 @@ systemctl enable "$SERVICE_NAME" --now
 
 echo "🎉 Installation complete! The $SERVICE_NAME service is now running."
 echo "✅ Systemd logs are disabled for this service."
+echo "ℹ️  Ensure Knot Resolver is running and listening at the address configured by KNOT_RESOLVER_ADDR (default 127.0.0.1:5353)."
