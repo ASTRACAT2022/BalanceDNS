@@ -31,8 +31,14 @@ echo "🔑 Generating DNSSEC root key..."
 sudo mkdir -p /etc/unbound
 sudo unbound-anchor -a /etc/unbound/root.key
 
-echo "🔨 Building the project..."
-go build -o "$SERVICE_NAME" .
+echo "🔨 Building the project (preferring recursive Unbound backend)..."
+# Try to build with Unbound recursive backend first; fall back to stub forwarder if unavailable
+if CGO_ENABLED=1 go build -tags=unbound -o "$SERVICE_NAME" .; then
+    echo "✅ Built with Unbound recursive backend (CGO enabled)."
+else
+    echo "⚠️  Falling back to cgo-free stub (forwarder) backend build."
+    go build -o "$SERVICE_NAME" .
+fi
 
 if [ ! -f "$BINARY_PATH" ]; then
     echo "❌ Build failed: binary not found at $BINARY_PATH"
