@@ -257,13 +257,7 @@ func (c *Cache) loadFromDB() {
 	}
 }
 
-func (c *Cache) writeToDB(key string, msg *dns.Msg, expiration time.Time, swr time.Duration) {
-	packedMsg, err := msg.Pack()
-	if err != nil {
-		log.Printf("Failed to pack DNS message for key %s: %v", key, err)
-		return
-	}
-
+func (c *Cache) writeToDB(key string, packedMsg []byte, expiration time.Time, swr time.Duration) {
 	fItem := FixedSizeCacheItem{
 		ExpirationUnix:                  expiration.Unix(),
 		StaleWhileRevalidateNanoseconds: int64(swr),
@@ -354,13 +348,13 @@ func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
 	ttl := getMinTTL(msg)
 	expiration := time.Now().Add(time.Duration(ttl) * time.Second)
 
-	c.writeToDB(key, msg, expiration, swr)
-
 	packedMsg, err := msg.Pack()
 	if err != nil {
-		log.Printf("Failed to pack DNS message for in-memory cache, key %s: %v", key, err)
+		log.Printf("Failed to pack DNS message for key %s: %v", key, err)
 		return
 	}
+
+	c.writeToDB(key, packedMsg, expiration, swr)
 
 	evictedKey := c.setInMemory(key, packedMsg, msg.Question[0], swr, expiration)
 	if evictedKey != "" && evictedKey != key {
