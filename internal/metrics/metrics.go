@@ -321,36 +321,44 @@ func (m *Metrics) systemMetricsCollector() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		m.Lock()
-		// CPU Usage
-		cpuPercentages, err := cpu.Percent(0, false)
+		// Perform data collection outside the lock to minimize contention
+		cpuPercentages, err := cpu.Percent(time.Second, false)
+		cpuUsage := 0.0
 		if err == nil && len(cpuPercentages) > 0 {
-			m.cpuUsage = cpuPercentages[0]
-			promCPUUsage.Set(cpuPercentages[0])
+			cpuUsage = cpuPercentages[0]
+		} else if err != nil {
+			log.Printf("Error collecting CPU metrics: %v", err)
 		}
 
-		// Memory Usage
 		memInfo, err := mem.VirtualMemory()
+		memUsage := 0.0
 		if err == nil {
-			m.memoryUsage = memInfo.UsedPercent
-			promMemoryUsage.Set(memInfo.UsedPercent)
+			memUsage = memInfo.UsedPercent
+		} else if err != nil {
+			log.Printf("Error collecting memory metrics: %v", err)
 		}
 
-		// Goroutine Count
-		m.goroutineCount = runtime.NumGoroutine()
-		promGoroutineCount.Set(float64(m.goroutineCount))
+		goroutineCount := runtime.NumGoroutine()
 
+		// Lock only when updating the shared metrics struct
+		m.Lock()
+		m.cpuUsage = cpuUsage
+		m.memoryUsage = memUsage
+		m.goroutineCount = goroutineCount
 		m.Unlock()
 
-		// Network Stats - no need to lock for these, they are just for prometheus
+		// Update Prometheus gauges (thread-safe)
+		promCPUUsage.Set(cpuUsage)
+		promMemoryUsage.Set(memUsage)
+		promGoroutineCount.Set(float64(goroutineCount))
+
+		// Network stats for Prometheus
 		netIO, err := net.IOCounters(false)
 		if err == nil && len(netIO) > 0 {
 			promNetworkSent.Set(float64(netIO[0].BytesSent))
 			promNetworkRecv.Set(float64(netIO[0].BytesRecv))
-		}
-
-		if err != nil {
-			log.Printf("Error collecting system metrics: %v", err)
+		} else if err != nil {
+			log.Printf("Error collecting network metrics: %v", err)
 		}
 	}
 }
@@ -401,14 +409,9 @@ func (m *Metrics) processTopNXDomains() {
 	})
 
 	// Sort and get top 10
-	// Simple bubble sort for demonstration
-	for i := 0; i < len(domains); i++ {
-		for j := i + 1; j < len(domains); j++ {
-			if domains[i].Count < domains[j].Count {
-				domains[i], domains[j] = domains[j], domains[i]
-			}
-		}
-	}
+	sort.Slice(domains, func(i, j int) bool {
+		return domains[i].Count > domains[j].Count
+	})
 	if len(domains) > 10 {
 		domains = domains[:10]
 	}
@@ -437,13 +440,9 @@ func (m *Metrics) processTopLatencyDomains() {
 	})
 
 	// Sort and get top 10
-	for i := 0; i < len(domains); i++ {
-		for j := i + 1; j < len(domains); j++ {
-			if domains[i].AvgLatency < domains[j].AvgLatency {
-				domains[i], domains[j] = domains[j], domains[i]
-			}
-		}
-	}
+	sort.Slice(domains, func(i, j int) bool {
+		return domains[i].AvgLatency > domains[j].AvgLatency
+	})
 	if len(domains) > 10 {
 		domains = domains[:10]
 	}
