@@ -19,7 +19,7 @@ RUN CGO_ENABLED=1 go build -o /dns-resolver -tags="unbound cgo" -ldflags "-s -w"
 FROM alpine:latest
 
 # Установка зависимостей времени выполнения
-RUN apk add --no-cache unbound
+RUN apk add --no-cache unbound ca-certificates
 
 # Получение корневого ключа для валидации DNSSEC
 RUN mkdir -p /etc/unbound && unbound-anchor -a /etc/unbound/root.key
