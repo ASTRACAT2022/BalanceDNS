@@ -1,12 +1,11 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"log"
-	"net"
 	"runtime"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/miekg/dns"
@@ -40,7 +39,7 @@ func (c *PerfTestClient) Query(domain string, qtype uint16) error {
 	return nil
 }
 
-func main() {
+func TestPerformance(t *testing.T) {
 	client := NewPerfTestClient()
 
 	// Test domains
