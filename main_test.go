@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"log"
 	"os"
 	"testing"
@@ -12,15 +13,32 @@ import (
 // TestMain runs the main function in a separate goroutine and then runs tests.
 // This is a simple way to write an integration test for the server.
 func TestMain(m *testing.M) {
-	// Start the server in the background
-	go func() {
-		// Suppress log output from the server during tests
-		log.SetOutput(os.NewFile(0, os.DevNull))
-		main()
-	}()
+	// Start the server in the background, with logging disabled.
+	srv, cleanup := runServer(io.Discard)
+	defer cleanup()
+	go srv.ListenAndServe()
 
-	// Give the server a moment to start up
-	time.Sleep(1 * time.Second)
+	// Wait for the server to be ready by pinging it.
+	client := new(dns.Client)
+	msg := new(dns.Msg)
+	msg.SetQuestion(".", dns.TypeNS) // A simple query
+	serverAddr := "127.0.0.1:5053"
+
+	// Retry mechanism to wait for the server
+	var ready bool
+	for i := 0; i < 20; i++ {
+		_, _, err := client.Exchange(msg, serverAddr)
+		if err == nil {
+			ready = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if !ready {
+		log.Println("Server did not start in time. Exiting.")
+		os.Exit(1)
+	}
 
 	// Run the tests
 	exitCode := m.Run()
