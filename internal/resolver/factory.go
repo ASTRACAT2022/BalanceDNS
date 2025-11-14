@@ -18,8 +18,6 @@ type ResolverType string
 const (
 	// ResolverTypeUnbound uses libunbound for DNS resolution
 	ResolverTypeUnbound ResolverType = "unbound"
-	// ResolverTypeGoDNS uses pure Go for DNS resolution
-	ResolverTypeGoDNS ResolverType = "godns"
 )
 
 // ResolverInterface defines the common interface for all resolvers.
@@ -33,12 +31,6 @@ type ResolverInterface interface {
 
 // NewResolver creates a new resolver instance based on the specified type.
 func NewResolver(resolverType ResolverType, cfg *config.Config, c *cache.Cache, m *metrics.Metrics) (ResolverInterface, error) {
-	switch resolverType {
-	case ResolverTypeGoDNS:
-		log.Println("Creating Go DNS resolver")
-		return NewGoDNSResolver(cfg, c, m), nil
-	default:
-		log.Println("Creating Unbound resolver (default)")
-		return NewUnboundResolver(cfg, c, m), nil
-	}
+	log.Println("Creating Unbound resolver")
+	return NewUnboundResolver(cfg, c, m), nil
 }

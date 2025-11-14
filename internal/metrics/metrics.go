@@ -171,27 +171,6 @@ var (
 		Name: "dns_resolver_prefetches_total",
 		Help: "Total number of cache prefetches",
 	})
-promResponseWriteErrors = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "dns_resolver_response_write_errors_total",
-		Help: "Total number of response write errors",
-	})
-promRateLimitExceeded = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "dns_resolver_rate_limit_exceeded_total",
-		Help: "Total number of rate limit exceeded events",
-	})
-promCacheHitsByType = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "dns_resolver_cache_hits_by_type_total",
-		Help: "Total number of cache hits by query type",
-	}, []string{"type"})
-promCacheMissesByType = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "dns_resolver_cache_misses_by_type_total",
-		Help: "Total number of cache misses by query type",
-	}, []string{"type"})
-promUpstreamQueryDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
-		Name: "dns_resolver_upstream_query_duration_seconds",
-		Help: "Duration of upstream DNS queries",
-		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0},
-	}, []string{"type"})
 )
 
 // NewMetrics returns the singleton instance of Metrics.
@@ -342,44 +321,36 @@ func (m *Metrics) systemMetricsCollector() {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		// Perform data collection outside the lock to minimize contention
-		cpuPercentages, err := cpu.Percent(time.Second, false)
-		cpuUsage := 0.0
-		if err == nil && len(cpuPercentages) > 0 {
-			cpuUsage = cpuPercentages[0]
-		} else if err != nil {
-			log.Printf("Error collecting CPU metrics: %v", err)
-		}
-
-		memInfo, err := mem.VirtualMemory()
-		memUsage := 0.0
-		if err == nil {
-			memUsage = memInfo.UsedPercent
-		} else if err != nil {
-			log.Printf("Error collecting memory metrics: %v", err)
-		}
-
-		goroutineCount := runtime.NumGoroutine()
-
-		// Lock only when updating the shared metrics struct
 		m.Lock()
-		m.cpuUsage = cpuUsage
-		m.memoryUsage = memUsage
-		m.goroutineCount = goroutineCount
+		// CPU Usage
+		cpuPercentages, err := cpu.Percent(0, false)
+		if err == nil && len(cpuPercentages) > 0 {
+			m.cpuUsage = cpuPercentages[0]
+			promCPUUsage.Set(cpuPercentages[0])
+		}
+
+		// Memory Usage
+		memInfo, err := mem.VirtualMemory()
+		if err == nil {
+			m.memoryUsage = memInfo.UsedPercent
+			promMemoryUsage.Set(memInfo.UsedPercent)
+		}
+
+		// Goroutine Count
+		m.goroutineCount = runtime.NumGoroutine()
+		promGoroutineCount.Set(float64(m.goroutineCount))
+
 		m.Unlock()
 
-		// Update Prometheus gauges (thread-safe)
-		promCPUUsage.Set(cpuUsage)
-		promMemoryUsage.Set(memUsage)
-		promGoroutineCount.Set(float64(goroutineCount))
-
-		// Network stats for Prometheus
+		// Network Stats - no need to lock for these, they are just for prometheus
 		netIO, err := net.IOCounters(false)
 		if err == nil && len(netIO) > 0 {
 			promNetworkSent.Set(float64(netIO[0].BytesSent))
 			promNetworkRecv.Set(float64(netIO[0].BytesRecv))
-		} else if err != nil {
-			log.Printf("Error collecting network metrics: %v", err)
+		}
+
+		if err != nil {
+			log.Printf("Error collecting system metrics: %v", err)
 		}
 	}
 }
@@ -430,9 +401,14 @@ func (m *Metrics) processTopNXDomains() {
 	})
 
 	// Sort and get top 10
-	sort.Slice(domains, func(i, j int) bool {
-		return domains[i].Count > domains[j].Count
-	})
+	// Simple bubble sort for demonstration
+	for i := 0; i < len(domains); i++ {
+		for j := i + 1; j < len(domains); j++ {
+			if domains[i].Count < domains[j].Count {
+				domains[i], domains[j] = domains[j], domains[i]
+			}
+		}
+	}
 	if len(domains) > 10 {
 		domains = domains[:10]
 	}
@@ -461,9 +437,13 @@ func (m *Metrics) processTopLatencyDomains() {
 	})
 
 	// Sort and get top 10
-	sort.Slice(domains, func(i, j int) bool {
-		return domains[i].AvgLatency > domains[j].AvgLatency
-	})
+	for i := 0; i < len(domains); i++ {
+		for j := i + 1; j < len(domains); j++ {
+			if domains[i].AvgLatency < domains[j].AvgLatency {
+				domains[i], domains[j] = domains[j], domains[i]
+			}
+		}
+	}
 	if len(domains) > 10 {
 		domains = domains[:10]
 	}
@@ -537,29 +517,4 @@ func (m *Metrics) IncrementLMDBErrors() {
 // IncrementPrefetches increments the prefetch counter.
 func (m *Metrics) IncrementPrefetches() {
 	promPrefetches.Inc()
-}
-
-// IncrementResponseWriteErrors increments the response write error counter.
-func (m *Metrics) IncrementResponseWriteErrors() {
-	promResponseWriteErrors.Inc()
-}
-
-// IncrementRateLimitExceeded increments the rate limit exceeded counter.
-func (m *Metrics) IncrementRateLimitExceeded() {
-	promRateLimitExceeded.Inc()
-}
-
-// IncrementCacheHitsByType increments the cache hit counter for a specific query type.
-func (m *Metrics) IncrementCacheHitsByType(qtype string) {
-	promCacheHitsByType.WithLabelValues(qtype).Inc()
-}
-
-// IncrementCacheMissesByType increments the cache miss counter for a specific query type.
-func (m *Metrics) IncrementCacheMissesByType(qtype string) {
-	promCacheMissesByType.WithLabelValues(qtype).Inc()
-}
-
-// RecordUpstreamQueryDuration records the duration of an upstream query.
-func (m *Metrics) RecordUpstreamQueryDuration(qtype string, duration time.Duration) {
-	promUpstreamQueryDuration.WithLabelValues(qtype).Observe(duration.Seconds())
 }

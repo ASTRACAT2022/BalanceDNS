@@ -11,10 +11,10 @@ BINARY_PATH="$PROJECT_DIR/$SERVICE_NAME"
 echo "🚀 Starting installation of Astracat DNS Resolver..."
 
 # Проверка наличия Go
-# if ! command -v go &> /dev/null; then
-#     echo "❌ Go is not installed. Please install Go first."
-#     exit 1
-# fi
+if ! command -v go &> /dev/null; then
+    echo "❌ Go is not installed. Please install Go first."
+    exit 1
+fi
 
 echo "📁 Project directory: $PROJECT_DIR"
 cd "$PROJECT_DIR"
@@ -32,7 +32,7 @@ sudo mkdir -p /etc/unbound
 sudo unbound-anchor -a /etc/unbound/root.key
 
 echo "🔨 Building the project..."
-/usr/local/go/bin/go build -o "$SERVICE_NAME" .
+go build -o "$SERVICE_NAME" .
 
 if [ ! -f "$BINARY_PATH" ]; then
     echo "❌ Build failed: binary not found at $BINARY_PATH"

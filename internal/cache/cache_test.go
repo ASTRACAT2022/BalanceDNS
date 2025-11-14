@@ -50,15 +50,15 @@ func TestCacheSetAndGet(t *testing.T) {
 
 	c.Set(key, msg, 0)
 
-	msgBytes, found, revalidate, _, _ := c.Get(key)
+	retrievedMsg, found, revalidate := c.Get(key)
 	if !found {
 		t.Fatal("expected to find message in cache, but didn't")
 	}
 	if revalidate {
 		t.Error("expected revalidate to be false for a fresh entry")
 	}
-	if msgBytes == nil {
-		t.Fatal("retrieved message bytes were nil")
+	if retrievedMsg == nil {
+		t.Fatal("retrieved message was nil")
 	}
 }
 
@@ -69,7 +69,7 @@ func TestCacheNotFound(t *testing.T) {
 	q := dns.Question{Name: "notfound.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	key := Key(q)
 
-	_, found, _, _, _ := c.Get(key)
+	_, found, _ := c.Get(key)
 	if found {
 		t.Fatal("expected to not find message in cache, but did")
 	}
@@ -87,7 +87,7 @@ func TestCacheExpiration(t *testing.T) {
 
 	time.Sleep(1100 * time.Millisecond)
 
-	_, found, _, _, _ := c.Get(key)
+	_, found, _ := c.Get(key)
 	if found {
 		t.Fatal("expected message to be expired and not found, but it was found")
 	}
@@ -115,17 +115,12 @@ func TestCachePersistence(t *testing.T) {
 	defer c2.Close()
 
 	// Verify the item is present in the new cache.
-	retrievedBytes, found, _, _, _ := c2.Get(key)
+	retrievedMsg, found, _ := c2.Get(key)
 	if !found {
 		t.Fatal("expected to find message in persisted cache, but didn't")
 	}
-	if retrievedBytes == nil {
-		t.Fatal("retrieved message bytes were nil")
-	}
-	// Optionally, unpack and verify the content
-	retrievedMsg := new(dns.Msg)
-	if err := retrievedMsg.Unpack(retrievedBytes); err != nil {
-		t.Fatalf("Failed to unpack retrieved message: %v", err)
+	if retrievedMsg == nil {
+		t.Fatal("retrieved message was nil")
 	}
 	if len(retrievedMsg.Answer) != 1 || retrievedMsg.Answer[0].Header().Name != "persistent.com." {
 		t.Errorf("unexpected answer in retrieved message: %v", retrievedMsg.Answer)
@@ -157,7 +152,7 @@ func TestCachePersistenceExpiration(t *testing.T) {
 	defer c2.Close()
 
 	// The expired item should not be loaded.
-	_, found, _, _, _ := c2.Get(key)
+	_, found, _ := c2.Get(key)
 	if found {
 		t.Fatal("found an expired message in the cache, but it should have been ignored on load")
 	}
@@ -178,20 +173,15 @@ func TestCacheStaleWhileRevalidate(t *testing.T) {
 	// Wait for item to become stale but not fully expired from SWR window
 	time.Sleep(1100 * time.Millisecond)
 
-	retrievedBytes, found, revalidate, _, _ := c.Get(key)
+	retrievedMsg, found, revalidate := c.Get(key)
 	if !found {
 		t.Fatal("expected to get stale message, but got nothing")
 	}
 	if !revalidate {
 		t.Error("expected revalidate to be true for a stale entry")
 	}
-	if retrievedBytes == nil {
+	if retrievedMsg == nil {
 		t.Fatal("retrieved stale message was nil")
-	}
-
-	retrievedMsg := new(dns.Msg)
-	if err := retrievedMsg.Unpack(retrievedBytes); err != nil {
-		t.Fatalf("Failed to unpack stale message: %v", err)
 	}
 	if len(retrievedMsg.Answer) != 1 {
 		t.Fatalf("expected 1 answer in stale message, got %d", len(retrievedMsg.Answer))
@@ -201,7 +191,7 @@ func TestCacheStaleWhileRevalidate(t *testing.T) {
 	time.Sleep(swrDuration)
 
 	// After the SWR window, the item should be gone
-	_, found, _, _, _ = c.Get(key)
+	_, found, _ = c.Get(key)
 	if found {
 		t.Fatal("expected message to be expired and not found after SWR window, but it was found")
 	}

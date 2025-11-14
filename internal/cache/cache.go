@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -126,8 +125,6 @@ type Cache struct {
 	lmdbEnv       *lmdb.Env
 	lmdbDBI       lmdb.DBI
 	metrics       *metrics.Metrics
-	cacheSize     int
-	shardMutexes  []sync.RWMutex  // Additional mutexes for better concurrency
 }
 
 // NewCache creates and returns a new Cache with LMDB persistence.
@@ -185,12 +182,6 @@ func NewCache(size int, numShards int, lmdbPath string, m *metrics.Metrics) *Cac
 		}
 	}
 
-	// Initialize shard mutexes for better concurrent access
-	shardMutexes := make([]sync.RWMutex, numShards)
-	for i := 0; i < numShards; i++ {
-		shardMutexes[i] = sync.RWMutex{}
-	}
-
 	c := &Cache{
 		shards:        shards,
 		numShards:     uint32(numShards),
@@ -199,8 +190,6 @@ func NewCache(size int, numShards int, lmdbPath string, m *metrics.Metrics) *Cac
 		lmdbEnv:       env,
 		lmdbDBI:       dbi,
 		metrics:       m,
-		cacheSize:     size,
-		shardMutexes:  shardMutexes,
 	}
 
 	c.loadFromDB()
@@ -268,7 +257,13 @@ func (c *Cache) loadFromDB() {
 	}
 }
 
-func (c *Cache) writeToDB(key string, packedMsg []byte, expiration time.Time, swr time.Duration) {
+func (c *Cache) writeToDB(key string, msg *dns.Msg, expiration time.Time, swr time.Duration) {
+	packedMsg, err := msg.Pack()
+	if err != nil {
+		log.Printf("Failed to pack DNS message for key %s: %v", key, err)
+		return
+	}
+
 	fItem := FixedSizeCacheItem{
 		ExpirationUnix:                  expiration.Unix(),
 		StaleWhileRevalidateNanoseconds: int64(swr),
@@ -301,50 +296,45 @@ func (c *Cache) deleteFromDB(key string) {
 	}
 }
 
-func (c *Cache) Get(key string) ([]byte, bool, bool, time.Time, time.Duration) {
-	// Extract query type from the key for metrics
-	qtype := extractQueryTypeFromKey(key)
-
-	shardIdx := c.getShardIndex(key)
-	shard := c.shards[shardIdx]
-	
-	// Use the separate shard mutex for more granular locking
-	c.shardMutexes[shardIdx].Lock()
-	defer c.shardMutexes[shardIdx].Unlock()
+func (c *Cache) Get(key string) (*dns.Msg, bool, bool) {
+	shard := c.getShard(key)
+	shard.Lock()
+	defer shard.Unlock()
 
 	item, found := shard.items[key]
 	if !found {
 		c.metrics.IncrementCacheMisses()
-		if qtype != "" {
-			c.metrics.IncrementCacheMissesByType(qtype)
-		}
-		return nil, false, false, time.Time{}, 0
+		return nil, false, false
 	}
 
-	if time.Now().After(item.Expiration) {
-		if item.StaleWhileRevalidate > 0 && time.Now().Before(item.Expiration.Add(item.StaleWhileRevalidate)) {
-			c.metrics.IncrementCacheHits()
-			if qtype != "" {
-				c.metrics.IncrementCacheHitsByType(qtype)
-			}
-			// Return the stale item's data for revalidation
-			return item.MsgBytes, true, true, item.Expiration, item.StaleWhileRevalidate
-		}
-
-		// Item has expired and is not eligible for stale-while-revalidate
+	msg := new(dns.Msg)
+	if err := msg.Unpack(item.MsgBytes); err != nil {
+		log.Printf("Failed to unpack message from in-memory cache for key %s: %v", key, err)
+		// Consider removing the corrupted item
 		evictedKey := shard.removeItem(item)
 		if evictedKey != "" {
 			c.metrics.IncrementCacheEvictions()
 			c.deleteFromDB(evictedKey)
 		}
 		c.metrics.IncrementCacheMisses()
-		if qtype != "" {
-			c.metrics.IncrementCacheMissesByType(qtype)
-		}
-		return nil, false, false, time.Time{}, 0
+		return nil, false, false
 	}
 
-	// Item is fresh, promote it in SLRU
+	if time.Now().After(item.Expiration) {
+		if item.StaleWhileRevalidate > 0 && time.Now().Before(item.Expiration.Add(item.StaleWhileRevalidate)) {
+			c.metrics.IncrementCacheHits()
+			msg.Id = 0
+			return msg, true, true
+		}
+		evictedKey := shard.removeItem(item)
+		if evictedKey != "" {
+			c.metrics.IncrementCacheEvictions()
+			c.deleteFromDB(evictedKey)
+		}
+		c.metrics.IncrementCacheMisses()
+		return nil, false, false
+	}
+
 	evictedKey := shard.accessItem(item)
 	if evictedKey != "" {
 		c.metrics.IncrementCacheEvictions()
@@ -352,23 +342,8 @@ func (c *Cache) Get(key string) ([]byte, bool, bool, time.Time, time.Duration) {
 	}
 
 	c.metrics.IncrementCacheHits()
-	if qtype != "" {
-		c.metrics.IncrementCacheHitsByType(qtype)
-	}
-	return item.MsgBytes, true, false, item.Expiration, item.StaleWhileRevalidate
-}
-
-// extractQueryTypeFromKey extracts the query type from the cache key
-func extractQueryTypeFromKey(key string) string {
-	parts := strings.Split(key, ":")
-	if len(parts) >= 2 {
-		qtypeNum := parts[1]
-		// Convert string number to uint16 and then to DNS type string
-		if qtype, err := strconv.ParseUint(qtypeNum, 10, 16); err == nil {
-			return dns.TypeToString[uint16(qtype)]
-		}
-	}
-	return ""
+	msg.Id = 0
+	return msg, true, false
 }
 
 func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
@@ -379,24 +354,18 @@ func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
 	ttl := getMinTTL(msg)
 	expiration := time.Now().Add(time.Duration(ttl) * time.Second)
 
+	c.writeToDB(key, msg, expiration, swr)
+
 	packedMsg, err := msg.Pack()
 	if err != nil {
-		log.Printf("Failed to pack DNS message for key %s: %v", key, err)
+		log.Printf("Failed to pack DNS message for in-memory cache, key %s: %v", key, err)
 		return
 	}
-
-	// Write to persistent storage in background to avoid blocking
-	go func() {
-		c.writeToDB(key, packedMsg, expiration, swr)
-	}()
 
 	evictedKey := c.setInMemory(key, packedMsg, msg.Question[0], swr, expiration)
 	if evictedKey != "" && evictedKey != key {
 		c.metrics.IncrementCacheEvictions()
-		// Delete from DB in background as well
-		go func(k string) {
-			c.deleteFromDB(k)
-		}(evictedKey)
+		c.deleteFromDB(evictedKey)
 	}
 }
 
@@ -505,11 +474,6 @@ func (c *Cache) getShard(key string) *slruSegment {
 	return c.shards[hash%c.numShards]
 }
 
-func (c *Cache) getShardIndex(key string) int {
-	hash := fnv32(key)
-	return int(hash % c.numShards)
-}
-
 func fnv32(key string) uint32 {
 	hash := uint32(2166136261)
 	for i := 0; i < len(key); i++ {
@@ -546,11 +510,11 @@ func getMinTTL(msg *dns.Msg) uint32 {
 
 func (c *Cache) GetCacheSize() (int, int) {
 	var probationSize, protectedSize int
-	for i, shard := range c.shards {
-		c.shardMutexes[i].RLock()
+	for _, shard := range c.shards {
+		shard.RLock()
 		probationSize += shard.probationList.Len()
 		protectedSize += shard.protectedList.Len()
-		c.shardMutexes[i].RUnlock()
+		shard.RUnlock()
 	}
 	return probationSize, protectedSize
 }

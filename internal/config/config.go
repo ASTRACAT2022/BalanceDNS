@@ -30,14 +30,14 @@ func NewConfig() *Config {
 		PrometheusNamespace:  "dns_resolver",
 		UpstreamTimeout:      5 * time.Second,
 		RequestTimeout:       5 * time.Second,
-		MaxWorkers:           50, // Increased for better concurrency
-		CacheSize:            10000, // Increased cache size
-		MessageCacheSize:     10000,
-		RRsetCacheSize:       10000,
+		MaxWorkers:           10,
+		CacheSize:            5000,
+		MessageCacheSize:     5000,
+		RRsetCacheSize:       5000,
 		CacheMaxTTL:          3600 * time.Second,
 		CacheMinTTL:          60 * time.Second,
-		StaleWhileRevalidate: 2 * time.Minute, // Increased for better performance
+		StaleWhileRevalidate: 1 * time.Minute,
 		LMDBPath:             "/tmp/dns_cache.lmdb",
-		ResolverType:         "godns", // Default to GoDNS resolver for better performance
+		ResolverType:         "knot", // Default to Knot resolver
 	}
 }

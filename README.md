@@ -1,5 +1,5 @@
 # 🐱 ASTRACAT DNS Resolver
-ASTRACAT DNS CDN https://www.jsdelivr.com/package/gh/ASTRACAT2022/Astracat-DNS-Resolver
+
 A high-performance DNS resolver with caching, prefetching, and metrics.
 
 ### Features
