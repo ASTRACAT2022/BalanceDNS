@@ -21,6 +21,9 @@ FROM alpine:latest
 # Установка зависимостей времени выполнения
 RUN apk add --no-cache unbound ca-certificates
 
+# Установка переменной окружения для ограничения использования CPU
+ENV GOMAXPROCS=1
+
 # Получение корневого ключа для валидации DNSSEC
 RUN mkdir -p /etc/unbound && unbound-anchor -a /etc/unbound/root.key
 

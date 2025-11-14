@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"log"
 	"os"
 	"time"
@@ -14,18 +15,10 @@ import (
 	"dns-resolver/plugins/example_logger"
 )
 
-// Старая функция больше не используется, так как теперь используем метод из пакета metrics
 
-func main() {
-	// Open a file for logging. Truncate the file if it already exists.
-	logFile, err := os.OpenFile("server.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
-	if err != nil {
-		log.Fatalf("Failed to open log file: %v", err)
-	}
-	defer logFile.Close()
-
-	// Set the output of the log package to the file.
-	log.SetOutput(logFile)
+func runServer(logOutput io.Writer) (*server.Server, func()) {
+	// Set the output of the log package.
+	log.SetOutput(logOutput)
 
 	log.Println("Booting up ASTRACAT Relover...")
 
@@ -37,14 +30,18 @@ func main() {
 
 	// Create cache and resolver
 	c := cache.NewCache(cfg.CacheSize, cache.DefaultShards, cfg.LMDBPath, m)
-	defer c.Close()
 	
 	// Create resolver based on configuration
 	res, err := resolver.NewResolver(resolver.ResolverType(cfg.ResolverType), cfg, c, m)
 	if err != nil {
+		c.Close()
 		log.Fatalf("Failed to create resolver: %v", err)
 	}
-	defer res.Close()
+
+	cleanup := func() {
+		res.Close()
+		c.Close()
+	}
 
 	// Start a goroutine to periodically update cache stats
 	go func() {
@@ -68,6 +65,19 @@ func main() {
 
 	// Create and start the server
 	srv := server.NewServer(cfg, m, res, pm)
+	return srv, cleanup
+}
+
+func main() {
+	// Open a file for logging. Truncate the file if it already exists.
+	logFile, err := os.OpenFile("server.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	if err != nil {
+		log.Fatalf("Failed to open log file: %v", err)
+	}
+	defer logFile.Close()
+
+	srv, cleanup := runServer(logFile)
+	defer cleanup()
 
 	srv.ListenAndServe()
 }

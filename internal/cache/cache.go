@@ -290,7 +290,7 @@ func (c *Cache) deleteFromDB(key string) {
 	}
 }
 
-func (c *Cache) Get(key string) (*dns.Msg, bool, bool) {
+func (c *Cache) Get(key string) ([]byte, bool, bool, time.Time, time.Duration) {
 	shard := c.getShard(key)
 	shard.Lock()
 	defer shard.Unlock()
@@ -298,37 +298,27 @@ func (c *Cache) Get(key string) (*dns.Msg, bool, bool) {
 	item, found := shard.items[key]
 	if !found {
 		c.metrics.IncrementCacheMisses()
-		return nil, false, false
-	}
-
-	msg := new(dns.Msg)
-	if err := msg.Unpack(item.MsgBytes); err != nil {
-		log.Printf("Failed to unpack message from in-memory cache for key %s: %v", key, err)
-		// Consider removing the corrupted item
-		evictedKey := shard.removeItem(item)
-		if evictedKey != "" {
-			c.metrics.IncrementCacheEvictions()
-			c.deleteFromDB(evictedKey)
-		}
-		c.metrics.IncrementCacheMisses()
-		return nil, false, false
+		return nil, false, false, time.Time{}, 0
 	}
 
 	if time.Now().After(item.Expiration) {
 		if item.StaleWhileRevalidate > 0 && time.Now().Before(item.Expiration.Add(item.StaleWhileRevalidate)) {
 			c.metrics.IncrementCacheHits()
-			msg.Id = 0
-			return msg, true, true
+			// Return the stale item's data for revalidation
+			return item.MsgBytes, true, true, item.Expiration, item.StaleWhileRevalidate
 		}
+
+		// Item has expired and is not eligible for stale-while-revalidate
 		evictedKey := shard.removeItem(item)
 		if evictedKey != "" {
 			c.metrics.IncrementCacheEvictions()
 			c.deleteFromDB(evictedKey)
 		}
 		c.metrics.IncrementCacheMisses()
-		return nil, false, false
+		return nil, false, false, time.Time{}, 0
 	}
 
+	// Item is fresh, promote it in SLRU
 	evictedKey := shard.accessItem(item)
 	if evictedKey != "" {
 		c.metrics.IncrementCacheEvictions()
@@ -336,8 +326,7 @@ func (c *Cache) Get(key string) (*dns.Msg, bool, bool) {
 	}
 
 	c.metrics.IncrementCacheHits()
-	msg.Id = 0
-	return msg, true, false
+	return item.MsgBytes, true, false, item.Expiration, item.StaleWhileRevalidate
 }
 
 func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
