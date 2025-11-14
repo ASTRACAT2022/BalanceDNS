@@ -6,11 +6,14 @@ import (
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/metrics"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/miekg/dns"
 )
+
+var testResolverMutex sync.Mutex
 
 func TestResolver_Resolve(t *testing.T) {
 	// Create a new cache and resolver for the test.
@@ -27,6 +30,8 @@ func TestResolver_Resolve(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create resolver: %v", err)
 	}
+	testResolverMutex.Lock()
+	defer testResolverMutex.Unlock()
 
 	// Define the question to test.
 	req := new(dns.Msg)
@@ -81,6 +86,8 @@ func TestResolver_Resolve_DNSSEC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create resolver: %v", err)
 	}
+	testResolverMutex.Lock()
+	defer testResolverMutex.Unlock()
 
 	testCases := []struct {
 		name          string

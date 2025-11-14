@@ -214,6 +214,7 @@ func (r *GoDNSResolver) iterativeLookup(ctx context.Context, domain string, qtyp
 	// Limit the number of iterations to prevent infinite loops
 	maxIterations := 20
 	iteration := 0
+    var lastError error
 
 	currentDomain := domain
 	currentServers := servers
@@ -228,7 +229,6 @@ func (r *GoDNSResolver) iterativeLookup(ctx context.Context, domain string, qtyp
 
 		// Track if any server responded in this iteration
 		serverResponded := false
-		var lastError error
 
 		// Try each server until one responds with a useful answer
 		for _, server := range currentServers {

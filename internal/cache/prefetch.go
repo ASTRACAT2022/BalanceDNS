@@ -98,8 +98,13 @@ func (pm *PrefetchManager) prefetchRecord(domain string, qType uint16) {
 
 		// Cache the response if it's valid
 		if resp != nil && resp.Rcode == dns.RcodeSuccess {
+			packedMsg, err := resp.Pack()
+			if err != nil {
+				log.Printf("Failed to pack prefetched response for %s: %v", domain, err)
+				return
+			}
 			key := Key(dns.Question{Name: domain, Qtype: qType, Qclass: dns.ClassINET})
-			pm.cache.setInMemory(key, resp.Answer, req.Question[0], time.Minute, time.Now().Add(time.Minute*5))
+			pm.cache.setInMemory(key, packedMsg, req.Question[0], time.Minute, time.Now().Add(time.Minute*5))
 			pm.metrics.IncrementPrefetches()
 			log.Printf("Successfully prefetched %s record for %s", dns.TypeToString[qType], domain)
 		}
