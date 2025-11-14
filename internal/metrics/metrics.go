@@ -171,6 +171,27 @@ var (
 		Name: "dns_resolver_prefetches_total",
 		Help: "Total number of cache prefetches",
 	})
+promResponseWriteErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "dns_resolver_response_write_errors_total",
+		Help: "Total number of response write errors",
+	})
+promRateLimitExceeded = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "dns_resolver_rate_limit_exceeded_total",
+		Help: "Total number of rate limit exceeded events",
+	})
+promCacheHitsByType = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "dns_resolver_cache_hits_by_type_total",
+		Help: "Total number of cache hits by query type",
+	}, []string{"type"})
+promCacheMissesByType = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "dns_resolver_cache_misses_by_type_total",
+		Help: "Total number of cache misses by query type",
+	}, []string{"type"})
+promUpstreamQueryDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "dns_resolver_upstream_query_duration_seconds",
+		Help: "Duration of upstream DNS queries",
+		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0},
+	}, []string{"type"})
 )
 
 // NewMetrics returns the singleton instance of Metrics.
@@ -516,4 +537,29 @@ func (m *Metrics) IncrementLMDBErrors() {
 // IncrementPrefetches increments the prefetch counter.
 func (m *Metrics) IncrementPrefetches() {
 	promPrefetches.Inc()
+}
+
+// IncrementResponseWriteErrors increments the response write error counter.
+func (m *Metrics) IncrementResponseWriteErrors() {
+	promResponseWriteErrors.Inc()
+}
+
+// IncrementRateLimitExceeded increments the rate limit exceeded counter.
+func (m *Metrics) IncrementRateLimitExceeded() {
+	promRateLimitExceeded.Inc()
+}
+
+// IncrementCacheHitsByType increments the cache hit counter for a specific query type.
+func (m *Metrics) IncrementCacheHitsByType(qtype string) {
+	promCacheHitsByType.WithLabelValues(qtype).Inc()
+}
+
+// IncrementCacheMissesByType increments the cache miss counter for a specific query type.
+func (m *Metrics) IncrementCacheMissesByType(qtype string) {
+	promCacheMissesByType.WithLabelValues(qtype).Inc()
+}
+
+// RecordUpstreamQueryDuration records the duration of an upstream query.
+func (m *Metrics) RecordUpstreamQueryDuration(qtype string, duration time.Duration) {
+	promUpstreamQueryDuration.WithLabelValues(qtype).Observe(duration.Seconds())
 }

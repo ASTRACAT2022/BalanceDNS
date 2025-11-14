@@ -149,6 +149,8 @@ func (r *Resolver) exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 
 	// Always record latency
 	r.metrics.RecordLatency(q.Name, latency)
+	// Record upstream query duration
+	r.metrics.RecordUpstreamQueryDuration(dns.TypeToString[q.Qtype], latency)
 
 	if err != nil {
 		r.metrics.IncrementUnboundErrors()
