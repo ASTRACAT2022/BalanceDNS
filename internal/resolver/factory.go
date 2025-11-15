@@ -36,7 +36,8 @@ func NewResolver(resolverType ResolverType, cfg *config.Config, c *cache.Cache, 
 	switch resolverType {
 	case ResolverTypeUnbound:
 		log.Println("Creating Unbound resolver")
-		return NewUnboundResolver(cfg, c, m), nil
+		log.Println("Unbound resolver is not available in this build. Using GoDNS resolver instead.")
+		return NewGoDNSResolver(cfg, c, m), nil
 	case ResolverTypeGoDNS:
 		log.Println("Creating GoDNS resolver")
 		return NewGoDNSResolver(cfg, c, m), nil
