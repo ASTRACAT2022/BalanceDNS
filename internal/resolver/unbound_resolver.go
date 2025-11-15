@@ -1,3 +1,6 @@
+//go:build unbound
+// +build unbound
+
 package resolver
 
 import (

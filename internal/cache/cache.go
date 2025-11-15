@@ -17,7 +17,7 @@ import (
 
 	"github.com/bmatsuo/lmdb-go/lmdb"
 	"github.com/miekg/dns"
-	"go.uber.org/atomic"
+	atomicpkg "go.uber.org/atomic"
 )
 
 // persistentCacheItem is the struct that gets serialized to LMDB.
@@ -141,9 +141,9 @@ type Cache struct {
 	lmdbDBI       lmdb.DBI
 	metrics       *metrics.Metrics
 	// Performance counters
-	hitCount      *atomic.Int64
-	missCount     *atomic.Int64
-	evictionCount *atomic.Int64
+	hitCount      *atomicpkg.Int64
+	missCount     *atomicpkg.Int64
+	evictionCount *atomicpkg.Int64
 	// High-performance fast cache for most frequent lookups
 	fastCache   sync.Map
 	fastSize    int32
@@ -214,9 +214,9 @@ func NewCache(size int, numShards int, lmdbPath string, m *metrics.Metrics) *Cac
 		lmdbEnv:       env,
 		lmdbDBI:       dbi,
 		metrics:       m,
-		hitCount:      atomic.NewInt64(0),
-		missCount:     atomic.NewInt64(0),
-		evictionCount: atomic.NewInt64(0),
+		hitCount:      atomicpkg.NewInt64(0),
+		missCount:     atomicpkg.NewInt64(0),
+		evictionCount: atomicpkg.NewInt64(0),
 		maxFastSize:   int32(size / 4), // Use 25% of total cache size for fast cache
 	}
 
@@ -719,12 +719,5 @@ func (c *Cache) cleanupFastCache() {
 		if cleanupCount > 0 {
 			log.Printf("Cleaned up %d expired entries from fast cache", cleanupCount)
 		}
-	}
-}
-
-// Close properly closes the cache and its resources
-func (c *Cache) Close() {
-	if c.lmdbEnv != nil {
-		c.lmdbEnv.Close()
 	}
 }
