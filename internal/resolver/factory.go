@@ -16,6 +16,8 @@ import (
 type ResolverType string
 
 const (
+	// ResolverTypeGoDNS uses a pure Go recursive resolver.
+	ResolverTypeGoDNS ResolverType = "godns"
 	// ResolverTypeUnbound uses libunbound for DNS resolution
 	ResolverTypeUnbound ResolverType = "unbound"
 )
@@ -31,6 +33,6 @@ type ResolverInterface interface {
 
 // NewResolver creates a new resolver instance based on the specified type.
 func NewResolver(resolverType ResolverType, cfg *config.Config, c *cache.Cache, m *metrics.Metrics) (ResolverInterface, error) {
-	log.Println("Creating Unbound resolver")
-	return NewUnboundResolver(cfg, c, m), nil
+	log.Println("Creating GoDNS resolver")
+	return NewGoDNSResolver(cfg, c, m), nil
 }

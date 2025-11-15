@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"os"
+	"os/exec"
 	"runtime"
 	"sync"
 	"testing"
@@ -10,6 +13,31 @@ import (
 
 	"github.com/miekg/dns"
 )
+
+// Helper function to start the server in the background for integration tests
+func runServerForPerfTest(ctx context.Context, cancel context.CancelFunc) {
+	// Build the server binary
+	cmd := exec.Command("go", "build", "-o", "/tmp/dns-resolver", ".")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Fatalf("Failed to build server: %v\nOutput: %s", err, string(output))
+	}
+
+	// Run the server
+	cmd = exec.Command("/tmp/dns-resolver")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err = cmd.Start()
+	if err != nil {
+		log.Fatalf("Failed to start server: %v", err)
+	}
+
+	// Kill the server when the context is done
+	go func() {
+		<-ctx.Done()
+		cmd.Process.Kill()
+	}()
+}
 
 type PerfTestClient struct {
 	client *dns.Client
@@ -40,12 +68,18 @@ func (c *PerfTestClient) Query(domain string, qtype uint16) error {
 }
 
 func TestPerformance(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runServerForPerfTest(ctx, cancel)
+	time.Sleep(2 * time.Second) // Wait for server to be ready
+
 	client := NewPerfTestClient()
 
 	// Test domains
 	domains := []string{
 		"google.com",
-		"github.com", 
+		"github.com",
 		"stackoverflow.com",
 		"amazon.com",
 		"microsoft.com",

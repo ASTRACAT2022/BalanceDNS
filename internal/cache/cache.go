@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"container/list"
 	"dns-resolver/internal/metrics"
+	"dns-resolver/internal/pool"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -36,7 +37,7 @@ type FixedSizeCacheItem struct {
 // Pack serializes the FixedSizeCacheItem into bytes
 func (f *FixedSizeCacheItem) Pack() ([]byte, error) {
 	buf := new(bytes.Buffer)
-	
+
 	// Write fixed-size metadata
 	err := binary.Write(buf, binary.BigEndian, f.ExpirationUnix)
 	if err != nil {
@@ -50,13 +51,13 @@ func (f *FixedSizeCacheItem) Pack() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Write variable-length message bytes
 	_, err = buf.Write(f.MsgBytes)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	return buf.Bytes(), nil
 }
 
@@ -65,9 +66,9 @@ func (f *FixedSizeCacheItem) Unpack(data []byte) error {
 	if len(data) < 24 { // 8*3 bytes for the fixed-size fields
 		return fmt.Errorf("data too short")
 	}
-	
+
 	buf := bytes.NewReader(data)
-	
+
 	err := binary.Read(buf, binary.BigEndian, &f.ExpirationUnix)
 	if err != nil {
 		return err
@@ -80,18 +81,18 @@ func (f *FixedSizeCacheItem) Unpack(data []byte) error {
 	if err != nil {
 		return err
 	}
-	
+
 	remaining := buf.Len()
 	if uint32(remaining) < f.MsgBytesLength {
 		return fmt.Errorf("message bytes length mismatch")
 	}
-	
+
 	f.MsgBytes = make([]byte, f.MsgBytesLength)
 	_, err = buf.Read(f.MsgBytes)
 	if err != nil {
 		return err
 	}
-	
+
 	return nil
 }
 
@@ -234,8 +235,9 @@ func (c *Cache) loadFromDB() {
 				continue
 			}
 
-			msg := new(dns.Msg)
+			msg := pool.GetMsg()
 			if err := msg.Unpack(fItem.MsgBytes); err != nil {
+				pool.PutMsg(msg)
 				c.metrics.IncrementLMDBErrors()
 				log.Printf("Failed to unpack DNS message for key %s: %v", string(key), err)
 				continue
@@ -249,6 +251,7 @@ func (c *Cache) loadFromDB() {
 				c.metrics.IncrementCacheEvictions()
 				c.deleteFromDB(evictedKey)
 			}
+			pool.PutMsg(msg)
 		}
 		return nil
 	})
@@ -307,8 +310,9 @@ func (c *Cache) Get(key string) (*dns.Msg, bool, bool) {
 		return nil, false, false
 	}
 
-	msg := new(dns.Msg)
+	msg := pool.GetMsg()
 	if err := msg.Unpack(item.MsgBytes); err != nil {
+		pool.PutMsg(msg)
 		log.Printf("Failed to unpack message from in-memory cache for key %s: %v", key, err)
 		// Consider removing the corrupted item
 		evictedKey := shard.removeItem(item)
@@ -326,6 +330,7 @@ func (c *Cache) Get(key string) (*dns.Msg, bool, bool) {
 			msg.Id = 0
 			return msg, true, true
 		}
+		pool.PutMsg(msg)
 		evictedKey := shard.removeItem(item)
 		if evictedKey != "" {
 			c.metrics.IncrementCacheEvictions()

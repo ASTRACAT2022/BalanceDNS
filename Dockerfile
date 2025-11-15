@@ -1,42 +1,30 @@
-# Этап 1: Сборка приложения Go
-FROM golang:1.23.2-alpine AS builder
-
-# Установка зависимостей для сборки
-RUN apk add --no-cache build-base gcc unbound-dev lmdb-dev
+# Stage 1: Build the Go binary
+FROM golang:1.20-bullseye AS builder
 
 WORKDIR /app
 
+# Install dependencies for unbound
+RUN apt-get update && apt-get install -y unbound-anchor
+
+# Generate root.key
+RUN unbound-anchor -a /app/root.key
+
 COPY go.mod go.sum ./
-# Загрузка зависимостей
 RUN go mod download
 
 COPY . .
 
-# Сборка приложения с поддержкой CGO для unbound
-RUN CGO_ENABLED=1 go build -o /dns-resolver -tags="unbound cgo" -ldflags "-s -w" .
+RUN CGO_ENABLED=1 GOOS=linux go build -tags="unbound cgo" -o /dns-resolver .
 
-# Этап 2: Создание финального легковесного образа
-FROM alpine:latest
+# Stage 2: Create the final image
+FROM debian:bullseye-slim
 
-# Установка зависимостей времени выполнения
-RUN apk add --no-cache unbound ca-certificates lmdb-dev
+WORKDIR /
 
-# Установка переменной окружения для ограничения использования CPU
-ENV GOMAXPROCS=1
-
-# Получение корневого ключа для валидации DNSSEC
-RUN mkdir -p /etc/unbound && unbound-anchor -a /etc/unbound/root.key
-
-# Копирование скомпилированного бинарного файла из этапа сборки
 COPY --from=builder /dns-resolver /dns-resolver
+COPY --from=builder /app/root.key /app/root.key
+COPY config.yaml /config.yaml
 
-# Создание директории для кэша
-RUN mkdir -p /tmp/dns_cache.lmdb
+EXPOSE 5053/udp 5053/tcp 9090/tcp
 
-# Открытие порта DNS (UDP и TCP) и порта метрик (TCP)
-EXPOSE 53/udp
-EXPOSE 53/tcp
-EXPOSE 9090/tcp
-
-# Установка точки входа для контейнера
 ENTRYPOINT ["/dns-resolver"]
