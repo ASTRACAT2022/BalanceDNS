@@ -3,20 +3,14 @@ package server
 import (
 	"context"
 	"log"
-	"sync"
 
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
+	"dns-resolver/internal/pool"
 	"dns-resolver/internal/resolver"
 	"github.com/miekg/dns"
 )
-
-var msgPool = sync.Pool{
-	New: func() interface{} {
-		return new(dns.Msg)
-	},
-}
 // Server holds the server state.
 type Server struct {
 	config        *config.Config
@@ -48,11 +42,8 @@ func (s *Server) buildAndSetHandler() {
 		pluginCtx := &plugins.PluginContext{}
 		s.pluginManager.ExecutePlugins(pluginCtx, r)
 
-		req := msgPool.Get().(*dns.Msg)
-		defer func() {
-			*req = dns.Msg{}
-			msgPool.Put(req)
-		}()
+		req := pool.GetDnsMsg()
+		defer pool.PutDnsMsg(req)
 
 		req.SetQuestion(r.Question[0].Name, r.Question[0].Qtype)
 		req.RecursionDesired = true

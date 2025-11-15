@@ -4,14 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net"
 	"sync"
+	"testing"
 	"time"
 
 	"github.com/miekg/dns"
 )
 
-func main() {
+func TestMainPerformance(t *testing.T) {
 	fmt.Println("=== Тестирование производительности DNS-сервера ===")
 
 	// Адрес DNS-сервера

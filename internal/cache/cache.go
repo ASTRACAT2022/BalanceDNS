@@ -12,8 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"dns-resolver/internal/interfaces"
-
 	"github.com/bmatsuo/lmdb-go/lmdb"
 	"github.com/miekg/dns"
 )
@@ -98,7 +96,6 @@ func (f *FixedSizeCacheItem) Unpack(data []byte) error {
 // CacheItem represents an item in the cache.
 type CacheItem struct {
 	MsgBytes             []byte
-	Question             dns.Question
 	Expiration           time.Time
 	StaleWhileRevalidate time.Duration
 	element              *list.Element
@@ -121,7 +118,6 @@ type Cache struct {
 	numShards     uint32
 	probationSize int
 	protectedSize int
-	resolver      interfaces.CacheResolver
 	lmdbEnv       *lmdb.Env
 	lmdbDBI       lmdb.DBI
 	metrics       *metrics.Metrics
@@ -242,7 +238,7 @@ func (c *Cache) loadFromDB() {
 			}
 
 			c.metrics.IncrementLMDBCacheLoads()
-			evictedKey := c.setInMemory(string(key), fItem.MsgBytes, msg.Question[0],
+			evictedKey := c.setInMemory(string(key), fItem.MsgBytes,
 				time.Duration(fItem.StaleWhileRevalidateNanoseconds),
 				expiration)
 			if evictedKey != "" {
@@ -362,21 +358,20 @@ func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
 		return
 	}
 
-	evictedKey := c.setInMemory(key, packedMsg, msg.Question[0], swr, expiration)
+	evictedKey := c.setInMemory(key, packedMsg, swr, expiration)
 	if evictedKey != "" && evictedKey != key {
 		c.metrics.IncrementCacheEvictions()
 		c.deleteFromDB(evictedKey)
 	}
 }
 
-func (c *Cache) setInMemory(key string, msgBytes []byte, question dns.Question, swr time.Duration, expiration time.Time) string {
+func (c *Cache) setInMemory(key string, msgBytes []byte, swr time.Duration, expiration time.Time) string {
 	shard := c.getShard(key)
 	shard.Lock()
 	defer shard.Unlock()
 
 	if existingItem, found := shard.items[key]; found {
 		existingItem.MsgBytes = msgBytes
-		existingItem.Question = question
 		existingItem.Expiration = expiration
 		existingItem.StaleWhileRevalidate = swr
 		if existingItem.element != nil {
@@ -392,7 +387,6 @@ func (c *Cache) setInMemory(key string, msgBytes []byte, question dns.Question, 
 
 	item := &CacheItem{
 		MsgBytes:             msgBytes,
-		Question:             question,
 		Expiration:           expiration,
 		StaleWhileRevalidate: swr,
 	}
@@ -459,10 +453,6 @@ func (s *slruSegment) removeItem(item *CacheItem) string {
 	}
 	delete(s.items, key)
 	return key
-}
-
-func (c *Cache) SetResolver(r interfaces.CacheResolver) {
-	c.resolver = r
 }
 
 func Key(q dns.Question) string {
