@@ -153,8 +153,6 @@ func (r *GoDNSResolver) recursiveLookup(ctx context.Context, req *dns.Msg) (*dns
 	defer func() {
 		latency := time.Since(startTime)
 		r.metrics.RecordLatency(q.Name, latency)
-		// Record upstream query duration
-		r.metrics.RecordUpstreamQueryDuration(dns.TypeToString[q.Qtype], latency)
 	}()
 
 	// Perform the recursive lookup starting from root servers

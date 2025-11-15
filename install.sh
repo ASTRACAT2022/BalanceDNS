@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
 SERVICE_NAME="astracat-dns"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-BINARY_PATH="$PROJECT_DIR/$SERVICE_NAME"
+BINARY_PATH="/tmp/$SERVICE_NAME"
 
 echo "🚀 Starting installation of Astracat DNS Resolver..."
 
@@ -21,6 +21,7 @@ cd "$PROJECT_DIR"
 
 echo "🔧 Installing required dependencies (libunbound-dev, unbound-anchor)..."
 if command -v apt-get &> /dev/null; then
+    export DEBIAN_FRONTEND=noninteractive
     sudo apt-get update
     sudo apt-get install -y libunbound-dev unbound-anchor
 else
@@ -32,7 +33,7 @@ sudo mkdir -p /etc/unbound
 sudo unbound-anchor -a /etc/unbound/root.key
 
 echo "🔨 Building the project..."
-go build -o "$SERVICE_NAME" .
+go build -o "$BINARY_PATH" .
 
 if [ ! -f "$BINARY_PATH" ]; then
     echo "❌ Build failed: binary not found at $BINARY_PATH"
@@ -43,7 +44,7 @@ echo "✅ Build successful: $BINARY_PATH"
 
 echo "📝 Creating systemd service file: $SERVICE_FILE..."
 
-cat > "$SERVICE_FILE" <<EOF
+sudo bash -c "cat > $SERVICE_FILE" <<EOF
 [Unit]
 Description=Astracat DNS Resolver Service
 After=network.target
@@ -62,10 +63,10 @@ WantedBy=multi-user.target
 EOF
 
 echo "🔄 Reloading systemd daemon..."
-systemctl daemon-reload
+sudo systemctl daemon-reload
 
 echo "🔌 Enabling and starting the $SERVICE_NAME service..."
-systemctl enable "$SERVICE_NAME" --now
+sudo systemctl enable "$SERVICE_NAME" --now
 
 echo "🎉 Installation complete! The $SERVICE_NAME service is now running."
 echo "✅ Systemd logs are disabled for this service."
