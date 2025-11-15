@@ -20,6 +20,8 @@ const (
 	ResolverTypeUnbound ResolverType = "unbound"
 	// ResolverTypeGoDNS uses pure Go DNS implementation
 	ResolverTypeGoDNS ResolverType = "godns"
+	// ResolverTypeNet uses Go's standard library for DNS resolution
+	ResolverTypeNet ResolverType = "net"
 )
 
 // ResolverInterface defines the common interface for all resolvers.
@@ -41,6 +43,9 @@ func NewResolver(resolverType ResolverType, cfg *config.Config, c *cache.Cache, 
 	case ResolverTypeGoDNS:
 		log.Println("Creating GoDNS resolver")
 		return NewGoDNSResolver(cfg, c, m), nil
+	case ResolverTypeNet:
+		log.Println("Creating Net resolver")
+		return NewNetResolver(cfg, c, m), nil
 	default:
 		log.Printf("Unknown resolver type: %s, defaulting to GoDNS", string(resolverType))
 		return NewGoDNSResolver(cfg, c, m), nil

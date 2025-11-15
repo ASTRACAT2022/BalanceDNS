@@ -38,6 +38,6 @@ func NewConfig() *Config {
 		CacheMinTTL:          60 * time.Second,
 		StaleWhileRevalidate: 5 * time.Minute,
 		LMDBPath:             "/tmp/dns_cache.lmdb",
-		ResolverType:         "godns", // Default to GoDNS resolver
+		ResolverType:         "net", // Default to Net resolver using Go's standard library
 	}
 }
