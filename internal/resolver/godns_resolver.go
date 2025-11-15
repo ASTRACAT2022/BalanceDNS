@@ -160,7 +160,7 @@ func (r *GoDNSResolver) recursiveLookup(ctx context.Context, req *dns.Msg) (*dns
 	// Perform the recursive lookup starting from root servers
 	result, err := r.lookupRecursive(ctx, q.Name, q.Qtype, q.Qclass)
 	if err != nil {
-		r.metrics.IncrementUnboundErrors()
+		r.metrics.IncrementGoDNSErrors()
 		log.Printf("Recursive resolution error for %s: %v", q.Name, err)
 		// Return a SERVFAIL message when resolution fails
 		msg := new(dns.Msg)
@@ -246,46 +246,15 @@ func (r *GoDNSResolver) iterativeLookup(ctx context.Context, domain string, qtyp
 
 			serverResponded = true
 
-			// Check the response
-			switch resp.Rcode {
-			case dns.RcodeSuccess:
+			// Check if we got a direct answer
+			if len(resp.Answer) > 0 && resp.Rcode == dns.RcodeSuccess {
 				// Got a direct answer - return it
 				return resp, nil
-			case dns.RcodeNameError:
-				// Domain doesn't exist
+			}
+
+			// Check if domain doesn't exist
+			if resp.Rcode == dns.RcodeNameError {
 				return resp, nil
-			case dns.RcodeServerFailure:
-				// Server failure - try next server
-				lastError = fmt.Errorf("server failure from %s for %s", server, currentDomain)
-				continue
-			case dns.RcodeRefused:
-				// Server refused - try next server
-				lastError = fmt.Errorf("server refused query from %s for %s", server, currentDomain)
-				continue
-			default:
-				// For referral (NXDOMAIN, etc.), continue to next iteration
-			}
-
-			// If we get referrals (authority records), use them
-			if len(resp.Ns) > 0 {
-				nextServers, err := r.extractServers(ctx, resp.Ns, resp.Extra)
-				if err != nil {
-					log.Printf("Error extracting servers: %v", err)
-					continue
-				}
-				if len(nextServers) > 0 {
-					currentServers = nextServers
-					break // Try the new servers in the next iteration
-				}
-			}
-
-			// If there are additional records (glue records), use them
-			if len(resp.Extra) > 0 {
-				additionalServers := r.extractGlueServers(resp.Extra)
-				if len(additionalServers) > 0 {
-					currentServers = additionalServers
-					break // Try the new servers in the next iteration
-				}
 			}
 
 			// If we got CNAME records and we're not looking up CNAME itself
@@ -295,6 +264,25 @@ func (r *GoDNSResolver) iterativeLookup(ctx context.Context, domain string, qtyp
 						log.Printf("CNAME redirect: %s -> %s", currentDomain, cn.Target)
 						currentDomain = strings.ToLower(dns.Fqdn(cn.Target))
 						break
+					}
+				}
+			}
+
+			// Check for referral (delegation) - if no direct answer, look for NS records
+			if len(resp.Ns) > 0 || len(resp.Answer) == 0 {
+				// Extract servers from NS records
+				nextServers, err := r.extractServers(ctx, resp.Ns, resp.Extra)
+				if err != nil {
+					log.Printf("Error extracting servers: %v", err)
+				} else if len(nextServers) > 0 {
+					currentServers = nextServers
+					break // Try the new servers in the next iteration
+				} else {
+					// If no servers extracted from NS records, try using glue records
+					additionalServers := r.extractGlueServers(resp.Extra)
+					if len(additionalServers) > 0 {
+						currentServers = additionalServers
+						break // Try the new servers in the next iteration
 					}
 				}
 			}

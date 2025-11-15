@@ -176,6 +176,10 @@ var (
 		Help: "Duration of upstream DNS queries (in seconds)",
 		Buckets: []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0},
 	}, []string{"qtype"})
+	promGoDNSErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "dns_resolver_godns_errors_total",
+		Help: "Total number of errors from the GoDNS resolver",
+	})
 )
 
 // NewMetrics returns the singleton instance of Metrics.
@@ -491,6 +495,11 @@ func (m *Metrics) IncrementCacheRevalidations() {
 // RecordUpstreamQueryDuration records the duration of an upstream query.
 func (m *Metrics) RecordUpstreamQueryDuration(qtype string, duration time.Duration) {
 	promUpstreamQueryDuration.WithLabelValues(qtype).Observe(duration.Seconds())
+}
+
+// IncrementGoDNSErrors increments the GoDNS error counter.
+func (m *Metrics) IncrementGoDNSErrors() {
+	promGoDNSErrors.Inc()
 }
 
 // IncrementCacheHits increments the cache hit counter.
