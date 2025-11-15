@@ -1,71 +1,16 @@
 #!/bin/bash
-set -e
 
-# Получаем абсолютный путь к директории скрипта
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$SCRIPT_DIR"
-SERVICE_NAME="astracat-dns"
-SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-BINARY_PATH="$PROJECT_DIR/$SERVICE_NAME"
+# Update package lists
+sudo apt-get update
 
-echo "🚀 Starting installation of Astracat DNS Resolver..."
+# Install unbound and unbound-anchor
+sudo apt-get install -y unbound unbound-anchor
 
-# Проверка наличия Go
-if ! command -v go &> /dev/null; then
-    echo "❌ Go is not installed. Please install Go first."
-    exit 1
-fi
-
-echo "📁 Project directory: $PROJECT_DIR"
-cd "$PROJECT_DIR"
-
-echo "🔧 Installing required dependencies (libunbound-dev, unbound-anchor)..."
-if command -v apt-get &> /dev/null; then
-    sudo apt-get update
-    sudo apt-get install -y libunbound-dev unbound-anchor
-else
-    echo "⚠️  Warning: 'apt-get' not found. Please install 'libunbound-dev' and 'unbound-anchor' manually."
-fi
-
-echo "🔑 Generating DNSSEC root key..."
+# Create unbound directory if it doesn't exist
 sudo mkdir -p /etc/unbound
+
+# Generate root.key
 sudo unbound-anchor -a /etc/unbound/root.key
 
-echo "🔨 Building the project..."
-go build -o "$SERVICE_NAME" .
-
-if [ ! -f "$BINARY_PATH" ]; then
-    echo "❌ Build failed: binary not found at $BINARY_PATH"
-    exit 1
-fi
-
-echo "✅ Build successful: $BINARY_PATH"
-
-echo "📝 Creating systemd service file: $SERVICE_FILE..."
-
-cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=Astracat DNS Resolver Service
-After=network.target
-
-[Service]
-ExecStart=$BINARY_PATH
-WorkingDirectory=$PROJECT_DIR
-Restart=always
-User=root
-StandardOutput=null
-StandardError=null
-LogLevelMax=0
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-echo "🔄 Reloading systemd daemon..."
-systemctl daemon-reload
-
-echo "🔌 Enabling and starting the $SERVICE_NAME service..."
-systemctl enable "$SERVICE_NAME" --now
-
-echo "🎉 Installation complete! The $SERVICE_NAME service is now running."
-echo "✅ Systemd logs are disabled for this service."
+# Build the application
+go build .

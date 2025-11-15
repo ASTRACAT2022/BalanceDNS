@@ -1,0 +1,22 @@
+listen_addr: "0.0.0.0:5053"
+metrics_addr: "0.0.0.0:9090"
+prometheus_enabled: false
+prometheus_namespace: "dns_resolver"
+upstream_timeout: 5s
+request_timeout: 5s
+max_workers: 10
+cache_size: 5000
+message_cache_size: 4m # unbound message cache size
+rrset_cache_size: 8m   # unbound rrset cache size
+cache_max_ttl: 3600s
+cache_min_ttl: 60s
+stale_while_revalidate: 1m
+lmdb_path: "/tmp/dns_cache.lmdb"
+resolver_type: "unbound"
+log_level: "info" # Options: "debug", "info", "warn", "error", "none"
+unbound:
+  num-threads: 1
+  so-reuseport: yes
+  prefetch: no
+  chroot: ""
+  val-permissive-mode: yes

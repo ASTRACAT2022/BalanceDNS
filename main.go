@@ -1,8 +1,10 @@
 package main
 
 import (
+	"io/ioutil"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"dns-resolver/internal/cache"
@@ -17,20 +19,29 @@ import (
 // Старая функция больше не используется, так как теперь используем метод из пакета metrics
 
 func main() {
-	// Open a file for logging. Truncate the file if it already exists.
+	// Load configuration
+	cfg, err := config.LoadConfig("config.yaml")
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+
+	// Set up logging
 	logFile, err := os.OpenFile("server.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 	if err != nil {
 		log.Fatalf("Failed to open log file: %v", err)
 	}
 	defer logFile.Close()
 
-	// Set the output of the log package to the file.
-	log.SetOutput(logFile)
+	switch strings.ToLower(cfg.LogLevel) {
+	case "debug", "info", "warn", "error":
+		log.SetOutput(logFile)
+	case "none":
+		log.SetOutput(ioutil.Discard)
+	default:
+		log.SetOutput(logFile)
+	}
 
 	log.Println("Booting up ASTRACAT Relover...")
-
-	// Load configuration
-	cfg := config.NewConfig()
 
 	// Initialize metrics
 	m := metrics.NewMetrics()
@@ -38,7 +49,7 @@ func main() {
 	// Create cache and resolver
 	c := cache.NewCache(cfg.CacheSize, cache.DefaultShards, cfg.LMDBPath, m)
 	defer c.Close()
-	
+
 	// Create resolver based on configuration
 	res, err := resolver.NewResolver(resolver.ResolverType(cfg.ResolverType), cfg, c, m)
 	if err != nil {
