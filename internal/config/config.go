@@ -28,16 +28,16 @@ func NewConfig() *Config {
 		MetricsAddr:          "0.0.0.0:9090",
 		PrometheusEnabled:    false,
 		PrometheusNamespace:  "dns_resolver",
-		UpstreamTimeout:      5 * time.Second,
+		UpstreamTimeout:      3 * time.Second,
 		RequestTimeout:       5 * time.Second,
-		MaxWorkers:           10,
-		CacheSize:            5000,
-		MessageCacheSize:     5000,
-		RRsetCacheSize:       5000,
-		CacheMaxTTL:          3600 * time.Second,
+		MaxWorkers:           50,
+		CacheSize:            50000,
+		MessageCacheSize:     50000,
+		RRsetCacheSize:       50000,
+		CacheMaxTTL:          7200 * time.Second,
 		CacheMinTTL:          60 * time.Second,
-		StaleWhileRevalidate: 1 * time.Minute,
+		StaleWhileRevalidate: 5 * time.Minute,
 		LMDBPath:             "/tmp/dns_cache.lmdb",
-		ResolverType:         "knot", // Default to Knot resolver
+		ResolverType:         "godns", // Default to GoDNS resolver
 	}
 }

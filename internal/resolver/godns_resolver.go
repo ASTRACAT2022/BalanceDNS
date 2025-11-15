@@ -81,12 +81,11 @@ func (r *GoDNSResolver) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 	key := cache.Key(q)
 
 	// Check the cache first.
-	if msgBytes, found, revalidate, _, _ := r.cache.Get(key); found {
+	if msg, found, revalidate := r.cache.Get(key); found {
 		log.Printf("Cache hit for %s (revalidate: %t)", q.Name, revalidate)
-		msg := new(dns.Msg)
-		if err := msg.Unpack(msgBytes); err != nil {
-			log.Printf("Failed to unpack message from cache for key %s: %v", key, err)
-			// If unpacking fails, treat it as a cache miss and proceed to resolve.
+		if msg == nil {
+			log.Printf("Cache returned nil message for key %s", key)
+			// Treat as cache miss and proceed to resolve
 		} else {
 			msg.Id = req.Id
 

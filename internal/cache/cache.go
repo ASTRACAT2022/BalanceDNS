@@ -10,12 +10,14 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"dns-resolver/internal/interfaces"
 
 	"github.com/bmatsuo/lmdb-go/lmdb"
 	"github.com/miekg/dns"
+	"go.uber.org/atomic"
 )
 
 // persistentCacheItem is the struct that gets serialized to LMDB.
@@ -95,6 +97,13 @@ func (f *FixedSizeCacheItem) Unpack(data []byte) error {
 	return nil
 }
 
+// FastCacheItem represents a cache item in the high-performance cache
+type FastCacheItem struct {
+	MsgBytes             []byte
+	Expiration           time.Time
+	StaleWhileRevalidate time.Duration
+}
+
 // CacheItem represents an item in the cache.
 type CacheItem struct {
 	MsgBytes             []byte
@@ -115,6 +124,12 @@ type slruSegment struct {
 	protectedCapacity int
 }
 
+// fastCacheEntry contains the fast cache entry with expiration
+type fastCacheEntry struct {
+	item       *FastCacheItem
+	expiration int64  // unix timestamp in nanoseconds
+}
+
 // Cache is a thread-safe, sharded DNS cache with SLRU eviction policy and LMDB persistence.
 type Cache struct {
 	shards        []*slruSegment
@@ -125,6 +140,14 @@ type Cache struct {
 	lmdbEnv       *lmdb.Env
 	lmdbDBI       lmdb.DBI
 	metrics       *metrics.Metrics
+	// Performance counters
+	hitCount      *atomic.Int64
+	missCount     *atomic.Int64
+	evictionCount *atomic.Int64
+	// High-performance fast cache for most frequent lookups
+	fastCache   sync.Map
+	fastSize    int32
+	maxFastSize int32
 }
 
 // NewCache creates and returns a new Cache with LMDB persistence.
@@ -149,7 +172,8 @@ func NewCache(size int, numShards int, lmdbPath string, m *metrics.Metrics) *Cac
 	if err != nil {
 		log.Fatalf("Failed to set max DBs for LMDB: %v", err)
 	}
-	err = env.SetMapSize(1 << 30) // 1GB
+	// Increase LMDB map size for better performance
+	err = env.SetMapSize(2 << 30) // 2GB
 	if err != nil {
 		log.Fatalf("Failed to set map size for LMDB: %v", err)
 	}
@@ -174,7 +198,7 @@ func NewCache(size int, numShards int, lmdbPath string, m *metrics.Metrics) *Cac
 	shards := make([]*slruSegment, numShards)
 	for i := 0; i < numShards; i++ {
 		shards[i] = &slruSegment{
-			items:             make(map[string]*CacheItem),
+			items:             make(map[string]*CacheItem, probationSize/numShards + protectedSize/numShards),
 			probationList:     list.New(),
 			protectedList:     list.New(),
 			probationCapacity: probationSize / numShards,
@@ -190,9 +214,17 @@ func NewCache(size int, numShards int, lmdbPath string, m *metrics.Metrics) *Cac
 		lmdbEnv:       env,
 		lmdbDBI:       dbi,
 		metrics:       m,
+		hitCount:      atomic.NewInt64(0),
+		missCount:     atomic.NewInt64(0),
+		evictionCount: atomic.NewInt64(0),
+		maxFastSize:   int32(size / 4), // Use 25% of total cache size for fast cache
 	}
 
-	c.loadFromDB()
+	// Load from persistent storage asynchronously for faster startup
+	go c.loadFromDB()
+	
+	// Start the fast cache cleanup goroutine
+	go c.cleanupFastCache()
 
 	return c
 }
@@ -297,53 +329,172 @@ func (c *Cache) deleteFromDB(key string) {
 }
 
 func (c *Cache) Get(key string) (*dns.Msg, bool, bool) {
-	shard := c.getShard(key)
-	shard.Lock()
-	defer shard.Unlock()
+	// First check the fast cache
+	if entry, ok := c.fastCache.Load(key); ok {
+		fastEntry := entry.(*fastCacheEntry)
+		now := time.Now().UnixNano()
+		
+		if now < fastEntry.expiration {
+			// Fast cache hit
+			msg := new(dns.Msg)
+			if err := msg.Unpack(fastEntry.item.MsgBytes); err != nil {
+				log.Printf("Failed to unpack message from fast cache for key %s: %v", key, err)
+				c.fastCache.Delete(key)
+				c.missCount.Inc()
+				c.metrics.IncrementCacheMisses()
+				return nil, false, false
+			}
+			
+			c.hitCount.Inc()
+			c.metrics.IncrementCacheHits()
+			msg.Id = 0
+			
+			// Check if we need revalidation
+			needsRevalidation := fastEntry.item.StaleWhileRevalidate > 0 && 
+				now > (fastEntry.expiration - int64(fastEntry.item.StaleWhileRevalidate))
+			
+			return msg, true, needsRevalidation
+		} else {
+			// Entry expired, remove from fast cache
+			c.fastCache.Delete(key)
+			atomic.AddInt32(&c.fastSize, -1)
+		}
+	}
 
+	// Fall back to SLRU cache
+	shard := c.getShard(key)
+	shard.RLock()  // Use read lock first for better performance
+	
 	item, found := shard.items[key]
 	if !found {
+		shard.RUnlock()
+		c.missCount.Inc()
 		c.metrics.IncrementCacheMisses()
 		return nil, false, false
 	}
 
+	// Check expiration while holding read lock
+	now := time.Now()
+	isExpired := now.After(item.Expiration)
+	
+	if isExpired {
+		shard.RUnlock()
+		// If expired, upgrade to write lock to remove the item
+		shard.Lock()
+		defer shard.Unlock()
+		
+		// Double-check after acquiring write lock
+		item, found = shard.items[key]
+		if !found {
+			c.missCount.Inc()
+			c.metrics.IncrementCacheMisses()
+			return nil, false, false
+		}
+		
+		isExpired = now.After(item.Expiration)
+		if isExpired {
+			if item.StaleWhileRevalidate > 0 && now.Before(item.Expiration.Add(item.StaleWhileRevalidate)) {
+				// Serve stale content but mark for revalidation
+				msg := new(dns.Msg)
+				if err := msg.Unpack(item.MsgBytes); err != nil {
+					log.Printf("Failed to unpack stale message from in-memory cache for key %s: %v", key, err)
+					evictedKey := shard.removeItem(item)
+					if evictedKey != "" {
+						c.evictionCount.Inc()
+						c.metrics.IncrementCacheEvictions()
+						c.deleteFromDB(evictedKey)
+					}
+					c.missCount.Inc()
+					c.metrics.IncrementCacheMisses()
+					return nil, false, false
+				}
+				
+				// Add to fast cache if space allows
+				c.addToFastCache(key, item.MsgBytes, item.Expiration, item.StaleWhileRevalidate)
+				
+				c.hitCount.Inc()
+				c.metrics.IncrementCacheHits()
+				msg.Id = 0
+				return msg, true, true
+			}
+			
+			// Remove expired item
+			evictedKey := shard.removeItem(item)
+			if evictedKey != "" {
+				c.evictionCount.Inc()
+				c.metrics.IncrementCacheEvictions()
+				c.deleteFromDB(evictedKey)
+			}
+			c.missCount.Inc()
+			c.metrics.IncrementCacheMisses()
+			return nil, false, false
+		}
+	} else {
+		shard.RUnlock()
+		// Item is not expired, get it with proper locking
+		shard.Lock()
+		defer shard.Unlock()
+		
+		item, found = shard.items[key]
+		if !found {
+			c.missCount.Inc()
+			c.metrics.IncrementCacheMisses()
+			return nil, false, false
+		}
+		
+		// Access the item (move to protected if in probation)
+		evictedKey := shard.accessItem(item)
+		if evictedKey != "" {
+			c.evictionCount.Inc()
+			c.metrics.IncrementCacheEvictions()
+			c.deleteFromDB(evictedKey)
+		}
+		
+		// Add to fast cache
+		c.addToFastCache(key, item.MsgBytes, item.Expiration, item.StaleWhileRevalidate)
+	}
+
+	// Unpack the message after all checks are done
 	msg := new(dns.Msg)
 	if err := msg.Unpack(item.MsgBytes); err != nil {
 		log.Printf("Failed to unpack message from in-memory cache for key %s: %v", key, err)
-		// Consider removing the corrupted item
+		// Remove corrupted item
 		evictedKey := shard.removeItem(item)
 		if evictedKey != "" {
+			c.evictionCount.Inc()
 			c.metrics.IncrementCacheEvictions()
 			c.deleteFromDB(evictedKey)
 		}
+		c.missCount.Inc()
 		c.metrics.IncrementCacheMisses()
 		return nil, false, false
 	}
 
-	if time.Now().After(item.Expiration) {
-		if item.StaleWhileRevalidate > 0 && time.Now().Before(item.Expiration.Add(item.StaleWhileRevalidate)) {
-			c.metrics.IncrementCacheHits()
-			msg.Id = 0
-			return msg, true, true
-		}
-		evictedKey := shard.removeItem(item)
-		if evictedKey != "" {
-			c.metrics.IncrementCacheEvictions()
-			c.deleteFromDB(evictedKey)
-		}
-		c.metrics.IncrementCacheMisses()
-		return nil, false, false
-	}
-
-	evictedKey := shard.accessItem(item)
-	if evictedKey != "" {
-		c.metrics.IncrementCacheEvictions()
-		c.deleteFromDB(evictedKey)
-	}
-
+	c.hitCount.Inc()
 	c.metrics.IncrementCacheHits()
 	msg.Id = 0
 	return msg, true, false
+}
+
+// addToFastCache adds an entry to the fast cache
+func (c *Cache) addToFastCache(key string, msgBytes []byte, expiration time.Time, swr time.Duration) {
+	if atomic.LoadInt32(&c.fastSize) >= c.maxFastSize {
+		return // Fast cache is full
+	}
+
+	item := &FastCacheItem{
+		MsgBytes:             msgBytes,
+		Expiration:           expiration,
+		StaleWhileRevalidate: swr,
+	}
+	
+	entry := &fastCacheEntry{
+		item:       item,
+		expiration: expiration.UnixNano(),
+	}
+	
+	c.fastCache.Store(key, entry)
+	atomic.AddInt32(&c.fastSize, 1)
 }
 
 func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
@@ -351,10 +502,9 @@ func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
 		return
 	}
 
+	// Get TTL and pack message in parallel to optimize performance
 	ttl := getMinTTL(msg)
 	expiration := time.Now().Add(time.Duration(ttl) * time.Second)
-
-	c.writeToDB(key, msg, expiration, swr)
 
 	packedMsg, err := msg.Pack()
 	if err != nil {
@@ -362,11 +512,23 @@ func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
 		return
 	}
 
+	// Write to persistent storage asynchronously to avoid blocking
+	go func() {
+		c.writeToDB(key, msg, expiration, swr)
+	}()
+
 	evictedKey := c.setInMemory(key, packedMsg, msg.Question[0], swr, expiration)
 	if evictedKey != "" && evictedKey != key {
+		c.evictionCount.Inc()
 		c.metrics.IncrementCacheEvictions()
-		c.deleteFromDB(evictedKey)
+		// Delete from DB asynchronously as well
+		go func() {
+			c.deleteFromDB(evictedKey)
+		}()
 	}
+	
+	// Add to fast cache
+	c.addToFastCache(key, packedMsg, expiration, swr)
 }
 
 func (c *Cache) setInMemory(key string, msgBytes []byte, question dns.Question, swr time.Duration, expiration time.Time) string {
@@ -375,6 +537,10 @@ func (c *Cache) setInMemory(key string, msgBytes []byte, question dns.Question, 
 	defer shard.Unlock()
 
 	if existingItem, found := shard.items[key]; found {
+		// Remove old entry from fast cache since content is being updated
+		c.fastCache.Delete(key)
+		atomic.AddInt32(&c.fastSize, -1)
+		
 		existingItem.MsgBytes = msgBytes
 		existingItem.Question = question
 		existingItem.Expiration = expiration
@@ -517,4 +683,48 @@ func (c *Cache) GetCacheSize() (int, int) {
 		shard.RUnlock()
 	}
 	return probationSize, protectedSize
+}
+
+// GetCacheStats returns performance statistics
+func (c *Cache) GetCacheStats() (hits int64, misses int64, evictions int64) {
+	return c.hitCount.Load(), c.missCount.Load(), c.evictionCount.Load()
+}
+
+// ResetCacheStats resets the performance counters
+func (c *Cache) ResetCacheStats() {
+	c.hitCount.Store(0)
+	c.missCount.Store(0)
+	c.evictionCount.Store(0)
+}
+
+// cleanupFastCache periodically removes expired entries from the fast cache
+func (c *Cache) cleanupFastCache() {
+	ticker := time.NewTicker(5 * time.Minute) // Clean up every 5 minutes
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		cleanupCount := 0
+		now := time.Now().UnixNano()
+		
+		c.fastCache.Range(func(key, value interface{}) bool {
+			entry := value.(*fastCacheEntry)
+			if now >= entry.expiration {
+				c.fastCache.Delete(key)
+				atomic.AddInt32(&c.fastSize, -1)
+				cleanupCount++
+			}
+			return true
+		})
+		
+		if cleanupCount > 0 {
+			log.Printf("Cleaned up %d expired entries from fast cache", cleanupCount)
+		}
+	}
+}
+
+// Close properly closes the cache and its resources
+func (c *Cache) Close() {
+	if c.lmdbEnv != nil {
+		c.lmdbEnv.Close()
+	}
 }

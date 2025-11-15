@@ -1,117 +1,144 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
-	"runtime"
+	"net"
 	"sync"
-	"testing"
 	"time"
 
 	"github.com/miekg/dns"
 )
 
-type PerfTestClient struct {
-	client *dns.Client
-}
+func main() {
+	fmt.Println("=== Тестирование производительности DNS-сервера ===")
 
-func NewPerfTestClient() *PerfTestClient {
-	return &PerfTestClient{
-		client: &dns.Client{
-			Timeout: 10 * time.Second,
-		},
-	}
-}
-
-func (c *PerfTestClient) Query(domain string, qtype uint16) error {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(domain), qtype)
-	m.RecursionDesired = true
-
-	// Send to the local resolver
-	r, _, err := c.client.Exchange(m, "127.0.0.1:5053")
-	if err != nil {
-		return err
-	}
-	if r.Rcode != dns.RcodeSuccess {
-		return fmt.Errorf("DNS error: %s", dns.RcodeToString[r.Rcode])
-	}
-	return nil
-}
-
-func TestPerformance(t *testing.T) {
-	client := NewPerfTestClient()
-
-	// Test domains
+	// Адрес DNS-сервера
+	serverAddr := "127.0.0.1:5053"
+	
+	// Список доменов для тестирования
 	domains := []string{
 		"google.com",
-		"github.com", 
+		"github.com",
 		"stackoverflow.com",
 		"amazon.com",
-		"microsoft.com",
+		"wikipedia.org",
+		"youtube.com",
+		"facebook.com",
+		"twitter.com",
+		"instagram.com",
+		"reddit.com",
 	}
 
-	fmt.Println("Starting DNS resolver performance test...")
+	fmt.Println("Тест 1: Одиночные запросы")
+	singleQueryTest(serverAddr, domains[0])
 
-	// Warm-up phase
-	fmt.Println("Warm-up phase (10 queries)...")
-	for i := 0; i < 10; i++ {
-		_ = client.Query(domains[i%len(domains)], dns.TypeA)
+	fmt.Println("\nТест 2: Последовательные запросы")
+	sequentialTest(serverAddr, domains)
+
+	fmt.Println("\nТест 3: Параллельные запросы")
+	parallelTest(serverAddr, domains, 10)
+
+	fmt.Println("\nТест 4: Высокая нагрузка (100 параллельных)")
+	parallelTest(serverAddr, domains, 100)
+
+	fmt.Println("\nТестирование производительности завершено.")
+}
+
+func singleQueryTest(serverAddr, domain string) {
+	c := new(dns.Client)
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeA)
+	m.RecursionDesired = true
+
+	start := time.Now()
+	r, _, err := c.Exchange(m, serverAddr)
+	duration := time.Since(start)
+
+	if err != nil {
+		log.Printf("Ошибка запроса: %v", err)
+	} else if r != nil && len(r.Answer) > 0 {
+		fmt.Printf("Запрос %s: %v, время: %v, ответ: %s\n", domain, r.Rcode == dns.RcodeSuccess, duration, r.Answer[0].String())
+	} else {
+		fmt.Printf("Запрос %s: %v, время: %v, нет ответа\n", domain, r != nil && r.Rcode == dns.RcodeSuccess, duration)
+	}
+}
+
+func sequentialTest(serverAddr string, domains []string) {
+	c := new(dns.Client)
+	totalTime := time.Duration(0)
+	successCount := 0
+
+	for i, domain := range domains {
+		m := new(dns.Msg)
+		m.SetQuestion(dns.Fqdn(domain), dns.TypeA)
+		m.RecursionDesired = true
+
+		start := time.Now()
+		r, _, err := c.Exchange(m, serverAddr)
+		duration := time.Since(start)
+		totalTime += duration
+
+		if err == nil && r != nil && r.Rcode == dns.RcodeSuccess && len(r.Answer) > 0 {
+			successCount++
+			if i < 3 { // Показать первые 3 результата
+				fmt.Printf("  %s: OK, %v\n", domain, duration)
+			}
+		} else {
+			if i < 3 {
+				fmt.Printf("  %s: FAIL, %v\n", domain, duration)
+			}
+		}
 	}
 
-	// Performance test with concurrency
-	fmt.Println("Performance test starting...")
+	avgTime := totalTime / time.Duration(len(domains))
+	fmt.Printf("  Успешно: %d/%d, Среднее время: %v\n", successCount, len(domains), avgTime)
+}
 
-	// Test 1: Concurrent queries
-	const numWorkers = 50
-	const queriesPerWorker = 100
+func parallelTest(serverAddr string, domains []string, workers int) {
+	c := new(dns.Client)
 	var wg sync.WaitGroup
+	results := make(chan bool, len(domains)*2)
 	start := time.Now()
 
-	for i := 0; i < numWorkers; i++ {
+	// Создаем пулы воркеров
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			for j := 0; j < queriesPerWorker; j++ {
-				domain := domains[(workerID+j)%len(domains)]
-				err := client.Query(domain, dns.TypeA)
-				if err != nil {
-					log.Printf("Worker %d: Query %s failed: %v", workerID, domain, err)
-				}
+			for i := workerID; i < len(domains)*2; i += workers {
+				domain := domains[i%len(domains)]
+				m := new(dns.Msg)
+				m.SetQuestion(dns.Fqdn(domain), dns.TypeA)
+				m.RecursionDesired = true
+
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+
+				r, _, err := c.ExchangeContext(ctx, m, serverAddr)
+				results <- (err == nil && r != nil && r.Rcode == dns.RcodeSuccess && len(r.Answer) > 0)
 			}
-		}(i)
+		}(w)
 	}
 
-	wg.Wait()
-	elapsed := time.Since(start)
+	// Закрываем канал результатов после завершения всех воркеров
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
 
-	totalQueries := numWorkers * queriesPerWorker
-	qps := float64(totalQueries) / elapsed.Seconds()
-
-	fmt.Printf("\nPerformance Results:\n")
-	fmt.Printf("Total queries: %d\n", totalQueries)
-	fmt.Printf("Time elapsed: %v\n", elapsed)
-	fmt.Printf("QPS: %.2f\n", qps)
-	fmt.Printf("Goroutines: %d\n", runtime.NumGoroutine())
-
-	// Test 2: Latency test
-	fmt.Println("\nLatency test...")
-	latencyStart := time.Now()
-	for i := 0; i < 100; i++ {
-		_ = client.Query("google.com", dns.TypeA)
+	// Подсчитываем результаты
+	successCount := 0
+	for result := range results {
+		if result {
+			successCount++
+		}
 	}
-	latencyAvg := time.Since(latencyStart) / 100
-	fmt.Printf("Average latency: %v\n", latencyAvg)
 
-	// Test 3: Cache efficiency test
-	fmt.Println("\nCache efficiency test...")
-	cacheStart := time.Now()
-	// Same query repeated to test cache
-	for i := 0; i < 1000; i++ {
-		_ = client.Query("google.com", dns.TypeA)
-	}
-	cacheAvg := time.Since(cacheStart) / 1000
-	fmt.Printf("Average cached query latency: %v\n", cacheAvg)
-
-	fmt.Println("\nPerformance test completed!")
+	duration := time.Since(start)
+	qps := float64(len(domains)*2) / duration.Seconds()
+	
+	fmt.Printf("  Результат: %d/%d успешно, время: %v, QPS: %.2f\n", 
+		successCount, len(domains)*2, duration, qps)
 }
