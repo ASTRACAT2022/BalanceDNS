@@ -64,8 +64,19 @@ func (s *Server) buildAndSetHandler() {
 		msg, err := s.resolver.Resolve(ctx, req)
 		if err != nil {
 			log.Printf("Failed to resolve %s: %v", req.Question[0].Name, err)
-			s.metrics.RecordResponseCode(dns.RcodeToString[dns.RcodeServerFailure])
-			dns.HandleFailed(w, r)
+			// If resolver returns an error but also returns a message, try to use that message
+			if msg != nil {
+				// Use the message returned by the resolver even if there was an error
+				s.metrics.RecordResponseCode(dns.RcodeToString[msg.Rcode])
+				msg.Id = r.Id
+				if err := w.WriteMsg(msg); err != nil {
+					log.Printf("Failed to write response: %v", err)
+				}
+			} else {
+				// If no message returned, return SERVFAIL
+				s.metrics.RecordResponseCode(dns.RcodeToString[dns.RcodeServerFailure])
+				dns.HandleFailed(w, r)
+			}
 			return
 		}
 

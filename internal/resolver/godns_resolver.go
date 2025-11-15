@@ -364,19 +364,57 @@ func (r *GoDNSResolver) resolveNameToIP(ctx context.Context, name string) ([]str
 
 	// First try A record
 	aReq := new(dns.Msg)
-	aReq.SetQuestion(name, dns.TypeA)
-	aReq.RecursionDesired = true
+	aReq.SetQuestion(dns.Fqdn(name), dns.TypeA)
+	aReq.RecursionDesired = false // Don't use recursive; do iterative resolution
 
-	aResp, err := r.directLookup(ctx, name, dns.TypeA, dns.ClassINET, r.rootServers)
+	// Use iterative lookup instead of directLookup to avoid potential recursion
+	ipResult, err := r.iterativeLookup(ctx, dns.Fqdn(name), dns.TypeA, dns.ClassINET, r.rootServers)
 	if err != nil {
-		// If A fails, try AAAA
-		aaaaResp, err2 := r.directLookup(ctx, name, dns.TypeAAAA, dns.ClassINET, r.rootServers)
+		// If iterative lookup fails for A, try AAAA
+		aaaaResult, err2 := r.iterativeLookup(ctx, dns.Fqdn(name), dns.TypeAAAA, dns.ClassINET, r.rootServers)
 		if err2 != nil {
+			log.Printf("Failed to resolve name %s for both A and AAAA: %v, %v", name, err, err2)
 			return nil, fmt.Errorf("failed to resolve %s: A failed: %v, AAAA failed: %v", name, err, err2)
 		}
 		
 		var ips []string
-		for _, ans := range aaaaResp.Answer {
+		for _, ans := range aaaaResult.Answer {
+			if aaaa, ok := ans.(*dns.AAAA); ok {
+				ips = append(ips, aaaa.AAAA.String())
+			}
+		}
+		if len(ips) > 0 {
+			return ips, nil
+		}
+		return nil, fmt.Errorf("no AAAA records found for %s", name)
+	}
+
+	// Check if we got a response for A records
+	if ipResult.Rcode == dns.RcodeSuccess && len(ipResult.Answer) > 0 {
+		var ips []string
+		for _, ans := range ipResult.Answer {
+			if a, ok := ans.(*dns.A); ok {
+				ips = append(ips, a.A.String())
+			}
+		}
+		if len(ips) > 0 {
+			return ips, nil
+		}
+	}
+
+	// If A request was successful but no A records returned, try AAAA
+	aaaaResult, err := r.iterativeLookup(ctx, dns.Fqdn(name), dns.TypeAAAA, dns.ClassINET, r.rootServers)
+	if err != nil {
+		// If A records were not found but the lookup itself succeeded, return what we have
+		if ipResult.Rcode == dns.RcodeSuccess {
+			return []string{}, nil // Return empty slice if no IP found but no error occurred
+		}
+		return nil, fmt.Errorf("failed to resolve %s: A query succeeded but no A records found, and AAAA query failed: %v", name, err)
+	}
+
+	if aaaaResult.Rcode == dns.RcodeSuccess && len(aaaaResult.Answer) > 0 {
+		var ips []string
+		for _, ans := range aaaaResult.Answer {
 			if aaaa, ok := ans.(*dns.AAAA); ok {
 				ips = append(ips, aaaa.AAAA.String())
 			}
@@ -384,13 +422,7 @@ func (r *GoDNSResolver) resolveNameToIP(ctx context.Context, name string) ([]str
 		return ips, nil
 	}
 
-	var ips []string
-	for _, ans := range aResp.Answer {
-		if a, ok := ans.(*dns.A); ok {
-			ips = append(ips, a.A.String())
-		}
-	}
-	return ips, nil
+	return []string{}, nil // Return empty slice if no records found but no error occurred
 }
 
 // sendQuery sends a single DNS query to the specified server
