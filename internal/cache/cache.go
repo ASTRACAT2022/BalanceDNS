@@ -253,35 +253,6 @@ func (c *Cache) loadFromDB() {
 	}
 }
 
-func (c *Cache) writeToDB(key string, msg *dns.Msg, expiration time.Time, swr time.Duration) {
-	packedMsg, err := msg.Pack()
-	if err != nil {
-		log.Printf("Failed to pack DNS message for key %s: %v", key, err)
-		return
-	}
-
-	fItem := FixedSizeCacheItem{
-		ExpirationUnix:                  expiration.Unix(),
-		StaleWhileRevalidateNanoseconds: int64(swr),
-		MsgBytesLength:                  uint32(len(packedMsg)),
-		MsgBytes:                        packedMsg,
-	}
-
-	packedData, err := fItem.Pack()
-	if err != nil {
-		log.Printf("Failed to pack cache item for key %s: %v", key, err)
-		return
-	}
-
-	err = c.lmdbEnv.Update(func(txn *lmdb.Txn) error {
-		return txn.Put(c.lmdbDBI, []byte(key), packedData, 0)
-	})
-	if err != nil {
-		c.metrics.IncrementLMDBErrors()
-		log.Printf("Failed to write to LMDB for key %s: %v", key, err)
-	}
-}
-
 func (c *Cache) deleteFromDB(key string) {
 	err := c.lmdbEnv.Update(func(txn *lmdb.Txn) error {
 		return txn.Del(c.lmdbDBI, []byte(key), nil)
@@ -350,14 +321,36 @@ func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
 	ttl := getMinTTL(msg)
 	expiration := time.Now().Add(time.Duration(ttl) * time.Second)
 
-	c.writeToDB(key, msg, expiration, swr)
-
+	// Pack the message once
 	packedMsg, err := msg.Pack()
 	if err != nil {
-		log.Printf("Failed to pack DNS message for in-memory cache, key %s: %v", key, err)
+		log.Printf("Failed to pack DNS message for key %s: %v", key, err)
 		return
 	}
 
+	// Write to LMDB
+	fItem := FixedSizeCacheItem{
+		ExpirationUnix:                  expiration.Unix(),
+		StaleWhileRevalidateNanoseconds: int64(swr),
+		MsgBytesLength:                  uint32(len(packedMsg)),
+		MsgBytes:                        packedMsg,
+	}
+
+	packedData, err := fItem.Pack()
+	if err != nil {
+		log.Printf("Failed to pack cache item for key %s: %v", key, err)
+		return
+	}
+
+	err = c.lmdbEnv.Update(func(txn *lmdb.Txn) error {
+		return txn.Put(c.lmdbDBI, []byte(key), packedData, 0)
+	})
+	if err != nil {
+		c.metrics.IncrementLMDBErrors()
+		log.Printf("Failed to write to LMDB for key %s: %v", key, err)
+	}
+
+	// Set in-memory cache
 	evictedKey := c.setInMemory(key, packedMsg, swr, expiration)
 	if evictedKey != "" && evictedKey != key {
 		c.metrics.IncrementCacheEvictions()
