@@ -121,7 +121,12 @@ type Cache struct {
 	wg        sync.WaitGroup
 }
 
-// NewCache creates and returns a new Cache with LMDB persistence.
+// NewCache creates a Cache backed by an in-memory fast cache and a persistent LMDB database.
+// It uses provided size and numShards (defaults are applied when values are <= 0), ensures the
+// LMDB directory exists, initializes the LMDB environment and database, and then loads entries
+// from the DB into the in-memory cache.
+// The lmdbPath parameter is the filesystem path for the LMDB environment; m is the metrics collector.
+// This function terminates the process with a fatal log message if LMDB setup or opening fails.
 func NewCache(size int, numShards int, lmdbPath string, m *metrics.Metrics) *Cache {
 	if size <= 0 {
 		size = DefaultCacheSize
@@ -300,10 +305,14 @@ func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
 	}()
 }
 
+// Key builds a normalized cache key from a DNS question.
+// The returned key is the lowercased question name followed by the numeric Qtype and Qclass, separated by colons (e.g. "example.com.:1:1").
 func Key(q dns.Question) string {
 	return fmt.Sprintf("%s:%d:%d", strings.ToLower(q.Name), q.Qtype, q.Qclass)
 }
 
+// fnv32 computes the 32-bit FNV-1a hash of the provided string.
+// It returns the 32-bit hash value for use in hashing or partitioning keys.
 func fnv32(key string) uint32 {
 	hash := uint32(2166136261)
 	for i := 0; i < len(key); i++ {
@@ -313,6 +322,10 @@ func fnv32(key string) uint32 {
 	return hash
 }
 
+// getMinTTL computes the minimum TTL to use for cache expiration for the provided DNS message.
+// If the Answer section is non-empty, it returns the smallest TTL among answer RRs.
+// If Answer is empty and an SOA record is present in the NS section, it returns that SOA's Minttl.
+// If no TTL can be determined or the computed minimum is zero, it returns 60.
 func getMinTTL(msg *dns.Msg) uint32 {
 	var minTTL uint32 = 0
 

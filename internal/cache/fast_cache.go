@@ -26,7 +26,10 @@ type fastCacheItem struct {
 	swr        time.Duration
 }
 
-// NewFastCache creates a new FastCache.
+// NewFastCache creates a sharded in-memory FastCache with per-shard LRU eviction.
+// If size or numShards are less than or equal to zero, package defaults are used.
+// The total capacity is divided evenly across shards (capacity = size / numShards), and
+// each shard is initialized with its own item map and LRU list.
 func NewFastCache(size int, numShards int) *FastCache {
 	if size <= 0 {
 		size = DefaultCacheSize
