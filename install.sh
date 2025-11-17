@@ -30,6 +30,7 @@ fi
 
 echo "🔑 Generating DNSSEC root key..."
 sudo mkdir -p /etc/unbound
+export DEBIAN_FRONTEND=noninteractive
 sudo unbound-anchor -a /etc/unbound/root.key
 
 echo "🔨 Building the project..."

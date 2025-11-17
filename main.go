@@ -3,7 +3,6 @@ package main
 import (
 	"log"
 	"os"
-	"time"
 
 	"dns-resolver/internal/cache"
 	"dns-resolver/internal/config"
@@ -45,16 +44,6 @@ func main() {
 		log.Fatalf("Failed to create resolver: %v", err)
 	}
 	defer res.Close()
-
-	// Start a goroutine to periodically update cache stats
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
-			probation, protected := c.GetCacheSize()
-			m.UpdateCacheStats(probation, protected)
-		}
-	}()
 
 	// Start the metrics server
 	go m.StartMetricsServer(cfg.MetricsAddr)
