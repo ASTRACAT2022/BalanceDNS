@@ -13,7 +13,7 @@ import (
 	"dns-resolver/plugins/example_logger"
 )
 
-// Старая функция больше не используется, так как теперь используем метод из пакета metrics
+// starts the metrics server, and runs the primary server loop.
 
 func main() {
 	// Open a file for logging. Truncate the file if it already exists.
