@@ -196,3 +196,57 @@ func TestCacheStaleWhileRevalidate(t *testing.T) {
 		t.Fatal("expected message to be expired and not found after SWR window, but it was found")
 	}
 }
+
+func BenchmarkCacheSet(b *testing.B) {
+	m := metrics.NewMetrics()
+	dir, err := os.MkdirTemp("", "bench-lmdb-set")
+	if err != nil {
+		b.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	c := NewCache(100000, 256, dir, m)
+	defer c.Close()
+
+	msg := createTestMsg("example.com.", 3600, "1.2.3.4")
+	key := Key(msg.Question[0])
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		c.Set(key, msg, 0)
+	}
+}
+
+func BenchmarkCacheGet(b *testing.B) {
+	m := metrics.NewMetrics()
+	dir, err := os.MkdirTemp("", "bench-lmdb-get")
+	if err != nil {
+		b.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	c := NewCache(100000, 256, dir, m)
+	defer c.Close()
+
+	msg := createTestMsg("example.com.", 3600, "1.2.3.4")
+	key := Key(msg.Question[0])
+	c.Set(key, msg, 0)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		c.Get(key)
+	}
+}
+
+func BenchmarkFastCacheSetAndGet(b *testing.B) {
+	c := NewFastCache(100000, 256)
+	msg := createTestMsg("example.com.", 3600, "1.2.3.4")
+	key := Key(msg.Question[0])
+	packedMsg, _ := msg.Pack()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		c.Set(key, packedMsg, 3600*time.Second, 0)
+		c.Get(key)
+	}
+}

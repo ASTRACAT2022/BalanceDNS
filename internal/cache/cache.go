@@ -114,13 +114,11 @@ type slruSegment struct {
 
 // Cache is a thread-safe, sharded DNS cache with SLRU eviction policy and LMDB persistence.
 type Cache struct {
-	shards        []*slruSegment
-	numShards     uint32
-	probationSize int
-	protectedSize int
-	lmdbEnv       *lmdb.Env
-	lmdbDBI       lmdb.DBI
-	metrics       *metrics.Metrics
+	fastCache *FastCache
+	lmdbEnv   *lmdb.Env
+	lmdbDBI   lmdb.DBI
+	metrics   *metrics.Metrics
+	wg        sync.WaitGroup
 }
 
 // NewCache creates and returns a new Cache with LMDB persistence.
@@ -164,28 +162,11 @@ func NewCache(size int, numShards int, lmdbPath string, m *metrics.Metrics) *Cac
 		log.Fatalf("Failed to open LMDB database: %v", err)
 	}
 
-	probationSize := int(float64(size) * SlruProbationFraction)
-	protectedSize := size - probationSize
-
-	shards := make([]*slruSegment, numShards)
-	for i := 0; i < numShards; i++ {
-		shards[i] = &slruSegment{
-			items:             make(map[string]*CacheItem),
-			probationList:     list.New(),
-			protectedList:     list.New(),
-			probationCapacity: probationSize / numShards,
-			protectedCapacity: protectedSize / numShards,
-		}
-	}
-
 	c := &Cache{
-		shards:        shards,
-		numShards:     uint32(numShards),
-		probationSize: probationSize,
-		protectedSize: protectedSize,
-		lmdbEnv:       env,
-		lmdbDBI:       dbi,
-		metrics:       m,
+		fastCache: NewFastCache(size, numShards),
+		lmdbEnv:   env,
+		lmdbDBI:   dbi,
+		metrics:   m,
 	}
 
 	c.loadFromDB()
@@ -195,6 +176,7 @@ func NewCache(size int, numShards int, lmdbPath string, m *metrics.Metrics) *Cac
 
 // Close gracefully closes the cache and its underlying LMDB environment.
 func (c *Cache) Close() {
+	c.wg.Wait()
 	if c.lmdbEnv != nil {
 		c.lmdbEnv.Close()
 	}
@@ -238,13 +220,7 @@ func (c *Cache) loadFromDB() {
 			}
 
 			c.metrics.IncrementLMDBCacheLoads()
-			evictedKey := c.setInMemory(string(key), fItem.MsgBytes,
-				time.Duration(fItem.StaleWhileRevalidateNanoseconds),
-				expiration)
-			if evictedKey != "" {
-				c.metrics.IncrementCacheEvictions()
-				c.deleteFromDB(evictedKey)
-			}
+			c.fastCache.Set(string(key), fItem.MsgBytes, expiration.Sub(time.Now()), time.Duration(fItem.StaleWhileRevalidateNanoseconds))
 		}
 		return nil
 	})
@@ -264,53 +240,22 @@ func (c *Cache) deleteFromDB(key string) {
 }
 
 func (c *Cache) Get(key string) (*dns.Msg, bool, bool) {
-	shard := c.getShard(key)
-	shard.Lock()
-	defer shard.Unlock()
-
-	item, found := shard.items[key]
+	msgBytes, found, revalidate := c.fastCache.Get(key)
 	if !found {
 		c.metrics.IncrementCacheMisses()
 		return nil, false, false
 	}
 
 	msg := new(dns.Msg)
-	if err := msg.Unpack(item.MsgBytes); err != nil {
+	if err := msg.Unpack(msgBytes); err != nil {
 		log.Printf("Failed to unpack message from in-memory cache for key %s: %v", key, err)
-		// Consider removing the corrupted item
-		evictedKey := shard.removeItem(item)
-		if evictedKey != "" {
-			c.metrics.IncrementCacheEvictions()
-			c.deleteFromDB(evictedKey)
-		}
 		c.metrics.IncrementCacheMisses()
 		return nil, false, false
-	}
-
-	if time.Now().After(item.Expiration) {
-		if item.StaleWhileRevalidate > 0 && time.Now().Before(item.Expiration.Add(item.StaleWhileRevalidate)) {
-			c.metrics.IncrementCacheHits()
-			msg.Id = 0
-			return msg, true, true
-		}
-		evictedKey := shard.removeItem(item)
-		if evictedKey != "" {
-			c.metrics.IncrementCacheEvictions()
-			c.deleteFromDB(evictedKey)
-		}
-		c.metrics.IncrementCacheMisses()
-		return nil, false, false
-	}
-
-	evictedKey := shard.accessItem(item)
-	if evictedKey != "" {
-		c.metrics.IncrementCacheEvictions()
-		c.deleteFromDB(evictedKey)
 	}
 
 	c.metrics.IncrementCacheHits()
 	msg.Id = 0
-	return msg, true, false
+	return msg, true, revalidate
 }
 
 func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
@@ -321,140 +266,42 @@ func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
 	ttl := getMinTTL(msg)
 	expiration := time.Now().Add(time.Duration(ttl) * time.Second)
 
-	// Pack the message once
 	packedMsg, err := msg.Pack()
 	if err != nil {
 		log.Printf("Failed to pack DNS message for key %s: %v", key, err)
 		return
 	}
 
-	// Write to LMDB
-	fItem := FixedSizeCacheItem{
-		ExpirationUnix:                  expiration.Unix(),
-		StaleWhileRevalidateNanoseconds: int64(swr),
-		MsgBytesLength:                  uint32(len(packedMsg)),
-		MsgBytes:                        packedMsg,
-	}
+	c.fastCache.Set(key, packedMsg, time.Duration(ttl)*time.Second, swr)
 
-	packedData, err := fItem.Pack()
-	if err != nil {
-		log.Printf("Failed to pack cache item for key %s: %v", key, err)
-		return
-	}
-
-	err = c.lmdbEnv.Update(func(txn *lmdb.Txn) error {
-		return txn.Put(c.lmdbDBI, []byte(key), packedData, 0)
-	})
-	if err != nil {
-		c.metrics.IncrementLMDBErrors()
-		log.Printf("Failed to write to LMDB for key %s: %v", key, err)
-	}
-
-	// Set in-memory cache
-	evictedKey := c.setInMemory(key, packedMsg, swr, expiration)
-	if evictedKey != "" && evictedKey != key {
-		c.metrics.IncrementCacheEvictions()
-		c.deleteFromDB(evictedKey)
-	}
-}
-
-func (c *Cache) setInMemory(key string, msgBytes []byte, swr time.Duration, expiration time.Time) string {
-	shard := c.getShard(key)
-	shard.Lock()
-	defer shard.Unlock()
-
-	if existingItem, found := shard.items[key]; found {
-		existingItem.MsgBytes = msgBytes
-		existingItem.Expiration = expiration
-		existingItem.StaleWhileRevalidate = swr
-		if existingItem.element != nil {
-			if existingItem.parentList == shard.probationList {
-				shard.probationList.Remove(existingItem.element)
-				return shard.addProtected(key, existingItem)
-			} else if existingItem.parentList == shard.protectedList {
-				shard.protectedList.MoveToFront(existingItem.element)
-			}
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		fItem := FixedSizeCacheItem{
+			ExpirationUnix:                  expiration.Unix(),
+			StaleWhileRevalidateNanoseconds: int64(swr),
+			MsgBytesLength:                  uint32(len(packedMsg)),
+			MsgBytes:                        packedMsg,
 		}
-		return ""
-	}
 
-	item := &CacheItem{
-		MsgBytes:             msgBytes,
-		Expiration:           expiration,
-		StaleWhileRevalidate: swr,
-	}
-	return shard.addProbation(key, item)
-}
-
-func (s *slruSegment) addProbation(key string, item *CacheItem) string {
-	var evictedKey string
-	if s.probationList.Len() >= s.probationCapacity && s.probationCapacity > 0 {
-		oldest := s.probationList.Back()
-		if oldest != nil {
-			evictedKey = oldest.Value.(string)
-			delete(s.items, evictedKey)
-			s.probationList.Remove(oldest)
+		packedData, err := fItem.Pack()
+		if err != nil {
+			log.Printf("Failed to pack cache item for key %s: %v", key, err)
+			return
 		}
-	}
-	item.element = s.probationList.PushFront(key)
-	item.parentList = s.probationList
-	s.items[key] = item
-	return evictedKey
-}
 
-func (s *slruSegment) addProtected(key string, item *CacheItem) string {
-	var evictedKey string
-	if s.protectedList.Len() >= s.protectedCapacity && s.protectedCapacity > 0 {
-		oldest := s.protectedList.Back()
-		if oldest != nil {
-			keyToMove := oldest.Value.(string)
-			itemToMove := s.items[keyToMove]
-			s.protectedList.Remove(oldest)
-			evictedKey = s.addProbation(keyToMove, itemToMove)
+		err = c.lmdbEnv.Update(func(txn *lmdb.Txn) error {
+			return txn.Put(c.lmdbDBI, []byte(key), packedData, 0)
+		})
+		if err != nil {
+			c.metrics.IncrementLMDBErrors()
+			log.Printf("Failed to write to LMDB for key %s: %v", key, err)
 		}
-	}
-	item.element = s.protectedList.PushFront(key)
-	item.parentList = s.protectedList
-	s.items[key] = item
-	return evictedKey
-}
-
-func (s *slruSegment) accessItem(item *CacheItem) string {
-	if item.element == nil {
-		return ""
-	}
-
-	if item.parentList == s.probationList {
-		s.probationList.Remove(item.element)
-		return s.addProtected(item.element.Value.(string), item)
-	} else if item.parentList == s.protectedList {
-		s.protectedList.MoveToFront(item.element)
-	}
-	return ""
-}
-
-func (s *slruSegment) removeItem(item *CacheItem) string {
-	if item.element == nil {
-		return ""
-	}
-	if item.parentList != nil {
-		item.parentList.Remove(item.element)
-	}
-	key, ok := item.element.Value.(string)
-	if !ok {
-		return ""
-	}
-	delete(s.items, key)
-	return key
+	}()
 }
 
 func Key(q dns.Question) string {
 	return fmt.Sprintf("%s:%d:%d", strings.ToLower(q.Name), q.Qtype, q.Qclass)
-}
-
-func (c *Cache) getShard(key string) *slruSegment {
-	hash := fnv32(key)
-	return c.shards[hash%c.numShards]
 }
 
 func fnv32(key string) uint32 {
@@ -489,15 +336,4 @@ func getMinTTL(msg *dns.Msg) uint32 {
 	}
 
 	return minTTL
-}
-
-func (c *Cache) GetCacheSize() (int, int) {
-	var probationSize, protectedSize int
-	for _, shard := range c.shards {
-		shard.RLock()
-		probationSize += shard.probationList.Len()
-		protectedSize += shard.protectedList.Len()
-		shard.RUnlock()
-	}
-	return probationSize, protectedSize
 }
