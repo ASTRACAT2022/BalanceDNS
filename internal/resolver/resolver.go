@@ -62,46 +62,52 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, error) 
 	key := cache.Key(q)
 
 	// Check the cache first.
-	if cachedMsg, found, revalidate := r.cache.Get(key); found {
+	if msgBytes, found, revalidate := r.cache.Get(key); found {
 		log.Printf("Cache hit for %s (revalidate: %t)", q.Name, revalidate)
-		cachedMsg.Id = req.Id
+		msg := new(dns.Msg)
+		if err := msg.Unpack(msgBytes); err != nil {
+			log.Printf("Failed to unpack message from cache for key %s: %v", key, err)
+			// Treat as cache miss and proceed to resolve
+		} else {
+			msg.Id = req.Id
 
-		if revalidate {
-			r.metrics.IncrementCacheRevalidations()
-			// Trigger a background revalidation using the worker pool
-			go func() {
-				if err := r.workerPool.Acquire(context.Background()); err != nil {
-					log.Printf("Failed to acquire worker for revalidation: %v", err)
-					return
-				}
-				defer r.workerPool.Release()
+			if revalidate {
+				r.metrics.IncrementCacheRevalidations()
+				// Trigger a background revalidation using the worker pool
+				go func() {
+					if err := r.workerPool.Acquire(context.Background()); err != nil {
+						log.Printf("Failed to acquire worker for revalidation: %v", err)
+						return
+					}
+					defer r.workerPool.Release()
 
-				ctx, cancel := context.WithTimeout(context.Background(), r.config.UpstreamTimeout)
-				defer cancel()
+					ctx, cancel := context.WithTimeout(context.Background(), r.config.UpstreamTimeout)
+					defer cancel()
 
-				// Create a new request for revalidation to avoid race conditions on the original request object.
-				revalidationReq := new(dns.Msg)
-				revalidationReq.SetQuestion(q.Name, q.Qtype)
-				revalidationReq.RecursionDesired = true
-				if opt := req.IsEdns0(); opt != nil {
-					revalidationReq.SetEdns0(opt.UDPSize(), opt.Do())
-				}
+					// Create a new request for revalidation to avoid race conditions on the original request object.
+					revalidationReq := new(dns.Msg)
+					revalidationReq.SetQuestion(q.Name, q.Qtype)
+					revalidationReq.RecursionDesired = true
+					if opt := req.IsEdns0(); opt != nil {
+						revalidationReq.SetEdns0(opt.UDPSize(), opt.Do())
+					}
 
-				res, err, _ := r.sf.Do(key+"-revalidate", func() (interface{}, error) {
-					return r.exchange(ctx, revalidationReq)
-				})
-				if err != nil {
-					log.Printf("Background revalidation failed for %s: %v", q.Name, err)
-					return
-				}
+					res, err, _ := r.sf.Do(key+"-revalidate", func() (interface{}, error) {
+						return r.exchange(ctx, revalidationReq)
+					})
+					if err != nil {
+						log.Printf("Background revalidation failed for %s: %v", q.Name, err)
+						return
+					}
 
-				if msg, ok := res.(*dns.Msg); ok {
-					r.cache.Set(key, msg, r.config.StaleWhileRevalidate)
-					log.Printf("Successfully revalidated and updated cache for %s", q.Name)
-				}
-			}()
+					if msg, ok := res.(*dns.Msg); ok {
+						r.cache.Set(key, msg, r.config.StaleWhileRevalidate)
+						log.Printf("Successfully revalidated and updated cache for %s", q.Name)
+					}
+				}()
+			}
+			return msg, nil
 		}
-		return cachedMsg, nil
 	}
 
 	// Use singleflight to ensure only one lookup for a given question is in flight at a time.

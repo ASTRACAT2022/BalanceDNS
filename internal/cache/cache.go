@@ -230,13 +230,6 @@ func (c *Cache) loadFromDB() {
 				continue
 			}
 
-			msg := new(dns.Msg)
-			if err := msg.Unpack(fItem.MsgBytes); err != nil {
-				c.metrics.IncrementLMDBErrors()
-				log.Printf("Failed to unpack DNS message for key %s: %v", string(key), err)
-				continue
-			}
-
 			c.metrics.IncrementLMDBCacheLoads()
 			evictedKey := c.setInMemory(string(key), fItem.MsgBytes,
 				time.Duration(fItem.StaleWhileRevalidateNanoseconds),
@@ -263,7 +256,7 @@ func (c *Cache) deleteFromDB(key string) {
 	}
 }
 
-func (c *Cache) Get(key string) (*dns.Msg, bool, bool) {
+func (c *Cache) Get(key string) ([]byte, bool, bool) {
 	shard := c.getShard(key)
 	shard.Lock()
 	defer shard.Unlock()
@@ -274,24 +267,10 @@ func (c *Cache) Get(key string) (*dns.Msg, bool, bool) {
 		return nil, false, false
 	}
 
-	msg := new(dns.Msg)
-	if err := msg.Unpack(item.MsgBytes); err != nil {
-		log.Printf("Failed to unpack message from in-memory cache for key %s: %v", key, err)
-		// Consider removing the corrupted item
-		evictedKey := shard.removeItem(item)
-		if evictedKey != "" {
-			c.metrics.IncrementCacheEvictions()
-			c.deleteFromDB(evictedKey)
-		}
-		c.metrics.IncrementCacheMisses()
-		return nil, false, false
-	}
-
 	if time.Now().After(item.Expiration) {
 		if item.StaleWhileRevalidate > 0 && time.Now().Before(item.Expiration.Add(item.StaleWhileRevalidate)) {
 			c.metrics.IncrementCacheHits()
-			msg.Id = 0
-			return msg, true, true
+			return item.MsgBytes, true, true
 		}
 		evictedKey := shard.removeItem(item)
 		if evictedKey != "" {
@@ -309,8 +288,7 @@ func (c *Cache) Get(key string) (*dns.Msg, bool, bool) {
 	}
 
 	c.metrics.IncrementCacheHits()
-	msg.Id = 0
-	return msg, true, false
+	return item.MsgBytes, true, false
 }
 
 func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {

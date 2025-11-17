@@ -50,15 +50,19 @@ func TestCacheSetAndGet(t *testing.T) {
 
 	c.Set(key, msg, 0)
 
-	retrievedMsg, found, revalidate := c.Get(key)
+	retrievedBytes, found, revalidate := c.Get(key)
 	if !found {
 		t.Fatal("expected to find message in cache, but didn't")
 	}
 	if revalidate {
 		t.Error("expected revalidate to be false for a fresh entry")
 	}
-	if retrievedMsg == nil {
+	if retrievedBytes == nil {
 		t.Fatal("retrieved message was nil")
+	}
+	retrievedMsg := new(dns.Msg)
+	if err := retrievedMsg.Unpack(retrievedBytes); err != nil {
+		t.Fatalf("failed to unpack retrieved message: %v", err)
 	}
 }
 
@@ -115,12 +119,16 @@ func TestCachePersistence(t *testing.T) {
 	defer c2.Close()
 
 	// Verify the item is present in the new cache.
-	retrievedMsg, found, _ := c2.Get(key)
+	retrievedBytes, found, _ := c2.Get(key)
 	if !found {
 		t.Fatal("expected to find message in persisted cache, but didn't")
 	}
-	if retrievedMsg == nil {
+	if retrievedBytes == nil {
 		t.Fatal("retrieved message was nil")
+	}
+	retrievedMsg := new(dns.Msg)
+	if err := retrievedMsg.Unpack(retrievedBytes); err != nil {
+		t.Fatalf("failed to unpack retrieved message: %v", err)
 	}
 	if len(retrievedMsg.Answer) != 1 || retrievedMsg.Answer[0].Header().Name != "persistent.com." {
 		t.Errorf("unexpected answer in retrieved message: %v", retrievedMsg.Answer)
@@ -173,15 +181,19 @@ func TestCacheStaleWhileRevalidate(t *testing.T) {
 	// Wait for item to become stale but not fully expired from SWR window
 	time.Sleep(1100 * time.Millisecond)
 
-	retrievedMsg, found, revalidate := c.Get(key)
+	retrievedBytes, found, revalidate := c.Get(key)
 	if !found {
 		t.Fatal("expected to get stale message, but got nothing")
 	}
 	if !revalidate {
 		t.Error("expected revalidate to be true for a stale entry")
 	}
-	if retrievedMsg == nil {
+	if retrievedBytes == nil {
 		t.Fatal("retrieved stale message was nil")
+	}
+	retrievedMsg := new(dns.Msg)
+	if err := retrievedMsg.Unpack(retrievedBytes); err != nil {
+		t.Fatalf("failed to unpack retrieved message: %v", err)
 	}
 	if len(retrievedMsg.Answer) != 1 {
 		t.Fatalf("expected 1 answer in stale message, got %d", len(retrievedMsg.Answer))
