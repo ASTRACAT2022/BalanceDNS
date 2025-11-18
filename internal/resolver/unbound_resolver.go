@@ -18,34 +18,52 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+// revalidationTask represents a task for background revalidation.
+type revalidationTask struct {
+	key string
+	req *dns.Msg
+}
+
 // Resolver is a recursive DNS resolver.
 type Resolver struct {
-	config     *config.Config
-	cache      *cache.Cache
-	sf         singleflight.Group
-	unbound    *unbound.Unbound
-	workerPool *WorkerPool
-	metrics    *metrics.Metrics
+	config             *config.Config
+	cache              *cache.Cache
+	sf                 singleflight.Group
+	unboundPool        chan *unbound.Unbound
+	metrics            *metrics.Metrics
+	revalidationQueue  chan revalidationTask
+	revalidationWg     sync.WaitGroup
+	revalidationCancel context.CancelFunc
 }
 
 // NewUnboundResolver creates a new Unbound resolver instance.
 func NewUnboundResolver(cfg *config.Config, c *cache.Cache, m *metrics.Metrics) *Resolver {
-	u := unbound.New()
-	// It's recommended to configure a trust anchor for DNSSEC validation.
-	// This could be from a file, or you can use the built-in one.
-	// For simplicity, we'll try to load a standard root key file.
-	if err := u.AddTaFile("/etc/unbound/root.key"); err != nil {
-		log.Printf("Warning: could not load root trust anchor: %v. DNSSEC validation might not be secure.", err)
+	poolSize := cfg.MaxWorkers // Use MaxWorkers as the pool size
+	if poolSize <= 0 {
+		poolSize = 10 // Default pool size
+	}
+	pool := make(chan *unbound.Unbound, poolSize)
+	for i := 0; i < poolSize; i++ {
+		u := unbound.New()
+		if err := u.AddTaFile("/etc/unbound/root.key"); err != nil {
+			log.Printf("Warning: could not load root trust anchor for pool instance %d: %v. DNSSEC validation might not be secure.", i, err)
+		}
+		pool <- u
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	r := &Resolver{
-		config:     cfg,
-		cache:      c,
-		sf:         singleflight.Group{},
-		unbound:    u,
-		workerPool: NewWorkerPool(cfg.MaxWorkers),
-		metrics:    m,
+		config:             cfg,
+		cache:              c,
+		sf:                 singleflight.Group{},
+		unboundPool:        pool,
+		metrics:            m,
+		revalidationQueue:  make(chan revalidationTask, cfg.MaxWorkers*2),
+		revalidationCancel: cancel,
 	}
+
+	r.startRevalidationWorkers(ctx, cfg.MaxWorkers)
 	return r
 }
 
@@ -71,38 +89,21 @@ func (r *Resolver) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, error) 
 
 		if revalidate {
 			r.metrics.IncrementCacheRevalidations()
-			// Trigger a background revalidation using the worker pool
-			go func() {
-				if err := r.workerPool.Acquire(context.Background()); err != nil {
-					log.Printf("Failed to acquire worker for revalidation: %v", err)
-					return
-				}
-				defer r.workerPool.Release()
+			// Create a new request for revalidation to avoid race conditions on the original request object.
+			revalidationReq := new(dns.Msg)
+			revalidationReq.SetQuestion(q.Name, q.Qtype)
+			revalidationReq.RecursionDesired = true
+			if opt := req.IsEdns0(); opt != nil {
+				revalidationReq.SetEdns0(opt.UDPSize(), opt.Do())
+			}
 
-				ctx, cancel := context.WithTimeout(context.Background(), r.config.UpstreamTimeout)
-				defer cancel()
-
-				// Create a new request for revalidation to avoid race conditions on the original request object.
-				revalidationReq := new(dns.Msg)
-				revalidationReq.SetQuestion(q.Name, q.Qtype)
-				revalidationReq.RecursionDesired = true
-				if opt := req.IsEdns0(); opt != nil {
-					revalidationReq.SetEdns0(opt.UDPSize(), opt.Do())
-				}
-
-				res, err, _ := r.sf.Do(key+"-revalidate", func() (interface{}, error) {
-					return r.exchange(ctx, revalidationReq)
-				})
-				if err != nil {
-					log.Printf("Background revalidation failed for %s: %v", q.Name, err)
-					return
-				}
-
-				if msg, ok := res.(*dns.Msg); ok {
-					r.cache.Set(key, msg, r.config.StaleWhileRevalidate)
-					log.Printf("Successfully revalidated and updated cache for %s", q.Name)
-				}
-			}()
+			// Send the revalidation task to the queue without blocking the current request.
+			select {
+			case r.revalidationQueue <- revalidationTask{key: key, req: revalidationReq}:
+				log.Printf("Queued revalidation for %s", q.Name)
+			default:
+				log.Printf("Revalidation queue is full for %s. Skipping.", q.Name)
+			}
 		}
 		return cachedMsg, nil
 	}
@@ -130,8 +131,12 @@ func (r *Resolver) exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 	q := req.Question[0]
 	startTime := time.Now()
 
+	// Get an unbound instance from the pool
+	u := <-r.unboundPool
+	defer func() { r.unboundPool <- u }()
+
 	// Note: The Go wrapper for libunbound doesn't seem to support passing context for cancellation.
-	result, err := r.unbound.Resolve(q.Name, q.Qtype, q.Qclass)
+	result, err := u.Resolve(q.Name, q.Qtype, q.Qclass)
 	latency := time.Since(startTime)
 
 	// Always record latency
@@ -157,10 +162,33 @@ func (r *Resolver) exchange(ctx context.Context, req *dns.Msg) (*dns.Msg, error)
 		r.metrics.RecordNXDOMAIN(q.Name)
 	}
 
-	// The unbound result gives us a flat list of RRs. We will add them
-	// to the Answer section.
+	// Sort RRs into correct sections.
 	if result.HaveData {
-		msg.Answer = result.Rr
+		nsRecords := make(map[string]bool)
+		for _, rr := range result.Rr {
+			if ns, ok := rr.(*dns.NS); ok {
+				nsRecords[ns.Ns] = true
+			}
+		}
+
+		for _, rr := range result.Rr {
+			hdr := rr.Header()
+			isGlue := false
+			if hdr.Rrtype == dns.TypeA || hdr.Rrtype == dns.TypeAAAA {
+				if _, ok := nsRecords[hdr.Name]; ok {
+					isGlue = true
+				}
+			}
+
+			switch {
+			case hdr.Rrtype == dns.TypeSOA || hdr.Rrtype == dns.TypeNS:
+				msg.Ns = append(msg.Ns, rr)
+			case isGlue:
+				msg.Extra = append(msg.Extra, rr)
+			default:
+				msg.Answer = append(msg.Answer, rr)
+			}
+		}
 	}
 
 	if result.Bogus {
@@ -190,7 +218,48 @@ func (r *Resolver) LookupWithoutCache(ctx context.Context, req *dns.Msg) (*dns.M
 	return r.exchange(ctx, req)
 }
 
+// startRevalidationWorkers starts a pool of workers to handle background revalidations.
+func (r *Resolver) startRevalidationWorkers(ctx context.Context, numWorkers int) {
+	for i := 0; i < numWorkers; i++ {
+		r.revalidationWg.Add(1)
+		go func() {
+			defer r.revalidationWg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case task, ok := <-r.revalidationQueue:
+					if !ok {
+						return
+					}
+					q := task.req.Question[0]
+					log.Printf("Revalidating %s", q.Name)
+					res, err, _ := r.sf.Do(task.key+"-revalidate", func() (interface{}, error) {
+						return r.exchange(ctx, task.req)
+					})
+					if err != nil {
+						log.Printf("Background revalidation failed for %s: %v", q.Name, err)
+						continue
+					}
+					if msg, ok := res.(*dns.Msg); ok {
+						r.cache.Set(task.key, msg, r.config.StaleWhileRevalidate)
+						log.Printf("Successfully revalidated and updated cache for %s", q.Name)
+					}
+				}
+			}
+		}()
+	}
+}
+
 // Close closes the resolver and frees resources.
 func (r *Resolver) Close() {
-	// Unbound doesn't need explicit cleanup in this implementation
+	r.revalidationCancel()
+	close(r.revalidationQueue)
+	r.revalidationWg.Wait()
+
+	// Drain the pool and close unbound instances
+	close(r.unboundPool)
+	for u := range r.unboundPool {
+		u.Destroy()
+	}
 }
