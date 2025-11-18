@@ -156,7 +156,7 @@ func (r *GoDNSResolver) recursiveLookup(ctx context.Context, req *dns.Msg) (*dns
 	}()
 
 	// Perform the recursive lookup starting from root servers
-	result, err := r.lookupRecursive(ctx, q.Name, q.Qtype, q.Qclass)
+	result, err := r.lookup(ctx, q.Name, q.Qtype)
 	if err != nil {
 		r.metrics.IncrementUnboundErrors()
 		log.Printf("Recursive resolution error for %s: %v", q.Name, err)
@@ -166,7 +166,7 @@ func (r *GoDNSResolver) recursiveLookup(ctx context.Context, req *dns.Msg) (*dns
 		return msg, err
 	}
 
-	// Set up the response
+	// Create a new message and set the reply based on the original request
 	msg := new(dns.Msg)
 	msg.SetReply(req)
 	msg.Rcode = result.Rcode
@@ -189,218 +189,126 @@ func (r *GoDNSResolver) recursiveLookup(ctx context.Context, req *dns.Msg) (*dns
 	return msg, nil
 }
 
-// lookupRecursive is the main recursive lookup function
-func (r *GoDNSResolver) lookupRecursive(ctx context.Context, domain string, qtype uint16, qclass uint16) (*dns.Msg, error) {
-	// Normalize the domain name
-	domain = strings.ToLower(dns.Fqdn(domain))
-
-	// Check if we're looking up one of the root servers - avoid infinite recursion
-	for _, rootServer := range r.rootServers {
-		serverName := strings.TrimSuffix(rootServer, ":53")
-		if strings.EqualFold(domain, serverName+".") {
-			return r.directLookup(ctx, domain, qtype, qclass, r.rootServers)
-		}
-	}
-
-	// Perform iterative resolution starting from the root
-	return r.iterativeLookup(ctx, domain, qtype, qclass, r.rootServers)
+// lookup performs a recursive lookup for a given domain and query type.
+func (r *GoDNSResolver) lookup(ctx context.Context, name string, qtype uint16) (*dns.Msg, error) {
+	return r.lookupWithServers(ctx, name, qtype, r.rootServers, make(map[string]bool))
 }
 
-// iterativeLookup performs iterative DNS resolution
-func (r *GoDNSResolver) iterativeLookup(ctx context.Context, domain string, qtype uint16, qclass uint16, servers []string) (*dns.Msg, error) {
-	// Limit the number of iterations to prevent infinite loops
-	maxIterations := 20
-	iteration := 0
-    var lastError error
+// lookupWithServers performs the recursive lookup using a specific set of nameservers.
+func (r *GoDNSResolver) lookupWithServers(ctx context.Context, name string, qtype uint16, servers []string, queriedServers map[string]bool) (*dns.Msg, error) {
+	req := new(dns.Msg)
+	req.SetQuestion(dns.Fqdn(name), qtype)
+	req.RecursionDesired = false
 
-	currentDomain := domain
-	currentServers := servers
+	for _, server := range r.shuffleServers(servers) {
+		if queriedServers[server] {
+			continue // Skip servers we've already queried in this chain.
+		}
+		queriedServers[server] = true
 
-	for iteration < maxIterations {
-		// Check for context cancellation
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
 
-		// Track if any server responded in this iteration
-		serverResponded := false
+		resp, _, err := r.client.ExchangeContext(ctx, req, server)
+		if err != nil {
+			log.Printf("Failed to query %s for %s: %v", server, name, err)
+			continue
+		}
 
-		// Try each server until one responds with a useful answer
-		for _, server := range currentServers {
-			// Create a query for the current domain
-			req := new(dns.Msg)
-			req.SetQuestion(currentDomain, qtype)
-			req.RecursionDesired = false // We're doing iterative resolution
-
-			// Send query to the current server
-			resp, err := r.sendQuery(ctx, req, server)
-			if err != nil {
-				log.Printf("Failed to query %s for %s: %v", server, currentDomain, err)
-				lastError = err
-				continue
-			}
-
-			serverResponded = true
-
-			// Check the response
-			switch resp.Rcode {
-			case dns.RcodeSuccess:
-				// Got a direct answer - return it
-				return resp, nil
-			case dns.RcodeNameError:
-				// Domain doesn't exist
-				return resp, nil
-			case dns.RcodeServerFailure:
-				// Server failure - try next server
-				lastError = fmt.Errorf("server failure from %s for %s", server, currentDomain)
-				continue
-			case dns.RcodeRefused:
-				// Server refused - try next server
-				lastError = fmt.Errorf("server refused query from %s for %s", server, currentDomain)
-				continue
-			default:
-				// For referral (NXDOMAIN, etc.), continue to next iteration
-			}
-
-			// If we get referrals (authority records), use them
-			if len(resp.Ns) > 0 {
-				nextServers, err := r.extractServers(ctx, resp.Ns, resp.Extra)
-				if err != nil {
-					log.Printf("Error extracting servers: %v", err)
-					continue
+		if resp.Rcode == dns.RcodeSuccess {
+			if len(resp.Answer) > 0 {
+				// We have an answer. This could be the final answer or a CNAME.
+				// Check for CNAMEs and follow them if necessary.
+				for _, rr := range resp.Answer {
+					if cname, ok := rr.(*dns.CNAME); ok {
+						return r.lookup(ctx, cname.Target, qtype)
+					}
 				}
-				if len(nextServers) > 0 {
-					currentServers = nextServers
-					break // Try the new servers in the next iteration
-				}
+				return resp, nil // This is the final answer.
 			}
+		}
 
-			// If there are additional records (glue records), use them
-			if len(resp.Extra) > 0 {
-				additionalServers := r.extractGlueServers(resp.Extra)
-				if len(additionalServers) > 0 {
-					currentServers = additionalServers
-					break // Try the new servers in the next iteration
+		if resp.Rcode == dns.RcodeNameError {
+			// The authoritative server says the name doesn't exist.
+			return resp, nil
+		}
+
+		// Check for referrals in the Authority section.
+		if len(resp.Ns) > 0 {
+			nextServers := []string{}
+			glueAvailable := false
+
+			// Check for glue records in the Additional section.
+			for _, rr := range resp.Extra {
+				if a, ok := rr.(*dns.A); ok {
+					for _, ns := range resp.Ns {
+						if ns, ok := ns.(*dns.NS); ok {
+							if strings.EqualFold(ns.Ns, a.Hdr.Name) {
+								nextServers = append(nextServers, net.JoinHostPort(a.A.String(), "53"))
+								glueAvailable = true
+							}
+						}
+					}
 				}
-			}
-
-			// If we got CNAME records and we're not looking up CNAME itself
-			if len(resp.Answer) > 0 && qtype != dns.TypeCNAME {
-				for _, ans := range resp.Answer {
-					if cn, ok := ans.(*dns.CNAME); ok {
-						log.Printf("CNAME redirect: %s -> %s", currentDomain, cn.Target)
-						currentDomain = strings.ToLower(dns.Fqdn(cn.Target))
-						break
+				if aaaa, ok := rr.(*dns.AAAA); ok {
+					for _, ns := range resp.Ns {
+						if ns, ok := ns.(*dns.NS); ok {
+							if strings.EqualFold(ns.Ns, aaaa.Hdr.Name) {
+								nextServers = append(nextServers, net.JoinHostPort(aaaa.AAAA.String(), "53"))
+								glueAvailable = true
+							}
+						}
 					}
 				}
 			}
-		}
 
-		// If no server responded in this iteration, return the last error
-		if !serverResponded && lastError != nil {
-			return nil, lastError
-		}
+			if glueAvailable {
+				// We have glue records, so we can proceed with the next iteration.
+				return r.lookupWithServers(ctx, name, qtype, nextServers, queriedServers)
+			}
 
-		iteration++
-	}
-
-	return nil, fmt.Errorf("max iterations reached for %s: %w", domain, lastError)
-}
-
-// extractServers extracts server addresses from authority and additional records
-func (r *GoDNSResolver) extractServers(ctx context.Context, nsRecords []dns.RR, extraRecords []dns.RR) ([]string, error) {
-	var servers []string
-
-	// First, check if we already have IP addresses in extra records
-	ipMap := make(map[string][]string)
-	for _, extra := range extraRecords {
-		switch rr := extra.(type) {
-		case *dns.A:
-			names := ipMap[strings.ToLower(rr.Hdr.Name)]
-			ipMap[strings.ToLower(rr.Hdr.Name)] = append(names, rr.A.String())
-		case *dns.AAAA:
-			names := ipMap[strings.ToLower(rr.Hdr.Name)]
-			ipMap[strings.ToLower(rr.Hdr.Name)] = append(names, rr.AAAA.String())
-		}
-	}
-
-	// Now match NS records with IP addresses
-	for _, ns := range nsRecords {
-		if nsRR, ok := ns.(*dns.NS); ok {
-			name := strings.ToLower(dns.Fqdn(nsRR.Ns))
-			if ips, exists := ipMap[name]; exists {
-				for _, ip := range ips {
-					servers = append(servers, net.JoinHostPort(ip, "53"))
+			// No glue records. We need to resolve the nameservers' IP addresses.
+			for _, ns := range resp.Ns {
+				if ns, ok := ns.(*dns.NS); ok {
+					// To avoid a loop, we resolve the NS records using the *original* lookup function.
+					// This is a simplified approach. A more robust implementation
+					// would be more careful about resolution loops.
+					nsMsg, err := r.lookup(ctx, ns.Ns, dns.TypeA)
+					if err != nil {
+						log.Printf("Failed to resolve NS %s: %v", ns.Ns, err)
+						continue
+					}
+					for _, ans := range nsMsg.Answer {
+						if a, ok := ans.(*dns.A); ok {
+							nextServers = append(nextServers, net.JoinHostPort(a.A.String(), "53"))
+						}
+						if aaaa, ok := ans.(*dns.AAAA); ok {
+							nextServers = append(nextServers, net.JoinHostPort(aaaa.AAAA.String(), "53"))
+						}
+					}
 				}
-			} else {
-				// If no IP in extra records, we need to resolve the NS name
-				ips, err := r.resolveNameToIP(ctx, name)
-				if err != nil {
-					log.Printf("Failed to resolve NS %s: %v", name, err)
-					continue
-				}
-				for _, ip := range ips {
-					servers = append(servers, net.JoinHostPort(ip, "53"))
-				}
+			}
+
+			if len(nextServers) > 0 {
+				return r.lookupWithServers(ctx, name, qtype, nextServers, queriedServers)
 			}
 		}
 	}
 
-	return servers, nil
+	return nil, fmt.Errorf("resolution failed for %s: no servers responded", name)
 }
 
-// extractGlueServers extracts server addresses from glue records
-func (r *GoDNSResolver) extractGlueServers(extraRecords []dns.RR) []string {
-	var servers []string
-
-	for _, extra := range extraRecords {
-		switch rr := extra.(type) {
-		case *dns.A:
-			servers = append(servers, net.JoinHostPort(rr.A.String(), "53"))
-		case *dns.AAAA:
-			servers = append(servers, net.JoinHostPort(rr.AAAA.String(), "53"))
-		}
-	}
-
-	return servers
-}
-
-// resolveNameToIP resolves a name to IP addresses
-func (r *GoDNSResolver) resolveNameToIP(ctx context.Context, name string) ([]string, error) {
-	// This is a simplified version - a full implementation would cache these results
-	// and handle the resolution more efficiently
-
-	// First try A record
-	aReq := new(dns.Msg)
-	aReq.SetQuestion(name, dns.TypeA)
-	aReq.RecursionDesired = true
-
-	aResp, err := r.directLookup(ctx, name, dns.TypeA, dns.ClassINET, r.rootServers)
-	if err != nil {
-		// If A fails, try AAAA
-		aaaaResp, err2 := r.directLookup(ctx, name, dns.TypeAAAA, dns.ClassINET, r.rootServers)
-		if err2 != nil {
-			return nil, fmt.Errorf("failed to resolve %s: A failed: %v, AAAA failed: %v", name, err, err2)
-		}
-		
-		var ips []string
-		for _, ans := range aaaaResp.Answer {
-			if aaaa, ok := ans.(*dns.AAAA); ok {
-				ips = append(ips, aaaa.AAAA.String())
-			}
-		}
-		return ips, nil
-	}
-
-	var ips []string
-	for _, ans := range aResp.Answer {
-		if a, ok := ans.(*dns.A); ok {
-			ips = append(ips, a.A.String())
-		}
-	}
-	return ips, nil
+// shuffleServers randomizes the order of a slice of servers.
+func (r *GoDNSResolver) shuffleServers(servers []string) []string {
+	shuffled := make([]string, len(servers))
+	copy(shuffled, servers)
+	rand.Shuffle(len(shuffled), func(i, j int) {
+		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+	})
+	return shuffled
 }
 
 // sendQuery sends a single DNS query to the specified server
@@ -416,62 +324,6 @@ func (r *GoDNSResolver) sendQuery(ctx context.Context, req *dns.Msg, server stri
 	}
 
 	return resp, nil
-}
-
-// directLookup is a helper to directly query specific servers
-func (r *GoDNSResolver) directLookup(ctx context.Context, domain string, qtype uint16, qclass uint16, servers []string) (*dns.Msg, error) {
-	req := new(dns.Msg)
-	req.SetQuestion(dns.Fqdn(domain), qtype)
-	req.RecursionDesired = true
-
-	// Shuffle the servers to distribute load
-	shuffled := make([]string, len(servers))
-	copy(shuffled, servers)
-	rand.Shuffle(len(shuffled), func(i, j int) {
-		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
-	})
-
-	var lastErr error
-	attempts := 0
-	maxAttempts := len(servers)
-
-	for attempts < maxAttempts {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		// Try each server with retry logic
-		for i, server := range shuffled {
-			// Skip server if it's been tried already in this iteration
-			if i < attempts {
-				continue
-			}
-
-			resp, err := r.sendQuery(ctx, req, server)
-			if err != nil {
-				lastErr = err
-				log.Printf("Failed to query %s for %s: %v", server, domain, err)
-				continue // Try next server
-			}
-
-			return resp, nil
-		}
-		
-		// If we've tried all servers and failed, increment attempts for exponential backoff
-		if lastErr != nil {
-			attempts++
-			// Brief delay before trying alternative servers again
-			select {
-			case <-time.After(50 * time.Millisecond):
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-	}
-
-	return nil, fmt.Errorf("all servers failed for %s after %d attempts: last error: %v", domain, maxAttempts, lastErr)
 }
 
 // LookupWithoutCache performs a recursive DNS lookup for a given request, bypassing the cache.
