@@ -7,7 +7,6 @@ import (
 	"dns-resolver/internal/cache"
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/metrics"
-
 	"github.com/miekg/dns"
 	"golang.org/x/sync/singleflight"
 )
@@ -16,8 +15,8 @@ import (
 type ResolverType string
 
 const (
-	// ResolverTypeUnbound uses libunbound for DNS resolution
-	ResolverTypeUnbound ResolverType = "unbound"
+	// ResolverTypeDnslib uses dnslib for DNS resolution
+	ResolverTypeDnslib ResolverType = "dnslib"
 )
 
 // ResolverInterface defines the common interface for all resolvers.
@@ -31,6 +30,6 @@ type ResolverInterface interface {
 
 // NewResolver creates a new resolver instance based on the specified type.
 func NewResolver(resolverType ResolverType, cfg *config.Config, c *cache.Cache, m *metrics.Metrics) (ResolverInterface, error) {
-	log.Println("Creating Unbound resolver")
-	return NewUnboundResolver(cfg, c, m), nil
+	log.Println("Creating Dnslib resolver")
+	return NewDnslibResolver(cfg, c, m), nil
 }

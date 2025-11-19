@@ -23,7 +23,7 @@ func TestResolver_Resolve(t *testing.T) {
 	m := metrics.NewMetrics()
 	c := cache.NewCache(cache.DefaultCacheSize, cache.DefaultShards, dir, m)
 	defer c.Close()
-	r, err := NewResolver(ResolverTypeUnbound, cfg, c, m)
+	r, err := NewResolver(ResolverTypeDnslib, cfg, c, m)
 	if err != nil {
 		t.Fatalf("Failed to create resolver: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestResolver_Resolve_DNSSEC(t *testing.T) {
 	m := metrics.NewMetrics()
 	c := cache.NewCache(cache.DefaultCacheSize, cache.DefaultShards, dir, m)
 	defer c.Close()
-	r, err := NewResolver(ResolverTypeUnbound, cfg, c, m)
+	r, err := NewResolver(ResolverTypeDnslib, cfg, c, m)
 	if err != nil {
 		t.Fatalf("Failed to create resolver: %v", err)
 	}

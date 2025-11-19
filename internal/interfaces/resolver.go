@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"dns-resolver/internal/config"
-
 	"github.com/miekg/dns"
 	"golang.org/x/sync/singleflight"
 )
