@@ -2,7 +2,6 @@ package cache
 
 import (
 	"bytes"
-	"container/list"
 	"dns-resolver/internal/metrics"
 	"encoding/binary"
 	"fmt"
@@ -98,18 +97,6 @@ type CacheItem struct {
 	MsgBytes             []byte
 	Expiration           time.Time
 	StaleWhileRevalidate time.Duration
-	element              *list.Element
-	parentList           *list.List
-}
-
-// slruSegment represents one segment of the SLRU cache.
-type slruSegment struct {
-	sync.RWMutex
-	items             map[string]*CacheItem
-	probationList     *list.List
-	protectedList     *list.List
-	probationCapacity int
-	protectedCapacity int
 }
 
 // Cache is a thread-safe, sharded DNS cache with SLRU eviction policy and LMDB persistence.
