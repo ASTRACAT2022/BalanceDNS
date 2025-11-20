@@ -79,12 +79,12 @@ func (p *HostsPlugin) Reload() error {
 }
 
 // Execute checks if the query can be answered from the HOSTS file.
-func (p *HostsPlugin) Execute(ctx *plugins.PluginContext, msg *dns.Msg) (bool, error) {
-	if len(msg.Question) == 0 {
+func (p *HostsPlugin) Execute(ctx *plugins.PluginContext, w dns.ResponseWriter, r *dns.Msg) (bool, error) {
+	if len(r.Question) == 0 {
 		return false, nil
 	}
 
-	question := msg.Question[0]
+	question := r.Question[0]
 	// We only handle A and AAAA queries for now.
 	if question.Qtype != dns.TypeA && question.Qtype != dns.TypeAAAA {
 		return false, nil
@@ -115,7 +115,7 @@ func (p *HostsPlugin) Execute(ctx *plugins.PluginContext, msg *dns.Msg) (bool, e
 		return false, nil
 	}
 
-	msg.Answer = append(msg.Answer, rr)
-	msg.Rcode = dns.RcodeSuccess
+	r.Answer = append(r.Answer, rr)
+	r.Rcode = dns.RcodeSuccess
 	return true, nil
 }

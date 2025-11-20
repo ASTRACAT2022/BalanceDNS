@@ -11,8 +11,13 @@ import (
 	"dns-resolver/internal/resolver"
 	"dns-resolver/internal/admin"
 	"dns-resolver/internal/server"
+	"dns-resolver/plugins/adblock"
 	"dns-resolver/plugins/example_logger"
 	"dns-resolver/plugins/hosts"
+	"dns-resolver/plugins/ratelimit"
+	"time"
+
+	"golang.org/x/time/rate"
 )
 
 // Старая функция больше не используется, так как теперь используем метод из пакета metrics
@@ -57,6 +62,15 @@ func main() {
 	loggerPlugin := example_logger.New()
 	pm.Register(loggerPlugin)
 
+	// Initialize and register the rate limit plugin
+	rateLimitPlugin := ratelimit.New(rate.Limit(50), 20, 1*time.Minute)
+	pm.Register(rateLimitPlugin)
+
+	// Initialize and register the adblock plugin
+	// We'll manage the blocklists via the admin panel later.
+	adBlockPlugin := adblock.New([]string{}, 24*time.Hour)
+	pm.Register(adBlockPlugin)
+
 	// Initialize and register the hosts plugin
 	var hostsPlugin *hosts.HostsPlugin
 	if cfg.HostsEnabled {
@@ -66,7 +80,7 @@ func main() {
 
 	// Start the admin server
 	if cfg.AdminAddr != "" {
-		adminServer := admin.New(cfg.AdminAddr, m, hostsPlugin)
+		adminServer := admin.New(cfg.AdminAddr, m, hostsPlugin, adBlockPlugin)
 		go adminServer.Start()
 	}
 
