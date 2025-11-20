@@ -39,13 +39,10 @@ func (s *Server) buildAndSetHandler() {
 		}
 
 		// Execute request plugins
-		pluginCtx := &plugins.PluginContext{}
-		if s.pluginManager.ExecutePlugins(pluginCtx, r) {
+		pluginCtx := &plugins.PluginContext{ResponseWriter: w}
+		if s.pluginManager.ExecutePlugins(pluginCtx, w, r) {
 			// A plugin has already handled the request.
-			// The response should be in `r`.
-			if err := w.WriteMsg(r); err != nil {
-				log.Printf("Failed to write plugin response: %v", err)
-			}
+			// The plugin is responsible for writing the response.
 			return
 		}
 
