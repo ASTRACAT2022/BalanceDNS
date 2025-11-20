@@ -19,6 +19,13 @@ type Config struct {
 	StaleWhileRevalidate time.Duration
 	LMDBPath             string
 	ResolverType         string // "unbound" or "knot"
+
+	// Hosts file plugin settings
+	HostsEnabled bool
+	HostsPath    string
+
+	// Admin panel settings
+	AdminAddr string
 }
 
 // NewConfig returns a new Config with default values.
@@ -39,5 +46,8 @@ func NewConfig() *Config {
 		StaleWhileRevalidate: 1 * time.Minute,
 		LMDBPath:             "/tmp/dns_cache.lmdb",
 		ResolverType:         "knot", // Default to Knot resolver
+		HostsEnabled:         true,
+		HostsPath:            "hosts",
+		AdminAddr:            "0.0.0.0:8080",
 	}
 }

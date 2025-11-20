@@ -40,7 +40,14 @@ func (s *Server) buildAndSetHandler() {
 
 		// Execute request plugins
 		pluginCtx := &plugins.PluginContext{}
-		s.pluginManager.ExecutePlugins(pluginCtx, r)
+		if s.pluginManager.ExecutePlugins(pluginCtx, r) {
+			// A plugin has already handled the request.
+			// The response should be in `r`.
+			if err := w.WriteMsg(r); err != nil {
+				log.Printf("Failed to write plugin response: %v", err)
+			}
+			return
+		}
 
 		req := pool.GetDnsMsg()
 		defer pool.PutDnsMsg(req)
