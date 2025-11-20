@@ -9,8 +9,10 @@ import (
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
 	"dns-resolver/internal/resolver"
+	"dns-resolver/internal/admin"
 	"dns-resolver/internal/server"
 	"dns-resolver/plugins/example_logger"
+	"dns-resolver/plugins/hosts"
 )
 
 // Старая функция больше не используется, так как теперь используем метод из пакета metrics
@@ -54,6 +56,19 @@ func main() {
 	// Register the example logger plugin
 	loggerPlugin := example_logger.New()
 	pm.Register(loggerPlugin)
+
+	// Initialize and register the hosts plugin
+	var hostsPlugin *hosts.HostsPlugin
+	if cfg.HostsEnabled {
+		hostsPlugin = hosts.New(cfg.HostsPath)
+		pm.Register(hostsPlugin)
+	}
+
+	// Start the admin server
+	if cfg.AdminAddr != "" {
+		adminServer := admin.New(cfg.AdminAddr, m, hostsPlugin)
+		go adminServer.Start()
+	}
 
 	// Create and start the server
 	srv := server.NewServer(cfg, m, res, pm)

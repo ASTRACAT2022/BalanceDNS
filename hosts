@@ -1,0 +1,11 @@
+# This is a sample hosts file.
+#
+# Lines starting with # are comments.
+#
+# Format: IP_ADDRESS HOSTNAME [ADDITIONAL_HOSTNAMES...]
+#
+127.0.0.1       localhost
+127.0.0.1       example.com
+127.0.0.1       www.example.com test.example.com
+::1             localhost
+2606:2800:220:1:248:1893:25c8:1946 example.net # This is a comment after a hostname

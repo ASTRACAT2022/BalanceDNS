@@ -298,6 +298,13 @@ func (m *Metrics) IncrementQueries() {
 	promTotalQueries.Inc()
 }
 
+// GetQueries returns the total number of queries.
+func (m *Metrics) GetQueries() int64 {
+	m.RLock()
+	defer m.RUnlock()
+	return m.totalQueries
+}
+
 // qpsCalculator calculates the QPS every second.
 func (m *Metrics) qpsCalculator() {
 	ticker := time.NewTicker(1 * time.Second)

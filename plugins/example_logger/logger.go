@@ -16,12 +16,12 @@ func (p *LoggerPlugin) Name() string {
 }
 
 // Execute logs the details of the DNS query.
-func (p *LoggerPlugin) Execute(ctx *plugins.PluginContext, msg *dns.Msg) error {
+func (p *LoggerPlugin) Execute(ctx *plugins.PluginContext, msg *dns.Msg) (bool, error) {
 	if len(msg.Question) > 0 {
 		question := msg.Question[0]
 		log.Printf("[Plugin %s] Received query for %s, type %s", p.Name(), question.Name, dns.TypeToString[question.Qtype])
 	}
-	return nil
+	return false, nil
 }
 
 // New returns a new instance of the LoggerPlugin.

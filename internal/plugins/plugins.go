@@ -15,7 +15,9 @@ type PluginContext struct {
 // Plugin is the interface that all plugins must implement.
 type Plugin interface {
 	Name() string
-	Execute(ctx *PluginContext, msg *dns.Msg) error
+	// Execute processes a DNS message. It returns true if it has handled the
+	// message and no further processing should be done.
+	Execute(ctx *PluginContext, msg *dns.Msg) (bool, error)
 }
 
 // PluginManager manages the lifecycle of plugins.
@@ -37,10 +39,15 @@ func (pm *PluginManager) Register(p Plugin) {
 }
 
 // ExecutePlugins runs all registered plugins.
-func (pm *PluginManager) ExecutePlugins(ctx *PluginContext, msg *dns.Msg) {
+func (pm *PluginManager) ExecutePlugins(ctx *PluginContext, msg *dns.Msg) bool {
 	for _, p := range pm.plugins {
-		if err := p.Execute(ctx, msg); err != nil {
+		handled, err := p.Execute(ctx, msg)
+		if err != nil {
 			log.Printf("Error executing plugin %s: %v", p.Name(), err)
 		}
+		if handled {
+			return true
+		}
 	}
+	return false
 }
