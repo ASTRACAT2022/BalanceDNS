@@ -52,6 +52,9 @@ func (p *AdBlockPlugin) Execute(ctx *plugins.PluginContext, w dns.ResponseWriter
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeNameError) // NXDOMAIN
 		w.WriteMsg(m)
+		if metrics, ok := ctx.Metrics.(interface{ IncrementBlockedDomains() }); ok {
+			metrics.IncrementBlockedDomains()
+		}
 		return true, nil // Stop processing
 	}
 

@@ -11,6 +11,7 @@ type PluginContext struct {
 	// You can add more context fields here if needed,
 	// for example, the original dns.ResponseWriter.
 	ResponseWriter dns.ResponseWriter
+	Metrics        interface{}
 }
 
 // ConfigField defines a configurable field for a plugin.

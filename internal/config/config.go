@@ -24,6 +24,11 @@ type Config struct {
 	HostsEnabled bool
 	HostsPath    string
 
+	// Rate limit plugin settings
+	RateLimitEnabled bool
+	RateLimitQPS     int
+	RateLimitBurst   int
+
 	// Admin panel settings
 	AdminAddr string
 
@@ -51,6 +56,9 @@ func NewConfig() *Config {
 		ResolverType:         "knot", // Default to Knot resolver
 		HostsEnabled:         true,
 		HostsPath:            "hosts",
+		RateLimitEnabled:     true,
+		RateLimitQPS:         50,
+		RateLimitBurst:       20,
 		AdminAddr:            "0.0.0.0:8080",
 		MetricsStoragePath:   "/tmp/dns_metrics.json",
 	}

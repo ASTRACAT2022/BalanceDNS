@@ -46,27 +46,31 @@ type CodeCount struct {
 }
 
 type DashboardMetrics struct {
-	QPS               float64         `json:"qps"`
-	TotalQueries      int64           `json:"total_queries"`
-	CPUUsage          float64         `json:"cpu_usage"`
-	MemoryUsage       float64         `json:"memory_usage"`
-	Goroutines        int             `json:"goroutines"`
-	CacheHits         int64           `json:"cache_hits"`
-	CacheMisses       int64           `json:"cache_misses"`
-	CacheHitRate      float64         `json:"cache_hit_rate"`
-	TopNXDomains      []DomainCount   `json:"top_nx_domains"`
-	TopLatencyDomains []DomainLatency `json:"top_latency_domains"`
-	QueryTypes        []TypeCount     `json:"query_types"`
-	ResponseCodes     []CodeCount     `json:"response_codes"`
+	QPS                 float64         `json:"qps"`
+	TotalQueries        int64           `json:"total_queries"`
+	BlockedDomains      int64           `json:"blocked_domains"`
+	CPUUsage            float64         `json:"cpu_usage"`
+	MemoryUsage         float64         `json:"memory_usage"`
+	Goroutines          int             `json:"goroutines"`
+	CacheHits           int64           `json:"cache_hits"`
+	CacheMisses         int64           `json:"cache_misses"`
+	CacheHitRate        float64         `json:"cache_hit_rate"`
+	TopNXDomains        []DomainCount   `json:"top_nx_domains"`
+	TopLatencyDomains   []DomainLatency `json:"top_latency_domains"`
+	TopQueriedDomains   []DomainCount   `json:"top_queried_domains"`
+	QueryTypes          []TypeCount     `json:"query_types"`
+	ResponseCodes       []CodeCount     `json:"response_codes"`
 }
 
 // Metrics holds the collected metrics.
 type Metrics struct {
 	sync.RWMutex
-	totalQueries      int64
+	TotalQueries      int64
+	BlockedDomains    int64
 	startTime         time.Time
 	TopNXDomains      sync.Map // map[string]int64
 	TopLatencyDomains sync.Map // map[string]LatencyStat
+	TopQueriedDomains sync.Map // map[string]int64
 	QueryTypes        sync.Map // map[string]int64
 	ResponseCodes     sync.Map // map[string]int64
 	registry          *prometheus.Registry
@@ -128,6 +132,10 @@ var (
 		Name: "dns_resolver_top_latency_domains_ms",
 		Help: "Top domains by average query latency in milliseconds",
 	}, []string{"domain"})
+	promTopQueriedDomains = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "dns_resolver_top_queried_domains",
+		Help: "Top queried domains",
+	}, []string{"domain"})
 	promQueryTypes = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "dns_resolver_query_types_total",
 		Help: "Total number of queries by type",
@@ -155,6 +163,10 @@ var (
 	promCacheMisses = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "dns_resolver_cache_misses_total",
 		Help: "Total number of cache misses",
+	})
+	promBlockedDomains = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "dns_resolver_blocked_domains_total",
+		Help: "Total number of blocked domains",
 	})
 	promCacheEvictions = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "dns_resolver_cache_evictions_total",
@@ -223,8 +235,8 @@ func (m *Metrics) loadHistoricalData(path string) error {
 		return err
 	}
 
-	m.totalQueries = historicalData.TotalQueries
-	promTotalQueries.Add(float64(m.totalQueries))
+	m.TotalQueries = historicalData.TotalQueries
+	promTotalQueries.Add(float64(m.TotalQueries))
 	return nil
 }
 
@@ -234,7 +246,7 @@ func (m *Metrics) SaveHistoricalData(path string) error {
 	defer m.RUnlock()
 
 	historicalData := HistoricalData{
-		TotalQueries: m.totalQueries,
+		TotalQueries: m.TotalQueries,
 	}
 
 	data, err := json.Marshal(historicalData)
@@ -303,6 +315,16 @@ func (m *Metrics) jsonMetricsHandler(w http.ResponseWriter, r *http.Request) {
 		topLatencyDomains = topLatencyDomains[:10]
 	}
 
+	var topQueriedDomains []DomainCount
+	m.TopQueriedDomains.Range(func(key, value interface{}) bool {
+		topQueriedDomains = append(topQueriedDomains, DomainCount{Domain: key.(string), Count: value.(int64)})
+		return true
+	})
+	sort.Slice(topQueriedDomains, func(i, j int) bool { return topQueriedDomains[i].Count > topQueriedDomains[j].Count })
+	if len(topQueriedDomains) > 10 {
+		topQueriedDomains = topQueriedDomains[:10]
+	}
+
 	var queryTypes []TypeCount
 	m.QueryTypes.Range(func(key, value interface{}) bool {
 		queryTypes = append(queryTypes, TypeCount{Type: key.(string), Count: value.(int64)})
@@ -323,18 +345,20 @@ func (m *Metrics) jsonMetricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data := DashboardMetrics{
-		QPS:               m.QPS,
-		TotalQueries:      m.totalQueries,
-		CPUUsage:          m.CPUUsage,
-		MemoryUsage:       m.MemoryUsage,
-		Goroutines:        m.Goroutines,
-		CacheHits:         m.CacheHits,
-		CacheMisses:       m.CacheMisses,
-		CacheHitRate:      cacheHitRate,
-		TopNXDomains:      topNXDomains,
-		TopLatencyDomains: topLatencyDomains,
-		QueryTypes:        queryTypes,
-		ResponseCodes:     responseCodes,
+		QPS:                 m.QPS,
+		TotalQueries:        m.TotalQueries,
+		BlockedDomains:      m.BlockedDomains,
+		CPUUsage:            m.CPUUsage,
+		MemoryUsage:         m.MemoryUsage,
+		Goroutines:          m.Goroutines,
+		CacheHits:           m.CacheHits,
+		CacheMisses:         m.CacheMisses,
+		CacheHitRate:        cacheHitRate,
+		TopNXDomains:        topNXDomains,
+		TopLatencyDomains:   topLatencyDomains,
+		TopQueriedDomains:   topQueriedDomains,
+		QueryTypes:          queryTypes,
+		ResponseCodes:       responseCodes,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -345,18 +369,20 @@ func (m *Metrics) jsonMetricsHandler(w http.ResponseWriter, r *http.Request) {
 
 
 // IncrementQueries increments the total number of queries.
-func (m *Metrics) IncrementQueries() {
+func (m *Metrics) IncrementQueries(domain string) {
 	m.Lock()
 	defer m.Unlock()
-	m.totalQueries++
+	m.TotalQueries++
 	promTotalQueries.Inc()
+	val, _ := m.TopQueriedDomains.LoadOrStore(domain, int64(0))
+	m.TopQueriedDomains.Store(domain, val.(int64)+1)
 }
 
 // GetQueries returns the total number of queries.
 func (m *Metrics) GetQueries() int64 {
 	m.RLock()
 	defer m.RUnlock()
-	return m.totalQueries
+	return m.TotalQueries
 }
 
 // qpsCalculator calculates the QPS every second.
@@ -367,7 +393,7 @@ func (m *Metrics) qpsCalculator() {
 	var lastQueryCount int64
 	for range ticker.C {
 		m.Lock()
-		currentQueries := m.totalQueries
+		currentQueries := m.TotalQueries
 		qps := float64(currentQueries - lastQueryCount)
 		lastQueryCount = currentQueries
 		m.QPS = qps
@@ -445,6 +471,7 @@ func (m *Metrics) topDomainsProcessor() {
 	for range ticker.C {
 		m.processTopNXDomains()
 		m.processTopLatencyDomains()
+		m.processTopQueriedDomains()
 	}
 }
 
@@ -578,4 +605,39 @@ func (m *Metrics) IncrementLMDBErrors() {
 // IncrementPrefetches increments the prefetch counter.
 func (m *Metrics) IncrementPrefetches() {
 	promPrefetches.Inc()
+}
+
+// IncrementBlockedDomains increments the blocked domains counter.
+func (m *Metrics) IncrementBlockedDomains() {
+	m.Lock()
+	m.BlockedDomains++
+	m.Unlock()
+	promBlockedDomains.Inc()
+}
+
+func (m *Metrics) processTopQueriedDomains() {
+	var domains []struct {
+		Domain string
+		Count  int64
+	}
+	m.TopQueriedDomains.Range(func(key, value interface{}) bool {
+		domains = append(domains, struct {
+			Domain string
+			Count  int64
+		}{key.(string), value.(int64)})
+		return true
+	})
+
+	// Sort and get top 10
+	sort.Slice(domains, func(i, j int) bool {
+		return domains[i].Count > domains[j].Count
+	})
+	if len(domains) > 10 {
+		domains = domains[:10]
+	}
+
+	promTopQueriedDomains.Reset()
+	for _, d := range domains {
+		promTopQueriedDomains.WithLabelValues(d.Domain).Set(float64(d.Count))
+	}
 }

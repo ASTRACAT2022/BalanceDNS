@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"golang.org/x/time/rate"
+	"gopkg.in/yaml.v3"
 )
 
 // Старая функция больше не используется, так как теперь используем метод из пакета metrics
@@ -29,6 +30,15 @@ func main() {
 
 	// Load configuration
 	cfg := config.NewConfig()
+	if _, err := os.Stat("config.yaml"); err == nil {
+		data, err := os.ReadFile("config.yaml")
+		if err != nil {
+			log.Fatalf("Failed to read config.yaml: %v", err)
+		}
+		if err := yaml.Unmarshal(data, cfg); err != nil {
+			log.Fatalf("Failed to unmarshal config.yaml: %v", err)
+		}
+	}
 
 	// Initialize metrics
 	m := metrics.NewMetrics(cfg.MetricsStoragePath)
@@ -55,8 +65,10 @@ func main() {
 	pm.Register(loggerPlugin)
 
 	// Initialize and register the rate limit plugin
-	rateLimitPlugin := ratelimit.New(rate.Limit(50), 20, 1*time.Minute)
-	pm.Register(rateLimitPlugin)
+	if cfg.RateLimitEnabled {
+		rateLimitPlugin := ratelimit.New(rate.Limit(cfg.RateLimitQPS), cfg.RateLimitBurst, 1*time.Minute)
+		pm.Register(rateLimitPlugin)
+	}
 
 	// Initialize and register the adblock plugin
 	// We'll manage the blocklists via the admin panel later.
