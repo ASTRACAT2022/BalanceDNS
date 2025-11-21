@@ -3,6 +3,7 @@ package ratelimit
 import (
 	"dns-resolver/internal/plugins"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -86,5 +87,76 @@ func (p *RateLimitPlugin) cleanupVisitors() {
 			}
 		}
 		p.mu.Unlock()
+	}
+}
+
+// GetConfig returns the current configuration of the plugin.
+func (p *RateLimitPlugin) GetConfig() map[string]any {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return map[string]any{
+		"rate":          p.rate,
+		"burst":         p.burst,
+		"cleanupInterval": p.cleanupInterval.String(),
+	}
+}
+
+// SetConfig updates the configuration of the plugin.
+func (p *RateLimitPlugin) SetConfig(config map[string]any) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if rateStr, ok := config["rate"].(string); ok {
+		if rateLimit, err := strconv.ParseFloat(rateStr, 64); err == nil {
+			p.rate = rate.Limit(rateLimit)
+		}
+	}
+
+	if burstStr, ok := config["burst"].(string); ok {
+		if burst, err := strconv.Atoi(burstStr); err == nil {
+			p.burst = burst
+		}
+	}
+
+	if cleanupInterval, ok := config["cleanupInterval"].(string); ok {
+		duration, err := time.ParseDuration(cleanupInterval)
+		if err != nil {
+			return err
+		}
+		p.cleanupInterval = duration
+	}
+
+	// Update existing limiters
+	for _, v := range p.visitors {
+		v.limiter.SetLimit(p.rate)
+		v.limiter.SetBurst(p.burst)
+	}
+
+	return nil
+}
+
+// GetConfigFields returns the configuration fields of the plugin.
+func (p *RateLimitPlugin) GetConfigFields() []plugins.ConfigField {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return []plugins.ConfigField{
+		{
+			Name:        "rate",
+			Description: "Rate limit (queries per second)",
+			Type:        "number",
+			Value:       p.rate,
+		},
+		{
+			Name:        "burst",
+			Description: "Burst size",
+			Type:        "number",
+			Value:       p.burst,
+		},
+		{
+			Name:        "cleanupInterval",
+			Description: "Cleanup interval for visitors (e.g., '1m', '30s')",
+			Type:        "text",
+			Value:       p.cleanupInterval.String(),
+		},
 	}
 }

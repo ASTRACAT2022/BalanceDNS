@@ -117,5 +117,41 @@ func (p *HostsPlugin) Execute(ctx *plugins.PluginContext, w dns.ResponseWriter, 
 
 	r.Answer = append(r.Answer, rr)
 	r.Rcode = dns.RcodeSuccess
+	w.WriteMsg(r)
 	return true, nil
+}
+
+// GetConfig returns the current configuration of the plugin.
+func (p *HostsPlugin) GetConfig() map[string]any {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return map[string]any{
+		"filePath": p.filePath,
+	}
+}
+
+// SetConfig updates the configuration of the plugin.
+func (p *HostsPlugin) SetConfig(config map[string]any) error {
+	if filePath, ok := config["filePath"].(string); ok {
+		p.mu.Lock()
+		p.filePath = filePath
+		p.mu.Unlock()
+		// Reload the hosts file with the new path
+		return p.Reload()
+	}
+	return nil
+}
+
+// GetConfigFields returns the configuration fields of the plugin.
+func (p *HostsPlugin) GetConfigFields() []plugins.ConfigField {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return []plugins.ConfigField{
+		{
+			Name:        "filePath",
+			Description: "Path to the hosts file",
+			Type:        "text",
+			Value:       p.filePath,
+		},
+	}
 }

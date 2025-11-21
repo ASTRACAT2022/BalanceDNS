@@ -26,6 +26,9 @@ type Config struct {
 
 	// Admin panel settings
 	AdminAddr string
+
+	// Metrics storage settings
+	MetricsStoragePath string
 }
 
 // NewConfig returns a new Config with default values.
@@ -49,5 +52,6 @@ func NewConfig() *Config {
 		HostsEnabled:         true,
 		HostsPath:            "hosts",
 		AdminAddr:            "0.0.0.0:8080",
+		MetricsStoragePath:   "/tmp/dns_metrics.json",
 	}
 }

@@ -20,7 +20,7 @@ func TestResolver_Resolve(t *testing.T) {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(dir)
-	m := metrics.NewMetrics()
+	m := metrics.NewMetrics("")
 	c := cache.NewCache(cache.DefaultCacheSize, cache.DefaultShards, dir, m)
 	defer c.Close()
 	r, err := NewResolver(ResolverTypeDnslib, cfg, c, m)
@@ -74,7 +74,7 @@ func TestResolver_Resolve_DNSSEC(t *testing.T) {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(dir)
-	m := metrics.NewMetrics()
+	m := metrics.NewMetrics("")
 	c := cache.NewCache(cache.DefaultCacheSize, cache.DefaultShards, dir, m)
 	defer c.Close()
 	r, err := NewResolver(ResolverTypeDnslib, cfg, c, m)

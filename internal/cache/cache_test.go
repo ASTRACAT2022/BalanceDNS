@@ -18,7 +18,7 @@ func newTestCache(t *testing.T) (*Cache, func()) {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	m := metrics.NewMetrics()
+	m := metrics.NewMetrics("")
 	cache := NewCache(128, 1, dir, m)
 
 	cleanup := func() {
@@ -104,7 +104,7 @@ func TestCachePersistence(t *testing.T) {
 	key := Key(q)
 	msg := createTestMsg("persistent.com.", 60, "5.6.7.8")
 
-	m := metrics.NewMetrics()
+	m := metrics.NewMetrics("")
 	// Create the first cache, add an item, and close it to persist the data.
 	c1 := NewCache(128, 1, dir, m)
 	c1.Set(key, msg, 0)
@@ -138,7 +138,7 @@ func TestCachePersistenceExpiration(t *testing.T) {
 	key := Key(q)
 	msg := createTestMsg("expired-persistent.com.", 1, "9.8.7.6") // 1-second TTL
 
-	m := metrics.NewMetrics()
+	m := metrics.NewMetrics("")
 	// Create the first cache, add an item, and close it.
 	c1 := NewCache(128, 1, dir, m)
 	c1.Set(key, msg, 0)
@@ -198,7 +198,7 @@ func TestCacheStaleWhileRevalidate(t *testing.T) {
 }
 
 func BenchmarkCacheSet(b *testing.B) {
-	m := metrics.NewMetrics()
+	m := metrics.NewMetrics("")
 	dir, err := os.MkdirTemp("", "bench-lmdb-set")
 	if err != nil {
 		b.Fatalf("Failed to create temp dir: %v", err)
@@ -218,7 +218,7 @@ func BenchmarkCacheSet(b *testing.B) {
 }
 
 func BenchmarkCacheGet(b *testing.B) {
-	m := metrics.NewMetrics()
+	m := metrics.NewMetrics("")
 	dir, err := os.MkdirTemp("", "bench-lmdb-get")
 	if err != nil {
 		b.Fatalf("Failed to create temp dir: %v", err)

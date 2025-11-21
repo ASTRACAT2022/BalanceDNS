@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"dns-resolver/internal/metrics"
+	"dns-resolver/internal/plugins"
 	"dns-resolver/plugins/adblock"
 	"dns-resolver/plugins/hosts"
 	"golang.org/x/crypto/bcrypt"
@@ -22,6 +23,7 @@ type Server struct {
 	metrics      *metrics.Metrics
 	hosts        *hosts.HostsPlugin
 	adblock      *adblock.AdBlockPlugin
+	pm           *plugins.PluginManager
 	username     string
 	passwordHash []byte
 	sessionToken string
@@ -29,7 +31,7 @@ type Server struct {
 }
 
 // New creates a new admin server.
-func New(addr string, m *metrics.Metrics, h *hosts.HostsPlugin, ab *adblock.AdBlockPlugin) *Server {
+func New(addr string, m *metrics.Metrics, h *hosts.HostsPlugin, ab *adblock.AdBlockPlugin, pm *plugins.PluginManager) *Server {
 	// In a real application, load this from config
 	username := "astracat"
 	password := "astracat"
@@ -43,6 +45,7 @@ func New(addr string, m *metrics.Metrics, h *hosts.HostsPlugin, ab *adblock.AdBl
 		metrics:      m,
 		hosts:        h,
 		adblock:      ab,
+		pm:           pm,
 		username:     username,
 		passwordHash: hash,
 	}
@@ -56,6 +59,9 @@ func (s *Server) Start() {
 
 	// Protected routes
 	mux.Handle("/", s.authMiddleware(http.HandlerFunc(s.handleStats)))
+	mux.Handle("/plugins", s.authMiddleware(http.HandlerFunc(s.handlePlugins)))
+	mux.Handle("/api/plugins/config", s.authMiddleware(http.HandlerFunc(s.handlePluginConfigUpdate)))
+	mux.Handle("/api/metrics", s.authMiddleware(http.HandlerFunc(s.handleApiMetrics)))
 	mux.Handle("/change-password", s.authMiddleware(http.HandlerFunc(s.handleChangePassword)))
 	mux.Handle("/api/hosts/reload", s.authMiddleware(http.HandlerFunc(s.handleHostsReload)))
 	mux.Handle("/adblock/add", s.authMiddleware(http.HandlerFunc(s.handleAddBlocklist)))
@@ -215,6 +221,105 @@ func (s *Server) handleHostsReload(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"message": "Hosts file reloaded successfully"})
 }
 
+func (s *Server) handleApiMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	s.metrics.RLock()
+	defer s.metrics.RUnlock()
+
+	var topNXDomains []metrics.DomainCount
+	s.metrics.TopNXDomains.Range(func(key, value interface{}) bool {
+		topNXDomains = append(topNXDomains, metrics.DomainCount{Domain: key.(string), Count: value.(int64)})
+		return true
+	})
+
+	var topLatencyDomains []metrics.DomainLatency
+	s.metrics.TopLatencyDomains.Range(func(key, value interface{}) bool {
+		stat := value.(metrics.LatencyStat)
+		if stat.Count > 0 {
+			avgLatency := stat.TotalLatency.Seconds() * 1000 / float64(stat.Count)
+			topLatencyDomains = append(topLatencyDomains, metrics.DomainLatency{Domain: key.(string), AvgLatency: avgLatency})
+		}
+		return true
+	})
+
+	var queryTypes []metrics.TypeCount
+	s.metrics.QueryTypes.Range(func(key, value interface{}) bool {
+		queryTypes = append(queryTypes, metrics.TypeCount{Type: key.(string), Count: value.(int64)})
+		return true
+	})
+
+	var responseCodes []metrics.CodeCount
+	s.metrics.ResponseCodes.Range(func(key, value interface{}) bool {
+		responseCodes = append(responseCodes, metrics.CodeCount{Code: key.(string), Count: value.(int64)})
+		return true
+	})
+
+	var cacheHitRate float64
+	if s.metrics.CacheHits+s.metrics.CacheMisses > 0 {
+		cacheHitRate = float64(s.metrics.CacheHits) / float64(s.metrics.CacheHits+s.metrics.CacheMisses) * 100
+	}
+
+	data := metrics.DashboardMetrics{
+		QPS:               s.metrics.QPS,
+		TotalQueries:      s.metrics.GetQueries(),
+		CPUUsage:          s.metrics.CPUUsage,
+		MemoryUsage:       s.metrics.MemoryUsage,
+		Goroutines:        s.metrics.Goroutines,
+		CacheHits:         s.metrics.CacheHits,
+		CacheMisses:       s.metrics.CacheMisses,
+		CacheHitRate:      cacheHitRate,
+		TopNXDomains:      topNXDomains,
+		TopLatencyDomains: topLatencyDomains,
+		QueryTypes:        queryTypes,
+		ResponseCodes:     responseCodes,
+	}
+
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Printf("Error encoding metrics to JSON: %v", err)
+	}
+}
+
+func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
+	message := r.URL.Query().Get("message")
+	data := struct {
+		Message string
+		Plugins []plugins.Plugin
+	}{
+		Message: message,
+		Plugins: s.pm.GetPlugins(),
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	tpl, _ := template.New("plugins").Parse(pluginsPage)
+	tpl.Execute(w, data)
+}
+
+func (s *Server) handlePluginConfigUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	r.ParseForm()
+	pluginName := r.FormValue("pluginName")
+	plugin := s.pm.GetPlugin(pluginName)
+	if plugin == nil {
+		http.Error(w, "Plugin not found", http.StatusNotFound)
+		return
+	}
+
+	config := make(map[string]any)
+	for _, field := range plugin.GetConfigFields() {
+		config[field.Name] = r.FormValue(field.Name)
+	}
+
+	if err := plugin.SetConfig(config); err != nil {
+		http.Redirect(w, r, "/plugins?message=Error+updating+config: "+err.Error(), http.StatusFound)
+		return
+	}
+
+	http.Redirect(w, r, "/plugins?message=Configuration+updated+successfully", http.StatusFound)
+}
+
 const loginPage = `
 <!DOCTYPE html>
 <html lang="en">
@@ -256,6 +361,67 @@ const loginPage = `
 </html>
 `
 
+const pluginsPage = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ASTRACAT DNS - Plugins</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; background-color: #f0f2f5; color: #333; }
+        .navbar { background-color: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.1); padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; }
+        .navbar .logo { font-size: 1.5rem; font-weight: bold; }
+        .navbar a { text-decoration: none; color: #007bff; }
+		.navbar a:hover { text-decoration: underline; }
+        .container { padding: 2rem; }
+        .card { background: #fff; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 1.5rem; padding: 1.5rem; }
+        h1, h2 { color: #333; }
+        .form-group { margin-bottom: 1rem; }
+        .form-group label { display: block; margin-bottom: 0.5rem; }
+        .form-group input, .form-group textarea { width: 100%; max-width: 400px; padding: 0.75rem; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        .btn { padding: 0.75rem 1.5rem; border: none; border-radius: 4px; background-color: #007bff; color: white; font-size: 1rem; cursor: pointer; }
+        .btn:hover { background-color: #0056b3; }
+		.message { padding: 1rem; background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; border-radius: 4px; margin-bottom: 1rem; }
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <div class="logo">ASTRACAT DNS</div>
+        <div>
+            <a href="/" style="margin-right: 1rem;">Dashboard</a>
+            <a href="/logout">Logout</a>
+        </div>
+    </div>
+    <div class="container">
+        <h1>Plugin Management</h1>
+		{{if .Message}}
+		<div class="message">{{.Message}}</div>
+		{{end}}
+        {{range .Plugins}}
+        <div class="card">
+            <h2>{{.Name}}</h2>
+            <form action="/api/plugins/config" method="post">
+                <input type="hidden" name="pluginName" value="{{.Name}}">
+                {{range .GetConfigFields}}
+                <div class="form-group">
+                    <label for="{{.Name}}">{{.Description}}</label>
+                    {{if eq .Type "textarea"}}
+                    <textarea id="{{.Name}}" name="{{.Name}}" rows="5">{{.Value}}</textarea>
+                    {{else}}
+                    <input type="{{.Type}}" id="{{.Name}}" name="{{.Name}}" value="{{.Value}}">
+                    {{end}}
+                </div>
+                {{end}}
+                <button type="submit" class="btn">Save Configuration</button>
+            </form>
+        </div>
+        {{end}}
+    </div>
+</body>
+</html>
+`
+
 const statsPage = `
 <!DOCTYPE html>
 <html lang="en">
@@ -263,7 +429,7 @@ const statsPage = `
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ASTRACAT DNS - Dashboard</title>
-	<meta http-equiv="refresh" content="10">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; background-color: #f0f2f5; color: #333; }
         .navbar { background-color: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.1); padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; }
@@ -297,12 +463,35 @@ const statsPage = `
 		{{end}}
         <div class="card">
             <h2>Statistics</h2>
-			<div class="stats-grid">
-				<div class="stat-item">
-					<div class="value">{{.Queries}}</div>
-					<div class="label">Total Queries</div>
-				</div>
-			</div>
+            <div class="stats-grid">
+                <div class="stat-item">
+                    <div class="value" id="total-queries">{{.Queries}}</div>
+                    <div class="label">Total Queries</div>
+                </div>
+                <div class="stat-item">
+                    <div class="value" id="qps">0</div>
+                    <div class="label">QPS</div>
+                </div>
+                <div class="stat-item">
+                    <div class="value" id="cache-hit-rate">0%</div>
+                    <div class="label">Cache Hit Rate</div>
+                </div>
+                <div class="stat-item">
+                    <div class="value" id="cpu-usage">0%</div>
+                    <div class="label">CPU Usage</div>
+                </div>
+                <div class="stat-item">
+                    <div class="value" id="memory-usage">0%</div>
+                    <div class="label">Memory Usage</div>
+                </div>
+                <div class="stat-item">
+                    <div class="value" id="goroutines">0</div>
+                    <div class="label">Goroutines</div>
+                </div>
+            </div>
+            <div style="width: 100%; margin-top: 2rem;">
+                <canvas id="qpsChart"></canvas>
+            </div>
         </div>
         <div class="card">
             <h2>Settings</h2>
@@ -341,6 +530,60 @@ const statsPage = `
 			</ul>
 		</div>
     </div>
+    <script>
+        const qpsData = {
+            labels: [],
+            datasets: [{
+                label: 'QPS',
+                data: [],
+                borderColor: 'rgb(75, 192, 192)',
+                tension: 0.1,
+                fill: false
+            }]
+        };
+
+        const qpsChart = new Chart(document.getElementById('qpsChart'), {
+            type: 'line',
+            data: qpsData,
+            options: {
+                scales: {
+                    x: {
+                        type: 'time',
+                        time: {
+                            unit: 'second'
+                        }
+                    }
+                }
+            }
+        });
+
+        function updateMetrics() {
+            fetch('/api/metrics')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('total-queries').innerText = data.total_queries;
+                    document.getElementById('qps').innerText = data.qps.toFixed(2);
+                    document.getElementById('cache-hit-rate').innerText = data.cache_hit_rate.toFixed(2) + '%';
+                    document.getElementById('cpu-usage').innerText = data.cpu_usage.toFixed(2) + '%';
+                    document.getElementById('memory-usage').innerText = data.memory_usage.toFixed(2) + '%';
+                    document.getElementById('goroutines').innerText = data.goroutines;
+
+                    const now = new Date();
+                    qpsData.labels.push(now);
+                    qpsData.datasets[0].data.push(data.qps);
+
+                    if (qpsData.labels.length > 60) {
+                        qpsData.labels.shift();
+                        qpsData.datasets[0].data.shift();
+                    }
+
+                    qpsChart.update();
+                });
+        }
+
+        setInterval(updateMetrics, 2000);
+        updateMetrics(); // Initial call
+    </script>
 </body>
 </html>
 `

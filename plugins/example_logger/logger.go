@@ -28,3 +28,18 @@ func (p *LoggerPlugin) Execute(ctx *plugins.PluginContext, w dns.ResponseWriter,
 func New() *LoggerPlugin {
 	return &LoggerPlugin{}
 }
+
+// GetConfig returns the current configuration of the plugin.
+func (p *LoggerPlugin) GetConfig() map[string]any {
+	return nil
+}
+
+// SetConfig updates the configuration of the plugin.
+func (p *LoggerPlugin) SetConfig(config map[string]any) error {
+	return nil
+}
+
+// GetConfigFields returns the configuration fields of the plugin.
+func (p *LoggerPlugin) GetConfigFields() []plugins.ConfigField {
+	return nil
+}

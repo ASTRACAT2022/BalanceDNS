@@ -134,3 +134,51 @@ func (p *AdBlockPlugin) UpdateBlocklists() {
 	p.mu.Unlock()
 	log.Printf("Adblock plugin updated with %d domains.", len(p.blocked))
 }
+
+// GetConfig returns the current configuration of the plugin.
+func (p *AdBlockPlugin) GetConfig() map[string]any {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return map[string]any{
+		"blocklists":     p.blocklists,
+		"updateInterval": p.updateInterval.String(),
+	}
+}
+
+// SetConfig updates the configuration of the plugin.
+func (p *AdBlockPlugin) SetConfig(config map[string]any) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if blocklists, ok := config["blocklists"].(string); ok {
+		p.blocklists = strings.Split(blocklists, "\n")
+	}
+
+	if updateInterval, ok := config["updateInterval"].(string); ok {
+		duration, err := time.ParseDuration(updateInterval)
+		if err != nil {
+			return err
+		}
+		p.updateInterval = duration
+	}
+
+	return nil
+}
+
+// GetConfigFields returns the configuration fields of the plugin.
+func (p *AdBlockPlugin) GetConfigFields() []plugins.ConfigField {
+	return []plugins.ConfigField{
+		{
+			Name:        "blocklists",
+			Description: "List of blocklist URLs (one per line)",
+			Type:        "textarea",
+			Value:       strings.Join(p.GetBlocklists(), "\n"),
+		},
+		{
+			Name:        "updateInterval",
+			Description: "Update interval for blocklists (e.g., '1h', '30m')",
+			Type:        "text",
+			Value:       p.updateInterval.String(),
+		},
+	}
+}
