@@ -15,10 +15,8 @@ import (
 	"dns-resolver/plugins/adblock"
 	"dns-resolver/plugins/example_logger"
 	"dns-resolver/plugins/hosts"
-	"dns-resolver/plugins/ratelimit"
 	"time"
 
-	"golang.org/x/time/rate"
 	"gopkg.in/yaml.v3"
 )
 
@@ -64,11 +62,7 @@ func main() {
 	loggerPlugin := example_logger.New()
 	pm.Register(loggerPlugin)
 
-	// Initialize and register the rate limit plugin
-	if cfg.RateLimitEnabled {
-		rateLimitPlugin := ratelimit.New(rate.Limit(cfg.RateLimitQPS), cfg.RateLimitBurst, 1*time.Minute)
-		pm.Register(rateLimitPlugin)
-	}
+
 
 	// Initialize and register the adblock plugin
 	// Use blocklists from configuration

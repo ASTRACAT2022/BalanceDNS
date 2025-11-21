@@ -42,11 +42,13 @@ func (r *DnslibResolver) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, e
 	// Check the cache first.
 	if cachedMsg, found, _ := r.cache.Get(key); found {
 		log.Printf("Cache hit for %s", q.Name)
+		r.metrics.IncrementCacheHits()
 		cachedMsg.Id = req.Id
 		return cachedMsg, nil
 	}
 
 	// Use singleflight to ensure only one lookup for a given question is in flight at a time.
+	r.metrics.IncrementCacheMisses()
 	res, err, _ := r.sf.Do(key, func() (interface{}, error) {
 		return r.exchange(ctx, req)
 	})

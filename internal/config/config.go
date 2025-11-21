@@ -33,10 +33,7 @@ type Config struct {
 	AdblockEnabled  bool
 	AdblockListURLs []string
 
-	// Rate limit plugin settings
-	RateLimitEnabled bool
-	RateLimitQPS     int
-	RateLimitBurst   int
+
 
 	// Admin panel settings
 	AdminAddr string
@@ -67,9 +64,6 @@ func NewConfig() *Config {
 		HostsPath:            "hosts",
 		AdblockEnabled:       true,
 		AdblockListURLs:      []string{"https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"},
-		RateLimitEnabled:     true,
-		RateLimitQPS:         50,
-		RateLimitBurst:       20,
 		AdminAddr:            "0.0.0.0:8080",
 		MetricsStoragePath:   "/tmp/dns_metrics.json",
 	}
