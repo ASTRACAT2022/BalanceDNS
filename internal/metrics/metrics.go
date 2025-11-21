@@ -210,9 +210,18 @@ func NewMetrics(storagePath string) *Metrics {
 
 		// Save historical data on shutdown
 		// This requires a signal handler in main.go to call SaveHistoricalData
-		go instance.qpsCalculator()
-		go instance.systemMetricsCollector()
-		go instance.topDomainsProcessor()
+		go func() {
+			log.Println("Starting QPS calculator goroutine")
+			instance.qpsCalculator()
+		}()
+		go func() {
+			log.Println("Starting system metrics collector goroutine")
+			instance.systemMetricsCollector()
+		}()
+		go func() {
+			log.Println("Starting top domains processor goroutine")
+			instance.topDomainsProcessor()
+		}()
 	})
 	return instance
 }
@@ -391,14 +400,26 @@ func (m *Metrics) qpsCalculator() {
 	defer ticker.Stop()
 
 	var lastQueryCount int64
+	log.Println("QPS calculator started")
+	
+	counter := 0 // For logging every 30 seconds
 	for range ticker.C {
 		m.Lock()
 		currentQueries := m.TotalQueries
 		qps := float64(currentQueries - lastQueryCount)
+		if qps < 0 {
+			qps = 0 // Handle potential race condition where TotalQueries decreased
+		}
 		lastQueryCount = currentQueries
 		m.QPS = qps
 		m.Unlock()
 		promQPS.Set(qps)
+		
+		// Log periodically for debugging
+		counter++
+		if counter%30 == 0 { // Log every 30 seconds
+			log.Printf("QPS: %.2f, Total Queries: %d", qps, currentQueries)
+		}
 	}
 }
 
@@ -409,11 +430,14 @@ func (m *Metrics) systemMetricsCollector() {
 
 	for range ticker.C {
 		m.Lock()
+		
 		// CPU Usage
 		cpuPercentages, err := cpu.Percent(0, false)
 		if err == nil && len(cpuPercentages) > 0 {
 			m.CPUUsage = cpuPercentages[0]
 			promCPUUsage.Set(cpuPercentages[0])
+		} else if err != nil {
+			log.Printf("Error collecting CPU metrics: %v", err)
 		}
 
 		// Memory Usage
@@ -421,6 +445,8 @@ func (m *Metrics) systemMetricsCollector() {
 		if err == nil {
 			m.MemoryUsage = memInfo.UsedPercent
 			promMemoryUsage.Set(memInfo.UsedPercent)
+		} else if err != nil {
+			log.Printf("Error collecting memory metrics: %v", err)
 		}
 
 		// Goroutine Count
@@ -434,10 +460,8 @@ func (m *Metrics) systemMetricsCollector() {
 		if err == nil && len(netIO) > 0 {
 			promNetworkSent.Set(float64(netIO[0].BytesSent))
 			promNetworkRecv.Set(float64(netIO[0].BytesRecv))
-		}
-
-		if err != nil {
-			log.Printf("Error collecting system metrics: %v", err)
+		} else if err != nil {
+			log.Printf("Error collecting network metrics: %v", err)
 		}
 	}
 }
