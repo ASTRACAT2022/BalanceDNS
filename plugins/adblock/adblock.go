@@ -52,7 +52,11 @@ func (p *AdBlockPlugin) Execute(ctx *plugins.PluginContext, w dns.ResponseWriter
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeNameError) // NXDOMAIN
 		w.WriteMsg(m)
-		if metrics, ok := ctx.Metrics.(interface{ IncrementBlockedDomains() }); ok {
+		// Use type assertion with interface to ensure metrics method is available
+		type blockedDomainsIncrementer interface {
+			IncrementBlockedDomains()
+		}
+		if metrics, ok := ctx.Metrics.(blockedDomainsIncrementer); ok {
 			metrics.IncrementBlockedDomains()
 		}
 		return true, nil // Stop processing
@@ -116,20 +120,37 @@ func (p *AdBlockPlugin) UpdateBlocklists() {
 			log.Printf("Failed to download blocklist %s: %v", url, err)
 			continue
 		}
-		defer resp.Body.Close()
-
+		
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" || strings.HasPrefix(line, "#") {
 				continue
 			}
+			
+			// Handle different hosts file formats
 			parts := strings.Fields(line)
-			if len(parts) > 0 {
-				domain := parts[len(parts)-1]
-				newBlocked[domain] = struct{}{}
+			if len(parts) >= 2 {
+				// For hosts file format: IP domain [additional domains]
+				for i := 1; i < len(parts); i++ {
+					domain := strings.TrimSpace(parts[i])
+					if domain != "" && !strings.HasPrefix(domain, "#") {
+						// Stop processing remaining parts if we encounter a comment
+						if strings.HasPrefix(domain, "#") {
+							break
+						}
+						newBlocked[strings.ToLower(domain)] = struct{}{}
+					}
+				}
+			} else if len(parts) == 1 {
+				// For simple domain lists
+				domain := strings.TrimSpace(parts[0])
+				if domain != "" {
+					newBlocked[strings.ToLower(domain)] = struct{}{}
+				}
 			}
 		}
+		resp.Body.Close() // Close the response body immediately after reading
 	}
 
 	p.mu.Lock()

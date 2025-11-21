@@ -91,8 +91,14 @@ func (p *HostsPlugin) Execute(ctx *plugins.PluginContext, w dns.ResponseWriter, 
 	}
 
 	hostname := strings.TrimSuffix(question.Name, ".")
+	hostname = strings.ToLower(hostname)
+	
 	p.mu.RLock()
-	ip, ok := p.hosts[strings.ToLower(hostname)]
+	ip, ok := p.hosts[hostname]
+	if !ok {
+		// Try with trailing dot as well, in case of different DNS client behavior
+		ip, ok = p.hosts[hostname+"."]
+	}
 	p.mu.RUnlock()
 
 	if !ok {
@@ -115,9 +121,12 @@ func (p *HostsPlugin) Execute(ctx *plugins.PluginContext, w dns.ResponseWriter, 
 		return false, nil
 	}
 
-	r.Answer = append(r.Answer, rr)
-	r.Rcode = dns.RcodeSuccess
-	w.WriteMsg(r)
+	// Create a new response message instead of modifying the original
+	response := new(dns.Msg)
+	response.SetReply(r)
+	response.Answer = append(response.Answer, rr)
+	response.Rcode = dns.RcodeSuccess
+	w.WriteMsg(response)
 	return true, nil
 }
 
