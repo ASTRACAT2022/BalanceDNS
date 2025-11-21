@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"dns-resolver/internal/plugins"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -14,17 +15,19 @@ import (
 
 // AdBlockPlugin blocks DNS queries for domains in blocklists.
 type AdBlockPlugin struct {
-	mu         sync.RWMutex
-	blocklists []string
-	blocked    map[string]struct{}
+	mu             sync.RWMutex
+	blocklists     []string
+	exactBlocked   map[string]struct{}     // Exact domain matches
+	wildcardBlocked map[string]struct{}    // Domains with wildcard (e.g., *.example.com as example.com)
 	updateInterval time.Duration
 }
 
 // New creates a new AdBlockPlugin.
 func New(blocklists []string, updateInterval time.Duration) *AdBlockPlugin {
 	p := &AdBlockPlugin{
-		blocklists: blocklists,
-		blocked:    make(map[string]struct{}),
+		blocklists:     blocklists,
+		exactBlocked:   make(map[string]struct{}),
+		wildcardBlocked: make(map[string]struct{}),
 		updateInterval: updateInterval,
 	}
 	go p.updateBlocklistsLoop()
@@ -36,6 +39,28 @@ func (p *AdBlockPlugin) Name() string {
 	return "adblock"
 }
 
+// isDomainBlocked checks if a domain (or its subdomain) is in the blocklist.
+// Supports exact matches and wildcard patterns (e.g., if example.com is blocked, sub.example.com is also blocked).
+func (p *AdBlockPlugin) isDomainBlocked(domain string) bool {
+	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
+
+	// Check for exact domain match
+	if _, exists := p.exactBlocked[domain]; exists {
+		return true
+	}
+
+	// Check for subdomain matches by iterating through possible parent domains
+	parts := strings.Split(domain, ".")
+	for i := 1; i < len(parts); i++ {
+		parentDomain := strings.Join(parts[i:], ".")
+		if _, exists := p.wildcardBlocked[parentDomain]; exists {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Execute checks if the query domain is in the blocklist.
 func (p *AdBlockPlugin) Execute(ctx *plugins.PluginContext, w dns.ResponseWriter, r *dns.Msg) (bool, error) {
 	if len(r.Question) == 0 {
@@ -45,13 +70,50 @@ func (p *AdBlockPlugin) Execute(ctx *plugins.PluginContext, w dns.ResponseWriter
 	domain := strings.TrimSuffix(question.Name, ".")
 
 	p.mu.RLock()
-	_, isBlocked := p.blocked[domain]
+	isBlocked := p.isDomainBlocked(domain)
 	p.mu.RUnlock()
 
 	if isBlocked {
-		m := new(dns.Msg)
-		m.SetRcode(r, dns.RcodeNameError) // NXDOMAIN
-		w.WriteMsg(m)
+		// Create response that returns 0.0.0.0 for A records and :: for AAAA records
+		response := new(dns.Msg)
+		response.SetReply(r)
+		response.Authoritative = true
+		response.Rcode = dns.RcodeSuccess
+
+		for _, q := range r.Question {
+			switch q.Qtype {
+			case dns.TypeA:
+				rr := &dns.A{
+					Hdr: dns.RR_Header{
+						Name:   q.Name,
+						Rrtype: dns.TypeA,
+						Class:  dns.ClassINET,
+						Ttl:    600, // 10 minutes
+					},
+					A: net.IPv4(0, 0, 0, 0),
+				}
+				response.Answer = append(response.Answer, rr)
+			case dns.TypeAAAA:
+				rr := &dns.AAAA{
+					Hdr: dns.RR_Header{
+						Name:   q.Name,
+						Rrtype: dns.TypeAAAA,
+						Class:  dns.ClassINET,
+						Ttl:    600, // 10 minutes
+					},
+					AAAA: net.ParseIP("::"),
+				}
+				response.Answer = append(response.Answer, rr)
+			}
+		}
+
+		// If no answer was added (for other record types), return NXDOMAIN
+		if len(response.Answer) == 0 {
+			response.SetRcode(r, dns.RcodeNameError) // NXDOMAIN for non-A/AAAA queries
+		}
+
+		w.WriteMsg(response)
+
 		// Use type assertion with interface to ensure metrics method is available
 		type blockedDomainsIncrementer interface {
 			IncrementBlockedDomains()
@@ -108,11 +170,11 @@ func (p *AdBlockPlugin) RemoveBlocklist(url string) {
 	p.blocklists = newBlocklists
 }
 
-
-// UpdateBlocklists fetches and parses the blocklists.
+// UpdateBlocklists fetches and parses the blocklists with enhanced format support.
 func (p *AdBlockPlugin) UpdateBlocklists() {
 	log.Println("Updating adblock blocklists...")
-	newBlocked := make(map[string]struct{})
+	newExactBlocked := make(map[string]struct{})
+	newWildcardBlocked := make(map[string]struct{})
 
 	for _, url := range p.GetBlocklists() { // Use the thread-safe getter
 		resp, err := http.Get(url)
@@ -124,29 +186,53 @@ func (p *AdBlockPlugin) UpdateBlocklists() {
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
+			
+			// Skip empty lines and comments
 			if line == "" || strings.HasPrefix(line, "#") {
 				continue
 			}
 			
-			// Handle different hosts file formats
+			// Handle different hosts file formats and adblock formats
 			parts := strings.Fields(line)
+			
+			// For hosts file format: IP domain [additional domains]
 			if len(parts) >= 2 {
-				// For hosts file format: IP domain [additional domains]
-				for i := 1; i < len(parts); i++ {
-					domain := strings.TrimSpace(parts[i])
-					if domain != "" && !strings.HasPrefix(domain, "#") {
-						// Stop processing remaining parts if we encounter a comment
-						if strings.HasPrefix(domain, "#") {
-							break
+				ip := net.ParseIP(parts[0])
+				if ip != nil { // It's a hosts file format
+					for i := 1; i < len(parts); i++ {
+						domain := strings.TrimSpace(parts[i])
+						if domain != "" && !strings.HasPrefix(domain, "#") {
+							// Stop processing remaining parts if we encounter a comment
+							if strings.HasPrefix(domain, "#") {
+								break
+							}
+							// Handle wildcard domains (starting with 0.0.0.0 or other IPs)
+							domain = strings.ToLower(domain)
+							newExactBlocked[domain] = struct{}{}
 						}
-						newBlocked[strings.ToLower(domain)] = struct{}{}
 					}
+				} else {
+					// Handle adblock-style format
+					domain := strings.TrimSpace(parts[0])
+					domain = strings.ToLower(domain)
+					newExactBlocked[domain] = struct{}{}
 				}
 			} else if len(parts) == 1 {
 				// For simple domain lists
 				domain := strings.TrimSpace(parts[0])
 				if domain != "" {
-					newBlocked[strings.ToLower(domain)] = struct{}{}
+					domain = strings.ToLower(domain)
+					// Check if it's a wildcard domain (contains *)
+					if strings.Contains(domain, "*") {
+						// Remove the wildcard part for blocking parent domains
+						// e.g., for "*.example.com", add "example.com" to wildcardBlocked
+						if strings.HasPrefix(domain, "*.") {
+							parentDomain := strings.TrimPrefix(domain, "*.")
+							newWildcardBlocked[parentDomain] = struct{}{}
+						}
+					} else {
+						newExactBlocked[domain] = struct{}{}
+					}
 				}
 			}
 		}
@@ -154,9 +240,13 @@ func (p *AdBlockPlugin) UpdateBlocklists() {
 	}
 
 	p.mu.Lock()
-	p.blocked = newBlocked
+	p.exactBlocked = newExactBlocked
+	p.wildcardBlocked = newWildcardBlocked
 	p.mu.Unlock()
-	log.Printf("Adblock plugin updated with %d domains.", len(p.blocked))
+	
+	totalBlocked := len(p.exactBlocked) + len(p.wildcardBlocked)
+	log.Printf("Adblock plugin updated with %d total blocked entries (%d exact, %d wildcard).", 
+		totalBlocked, len(p.exactBlocked), len(p.wildcardBlocked))
 }
 
 // GetConfig returns the current configuration of the plugin.
