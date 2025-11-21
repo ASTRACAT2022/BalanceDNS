@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"os"
+	"os/signal"
 
 	"dns-resolver/internal/cache"
 	"dns-resolver/internal/config"
@@ -23,23 +24,14 @@ import (
 // Старая функция больше не используется, так как теперь используем метод из пакета metrics
 
 func main() {
-	// Open a file for logging. Truncate the file if it already exists.
-	logFile, err := os.OpenFile("server.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
-	if err != nil {
-		log.Fatalf("Failed to open log file: %v", err)
-	}
-	defer logFile.Close()
-
-	// Set the output of the log package to the file.
-	log.SetOutput(logFile)
-
+	log.SetOutput(os.Stdout)
 	log.Println("Booting up ASTRACAT Relover...")
 
 	// Load configuration
 	cfg := config.NewConfig()
 
 	// Initialize metrics
-	m := metrics.NewMetrics()
+	m := metrics.NewMetrics(cfg.MetricsStoragePath)
 
 	// Create cache and resolver
 	c := cache.NewCache(cfg.CacheSize, cache.DefaultShards, cfg.LMDBPath, m)
@@ -80,12 +72,24 @@ func main() {
 
 	// Start the admin server
 	if cfg.AdminAddr != "" {
-		adminServer := admin.New(cfg.AdminAddr, m, hostsPlugin, adBlockPlugin)
+		adminServer := admin.New(cfg.AdminAddr, m, hostsPlugin, adBlockPlugin, pm)
 		go adminServer.Start()
 	}
 
 	// Create and start the server
 	srv := server.NewServer(cfg, m, res, pm)
+
+	// Graceful shutdown
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt)
+		<-sig
+		log.Println("Shutting down...")
+		if err := m.SaveHistoricalData(cfg.MetricsStoragePath); err != nil {
+			log.Printf("Failed to save metrics: %v", err)
+		}
+		os.Exit(0)
+	}()
 
 	srv.ListenAndServe()
 }

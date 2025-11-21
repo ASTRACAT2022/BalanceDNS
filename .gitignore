@@ -4,3 +4,10 @@
 # Ignore compiled binaries
 astracat-dns
 dns-resolver
+
+# Ignore sensitive files
+cookies.txt
+
+# Ignore temporary files
+dashboard.html
+server.log

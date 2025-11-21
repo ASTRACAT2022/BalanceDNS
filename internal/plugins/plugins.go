@@ -13,12 +13,23 @@ type PluginContext struct {
 	ResponseWriter dns.ResponseWriter
 }
 
+// ConfigField defines a configurable field for a plugin.
+type ConfigField struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Type        string `json:"type"` // e.g., "text", "number", "boolean"
+	Value       any    `json:"value"`
+}
+
 // Plugin is the interface that all plugins must implement.
 type Plugin interface {
 	Name() string
 	// Execute processes a DNS message. It returns true if it has handled the
 	// message and no further processing should be done.
 	Execute(ctx *PluginContext, w dns.ResponseWriter, r *dns.Msg) (bool, error)
+	GetConfig() map[string]any
+	SetConfig(config map[string]any) error
+	GetConfigFields() []ConfigField
 }
 
 // PluginManager manages the lifecycle of plugins.
@@ -51,4 +62,19 @@ func (pm *PluginManager) ExecutePlugins(ctx *PluginContext, w dns.ResponseWriter
 		}
 	}
 	return false
+}
+
+// GetPlugins returns all registered plugins.
+func (pm *PluginManager) GetPlugins() []Plugin {
+	return pm.plugins
+}
+
+// GetPlugin returns a plugin by name.
+func (pm *PluginManager) GetPlugin(name string) Plugin {
+	for _, p := range pm.plugins {
+		if p.Name() == name {
+			return p
+		}
+	}
+	return nil
 }
