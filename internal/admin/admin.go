@@ -524,229 +524,376 @@ const statsPage = `
     <title>ASTRACAT DNS - Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; background-color: #f0f2f5; color: #333; }
-        .navbar { background-color: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.1); padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; }
-        .navbar .logo { font-size: 1.5rem; font-weight: bold; }
-        .navbar a { text-decoration: none; color: #007bff; }
-		.navbar a:hover { text-decoration: underline; }
-        .container { padding: 2rem; }
-        .card { background: #fff; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 1.5rem; padding: 1.5rem; }
-        h1, h2 { color: #333; }
-		.stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; }
-        .stat-item { text-align: center; }
-        .stat-item .value { font-size: 2.5rem; font-weight: bold; }
-        .stat-item .label { color: #666; }
-        .form-group { margin-bottom: 1rem; }
-        .form-group label { display: block; margin-bottom: 0.5rem; }
-        .form-group input { width: 100%; max-width: 400px; padding: 0.75rem; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
-        .btn { padding: 0.75rem 1.5rem; border: none; border-radius: 4px; background-color: #007bff; color: white; font-size: 1rem; cursor: pointer; }
-        .btn:hover { background-color: #0056b3; }
-		.message { padding: 1rem; background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; border-radius: 4px; margin-bottom: 1rem; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
+            margin: 0; 
+            background-color: #f5f7fa; 
+            color: #333; 
+            line-height: 1.6;
+        }
+        .navbar { 
+            background-color: #2c3e50; 
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1); 
+            padding: 1rem 2rem; 
+            display: flex; 
+            justify-content: space-between; 
+            align-items: center; 
+        }
+        .navbar .logo { 
+            font-size: 1.5rem; 
+            font-weight: bold; 
+            color: #ecf0f1; 
+        }
+        .navbar a { 
+            text-decoration: none; 
+            color: #3498db; 
+            margin-left: 1.5rem;
+        }
+        .navbar a:hover { 
+            text-decoration: underline; 
+        }
+        .container { 
+            padding: 2rem; 
+            max-width: 1600px;
+            margin: 0 auto;
+        }
+        .card { 
+            background: #ffffff; 
+            border-radius: 10px; 
+            box-shadow: 0 4px 15px rgba(0,0,0,0.08); 
+            margin-bottom: 1.5rem; 
+            padding: 1.5rem; 
+        }
+        h1, h2, h3 { 
+            color: #2c3e50; 
+            margin-top: 0;
+        }
+        .stats-grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); 
+            gap: 1rem; 
+            margin-bottom: 1.5rem;
+        }
+        .stat-item { 
+            text-align: center; 
+            padding: 1rem;
+            background-color: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid #3498db;
+        }
+        .stat-item .value { 
+            font-size: 2rem; 
+            font-weight: bold; 
+            color: #2c3e50;
+        }
+        .stat-item .label { 
+            color: #7f8c8d; 
+            font-size: 0.9rem;
+        }
+        .form-group { 
+            margin-bottom: 1rem; 
+        }
+        .form-group label { 
+            display: block; 
+            margin-bottom: 0.5rem; 
+            font-weight: 500;
+            color: #2c3e50;
+        }
+        .form-group input, 
+        .form-group textarea { 
+            width: 100%; 
+            max-width: 100%; 
+            padding: 0.75rem; 
+            border: 1px solid #ddd; 
+            border-radius: 4px; 
+            box-sizing: border-box; 
+            font-size: 1rem;
+        }
+        .btn { 
+            padding: 0.75rem 1.5rem; 
+            border: none; 
+            border-radius: 4px; 
+            background-color: #3498db; 
+            color: white; 
+            font-size: 1rem; 
+            cursor: pointer; 
+            transition: background-color 0.3s;
+        }
+        .btn:hover { 
+            background-color: #2980b9; 
+        }
+        .btn-danger {
+            background-color: #e74c3c;
+        }
+        .btn-danger:hover {
+            background-color: #c0392b;
+        }
+        .message { 
+            padding: 1rem; 
+            background-color: #d4edda; 
+            color: #155724; 
+            border: 1px solid #c3e6cb; 
+            border-radius: 4px; 
+            margin-bottom: 1rem; 
+        }
+        .metric-sections {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+        .metric-section {
+            min-height: 300px;
+        }
+        .progress-container {
+            margin: 0.5rem 0;
+        }
+        .progress-bar {
+            height: 10px;
+            background-color: #ecf0f1;
+            border-radius: 5px;
+            overflow: hidden;
+        }
+        .progress-bar-fill {
+            height: 100%;
+            background-color: #3498db;
+            transition: width 0.3s ease;
+        }
+        .top-domains-list {
+            max-height: 300px;
+            overflow-y: auto;
+            padding: 0.5rem 0;
+        }
+        .top-domain-item {
+            padding: 0.5rem;
+            border-bottom: 1px solid #eee;
+        }
+        .top-domain-item:last-child {
+            border-bottom: none;
+        }
+        .metric-card-large {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 1rem;
+            background-color: #f8f9fa;
+            border-radius: 8px;
+            margin-bottom: 0.5rem;
+        }
+        .metric-value-large {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .loading {
+            text-align: center;
+            padding: 1rem;
+            color: #7f8c8d;
+        }
+        .error-message {
+            color: #e74c3c;
+            padding: 1rem;
+            text-align: center;
+        }
     </style>
 </head>
 <body>
     <div class="navbar">
-        <div class="logo">ASTRACAT DNS</div>
+        <div class="logo">ASTRACAT DNS Resolver</div>
         <a href="/logout">Logout</a>
     </div>
     <div class="container">
         <h1>Dashboard</h1>
-		{{if .Message}}
-		<div class="message">{{.Message}}</div>
-		{{end}}
+        {{if .Message}}
+        <div class="message">{{.Message}}</div>
+        {{end}}
+        
+        <!-- Main Statistics -->
         <div class="card">
-            <h2>Statistics</h2>
+            <h2>System Statistics</h2>
             <div class="stats-grid">
                 <div class="stat-item">
                     <div class="value" id="total-queries">{{.Queries}}</div>
                     <div class="label">Total Queries</div>
                 </div>
                 <div class="stat-item">
-                    <div class="value" id="qps">0</div>
-                    <div class="label">QPS</div>
+                    <div class="value" id="qps">0.00</div>
+                    <div class="label">Queries Per Second</div>
                 </div>
                 <div class="stat-item">
                     <div class="value" id="blocked-domains">0</div>
                     <div class="label">Blocked Domains</div>
                 </div>
                 <div class="stat-item">
-                    <div class="value" id="cache-hit-rate">0%</div>
+                    <div class="value" id="cache-hit-rate">0.00%</div>
                     <div class="label">Cache Hit Rate</div>
                 </div>
                 <div class="stat-item">
-                    <div class="value" id="cpu-usage">0%</div>
+                    <div class="value" id="cpu-usage">0.00%</div>
                     <div class="label">CPU Usage</div>
                 </div>
                 <div class="stat-item">
-                    <div class="value" id="memory-usage">0%</div>
+                    <div class="value" id="memory-usage">0.00%</div>
                     <div class="label">Memory Usage</div>
                 </div>
                 <div class="stat-item">
                     <div class="value" id="goroutines">0</div>
                     <div class="label">Goroutines</div>
                 </div>
+                <div class="stat-item">
+                    <div class="value" id="cache-hits">0</div>
+                    <div class="label">Cache Hits</div>
+                </div>
+                <div class="stat-item">
+                    <div class="value" id="cache-misses">0</div>
+                    <div class="label">Cache Misses</div>
+                </div>
             </div>
-            <div style="width: 100%; margin-top: 2rem;">
+            <div style="width: 100%; height: 300px; margin-top: 1rem;">
                 <canvas id="qpsChart"></canvas>
             </div>
         </div>
-        <div class="card">
-            <h2>Detailed Statistics</h2>
-            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 2rem;">
-                <div>
-                    <h3>Top Queried Domains</h3>
-                    <ul id="top-queried-domains" style="max-height: 300px; overflow-y: auto;">
-                        <li>Loading...</li>
-                    </ul>
+        
+        <!-- System Resources and Performance -->
+        <div class="metric-sections">
+            <div class="card metric-section">
+                <h2>System Resources</h2>
+                <div class="progress-container">
+                    <div class="metric-card-large">
+                        <span>CPU Usage</span>
+                        <div class="metric-value-large" id="cpu-usage-large">0.00%</div>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-bar-fill" id="cpu-progress" style="width: 0%"></div>
+                    </div>
                 </div>
-                <div>
-                    <h3>Top NXDOMAIN Queries</h3>
-                    <ul id="top-nx-domains" style="max-height: 300px; overflow-y: auto;">
-                        <li>Loading...</li>
-                    </ul>
+                <div class="progress-container">
+                    <div class="metric-card-large">
+                        <span>Memory Usage</span>
+                        <div class="metric-value-large" id="memory-usage-large">0.00%</div>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-bar-fill" id="memory-progress" style="width: 0%"></div>
+                    </div>
+                </div>
+                <div class="progress-container">
+                    <div class="metric-card-large">
+                        <span>Cache Hit Rate</span>
+                        <div class="metric-value-large" id="cache-hit-rate-large">0.00%</div>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-bar-fill" id="cache-progress" style="width: 0%"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card metric-section">
+                <h2>Performance Metrics</h2>
+                <div class="metric-card-large">
+                    <span>Goroutines</span>
+                    <div class="metric-value-large" id="goroutines-large">0</div>
+                </div>
+                <div class="metric-card-large">
+                    <span>Cache Hits</span>
+                    <div class="metric-value-large" id="cache-hits-large">0</div>
+                </div>
+                <div class="metric-card-large">
+                    <span>Cache Misses</span>
+                    <div class="metric-value-large" id="cache-misses-large">0</div>
+                </div>
+                <div class="metric-card-large">
+                    <span>QPS</span>
+                    <div class="metric-value-large" id="qps-large">0.00</div>
                 </div>
             </div>
         </div>
-        <div class="card">
-            <h2>Settings</h2>
-            <form action="/change-password" method="post">
-                <div class="form-group">
-                    <label for="new_password">Change Admin Password</label>
-                    <input type="password" id="new_password" name="new_password" minlength="8" required>
+        
+        
+        <!-- Query Types and Response Codes -->
+        <div class="metric-sections">
+            <div class="card">
+                <h2>Query Types</h2>
+                <div class="top-domains-list" id="query-types">
+                    <div class="loading">Loading...</div>
                 </div>
-                <button type="submit" class="btn">Change Password</button>
-            </form>
+            </div>
+            <div class="card">
+                <h2>Response Codes</h2>
+                <div class="top-domains-list" id="response-codes">
+                    <div class="loading">Loading...</div>
+                </div>
+            </div>
         </div>
-		<div class="card">
-			<h2>AdBlock Management</h2>
-			<div class="form-group">
-				<form action="/adblock/add" method="post" style="display: flex; gap: 10px;">
-					<input type="url" name="url" placeholder="https://example.com/blocklist.txt" required style="flex-grow: 1;">
-					<button type="submit" class="btn">Add Blocklist</button>
-				</form>
-			</div>
-			<div class="form-group">
-				<form action="/adblock/reload" method="post">
-					<button type="submit" class="btn">Update All Blocklists Now</button>
-				</form>
-			</div>
-			<h4>Current Blocklists:</h4>
-			<ul>
-				{{range .Blocklists}}
-				<li style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
-					<span>{{.}}</span>
-					<form action="/adblock/remove" method="post">
-						<input type="hidden" name="url" value="{{.}}">
-						<button type="submit" class="btn" style="background-color: #dc3545;">Remove</button>
-					</form>
-				</li>
-				{{end}}
-			</ul>
-		</div>
-		<div class="card">
-			<h2>Hosts Management</h2>
-			<form action="/hosts/update" method="post">
-				<div class="form-group">
-					<label for="content">Hosts File Content</label>
-					<textarea id="content" name="content" rows="10" style="width: 100%; font-family: monospace;" placeholder="Example:
-127.0.0.1 localhost
-127.0.0.1 example.com">127.0.0.1 localhost
+
+        <!-- Settings and Management -->
+        <div class="card">
+            <h2>Settings & Management</h2>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem;">
+                <div>
+                    <h3>Change Password</h3>
+                    <form action="/change-password" method="post">
+                        <div class="form-group">
+                            <label for="new_password">New Admin Password (min 8 chars)</label>
+                            <input type="password" id="new_password" name="new_password" minlength="8" required>
+                        </div>
+                        <button type="submit" class="btn">Change Password</button>
+                    </form>
+                </div>
+                
+                <div>
+                    <h3>AdBlock Management</h3>
+                    <div class="form-group">
+                        <form action="/adblock/add" method="post">
+                            <label>Add Blocklist URL</label>
+                            <input type="url" name="url" placeholder="https://example.com/blocklist.txt" required>
+                            <button type="submit" class="btn" style="margin-top: 0.5rem;">Add Blocklist</button>
+                        </form>
+                    </div>
+                    <div class="form-group">
+                        <form action="/adblock/reload" method="post">
+                            <button type="submit" class="btn">Update All Blocklists Now</button>
+                        </form>
+                    </div>
+                </div>
+                
+                <div>
+                    <h3>Hosts Management</h3>
+                    <form action="/hosts/update" method="post">
+                        <div class="form-group">
+                            <label>Update Hosts File</label>
+                            <textarea id="content" name="content" rows="3" placeholder="Enter hosts content">127.0.0.1 localhost
 127.0.0.1 example.com</textarea>
-				</div>
-				<button type="submit" class="btn">Update Hosts File</button>
-			</form>
-			<div class="form-group" style="margin-top: 1rem;">
-				<form action="/api/hosts/reload" method="post">
-					<button type="submit" class="btn">Reload Hosts File from Disk</button>
-				</form>
-			</div>
-		</div>
+                        </div>
+                        <button type="submit" class="btn">Update Hosts File</button>
+                    </form>
+                    <div class="form-group" style="margin-top: 0.5rem;">
+                        <form action="/api/hosts/reload" method="post">
+                            <button type="submit" class="btn">Reload Hosts File</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Current Blocklists -->
+        <div class="card">
+            <h2>Current Blocklists</h2>
+            <ul id="current-blocklists">
+                {{range .Blocklists}}
+                <li style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid #eee;">
+                    <span style="word-break: break-all; flex-grow: 1;">{{.}}</span>
+                    <form action="/adblock/remove" method="post" style="margin-left: 1rem;">
+                        <input type="hidden" name="url" value="{{.}}">
+                        <button type="submit" class="btn btn-danger">Remove</button>
+                    </form>
+                </li>
+                {{else}}
+                <li>No blocklists configured</li>
+                {{end}}
+            </ul>
+        </div>
     </div>
-    <script>
-        const qpsData = {
-            labels: [],
-            datasets: [{
-                label: 'QPS',
-                data: [],
-                borderColor: 'rgb(75, 192, 192)',
-                tension: 0.1,
-                fill: false
-            }]
-        };
-
-        const qpsChart = new Chart(document.getElementById('qpsChart'), {
-            type: 'line',
-            data: qpsData,
-            options: {
-                scales: {
-                    x: {
-                        type: 'time',
-                        time: {
-                            unit: 'second'
-                        }
-                    }
-                }
-            }
-        });
-
-        function updateMetrics() {
-            fetch('/api/metrics')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('total-queries').innerText = data.total_queries;
-                    document.getElementById('qps').innerText = data.qps.toFixed(2);
-                    document.getElementById('blocked-domains').innerText = data.blocked_domains;
-                    document.getElementById('cache-hit-rate').innerText = data.cache_hit_rate.toFixed(2) + '%';
-                    document.getElementById('cpu-usage').innerText = data.cpu_usage.toFixed(2) + '%';
-                    document.getElementById('memory-usage').innerText = data.memory_usage.toFixed(2) + '%';
-                    document.getElementById('goroutines').innerText = data.goroutines;
-
-                    // Update top queried domains
-                    const topQueriedList = document.getElementById('top-queried-domains');
-                    topQueriedList.innerHTML = '';
-                    if (data.top_queried_domains && data.top_queried_domains.length > 0) {
-                        data.top_queried_domains.forEach(item => {
-                            const li = document.createElement('li');
-                            li.textContent = item.domain + ': ' + item.count;
-                            topQueriedList.appendChild(li);
-                        });
-                    } else {
-                        topQueriedList.innerHTML = '<li>No data available</li>';
-                    }
-
-                    // Update top NX domains
-                    const topNxList = document.getElementById('top-nx-domains');
-                    topNxList.innerHTML = '';
-                    if (data.top_nx_domains && data.top_nx_domains.length > 0) {
-                        data.top_nx_domains.forEach(item => {
-                            const li = document.createElement('li');
-                            li.textContent = item.domain + ': ' + item.count;
-                            topNxList.appendChild(li);
-                        });
-                    } else {
-                        topNxList.innerHTML = '<li>No data available</li>';
-                    }
-
-                    const now = new Date();
-                    qpsData.labels.push(now);
-                    qpsData.datasets[0].data.push(data.qps);
-
-                    if (qpsData.labels.length > 60) {
-                        qpsData.labels.shift();
-                        qpsData.datasets[0].data.shift();
-                    }
-
-                    qpsChart.update();
-                })
-                .catch(error => {
-                    console.error('Error fetching metrics:', error);
-                    // Keep the old values in case of error
-                });
-        }
-
-        setInterval(updateMetrics, 2000);
-        updateMetrics(); // Initial call
-    </script>
+    
     <script>
         // Load current hosts file content on page load
         window.onload = function() {
@@ -767,6 +914,196 @@ const statsPage = `
                 console.error('Error loading hosts content:', error);
             });
         };
+    </script>
+    
+    <script>
+        // Initialize charts
+        const qpsCtx = document.getElementById('qpsChart').getContext('2d');
+        const qpsChart = new Chart(qpsCtx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'Queries Per Second',
+                    data: [],
+                    borderColor: '#3498db',
+                    backgroundColor: 'rgba(52, 152, 219, 0.1)',
+                    borderWidth: 2,
+                    fill: true,
+                    tension: 0.3
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        grid: {
+                            color: 'rgba(0, 0, 0, 0.05)'
+                        }
+                    },
+                    x: {
+                        grid: {
+                            color: 'rgba(0, 0, 0, 0.05)'
+                        }
+                    }
+                },
+                plugins: {
+                    legend: {
+                        display: true,
+                        position: 'top',
+                    },
+                    tooltip: {
+                        enabled: true,
+                        mode: 'index',
+                        intersect: false
+                    }
+                }
+            }
+        });
+
+        // Update metrics function with better error handling
+        function updateMetrics() {
+            fetch('/api/metrics')
+                .timeout = 5000; // 5 second timeout
+                
+            fetch('/api/metrics', { 
+                method: 'GET',
+                cache: 'no-cache',
+                headers: {
+                    'Cache-Control': 'no-cache'
+                }
+            })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('Network response was not ok');
+                }
+                return response.json();
+            })
+            .then(data => {
+                // Update main statistics
+                document.getElementById('total-queries').innerText = formatNumber(data.total_queries || 0);
+                document.getElementById('qps').innerText = (data.qps || 0).toFixed(2);
+                document.getElementById('blocked-domains').innerText = formatNumber(data.blocked_domains || 0);
+                document.getElementById('cache-hit-rate').innerText = (data.cache_hit_rate || 0).toFixed(2) + '%';
+                document.getElementById('cpu-usage').innerText = (data.cpu_usage || 0).toFixed(2) + '%';
+                document.getElementById('memory-usage').innerText = (data.memory_usage || 0).toFixed(2) + '%';
+                document.getElementById('goroutines').innerText = data.goroutines || 0;
+                document.getElementById('cache-hits').innerText = formatNumber(data.cache_hits || 0);
+                document.getElementById('cache-misses').innerText = formatNumber(data.cache_misses || 0);
+                
+                // Update large display values
+                document.getElementById('qps-large').innerText = (data.qps || 0).toFixed(2);
+                document.getElementById('cpu-usage-large').innerText = (data.cpu_usage || 0).toFixed(2) + '%';
+                document.getElementById('memory-usage-large').innerText = (data.memory_usage || 0).toFixed(2) + '%';
+                document.getElementById('cache-hit-rate-large').innerText = (data.cache_hit_rate || 0).toFixed(2) + '%';
+                document.getElementById('goroutines-large').innerText = data.goroutines || 0;
+                document.getElementById('cache-hits-large').innerText = formatNumber(data.cache_hits || 0);
+                document.getElementById('cache-misses-large').innerText = formatNumber(data.cache_misses || 0);
+                
+                // Update progress bars
+                document.getElementById('cpu-progress').style.width = Math.min(100, data.cpu_usage || 0) + '%';
+                document.getElementById('memory-progress').style.width = Math.min(100, data.memory_usage || 0) + '%';
+                document.getElementById('cache-progress').style.width = Math.min(100, data.cache_hit_rate || 0) + '%';
+                
+                // Update top queried domains
+                updateList('top-queried-domains', data.top_queried_domains || [], 'domain', 'count');
+                
+                // Update top NX domains
+                updateList('top-nx-domains', data.top_nx_domains || [], 'domain', 'count');
+                
+                // Update query types
+                updateList('query-types', data.query_types || [], 'type', 'count');
+                
+                // Update response codes
+                updateList('response-codes', data.response_codes || [], 'code', 'count');
+                
+                // Update chart with new data point
+                const now = new Date();
+                qpsChart.data.labels.push(now.toLocaleTimeString());
+                qpsChart.data.datasets[0].data.push(data.qps || 0);
+                
+                // Keep only the last 60 points
+                if (qpsChart.data.labels.length > 60) {
+                    qpsChart.data.labels.shift();
+                    qpsChart.data.datasets[0].data.shift();
+                }
+                
+                qpsChart.update();
+                
+                // Update status indicators
+                document.getElementById('total-queries').style.color = '#27ae60';
+                document.getElementById('qps').style.color = '#27ae60';
+            })
+            .catch(error => {
+                console.error('Error fetching metrics:', error);
+                showErrorMessage('Failed to load metrics. Will retry automatically...');
+                
+                // Keep trying to update even if there's an error
+                setTimeout(updateMetrics, 5000); // Retry after 5 seconds
+            });
+        }
+        
+        // Helper function to format large numbers
+        function formatNumber(num) {
+            return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+        }
+        
+        // Helper function to update list items
+        function updateList(elementId, items, nameField, countField) {
+            const container = document.getElementById(elementId);
+            if (!container) return;
+            
+            if (!items || items.length === 0) {
+                container.innerHTML = '<div class="loading">No data available</div>';
+                return;
+            }
+            
+            let html = '';
+            items.slice(0, 20).forEach(item => {
+                html += '<div class="top-domain-item">' +
+                        '<strong>' + item[nameField] + '</strong> - ' + formatNumber(item[countField] || 0) +
+                        '</div>';
+            });
+            
+            if (items.length > 20) {
+                html += '<div class="loading">... and ' + (items.length - 20) + ' more</div>';
+            }
+            
+            container.innerHTML = html;
+        }
+        
+        // Show error message function
+        function showErrorMessage(message) {
+            // Only show error if no other error is currently displayed
+            if (!document.querySelector('.error-message')) {
+                const errorDiv = document.createElement('div');
+                errorDiv.className = 'error-message';
+                errorDiv.textContent = message;
+                errorDiv.style.position = 'fixed';
+                errorDiv.style.top = '10px';
+                errorDiv.style.right = '10px';
+                errorDiv.style.zIndex = '1000';
+                errorDiv.style.backgroundColor = '#fadbd8';
+                errorDiv.style.border = '1px solid #e74c3c';
+                errorDiv.style.borderRadius = '4px';
+                errorDiv.style.padding = '10px';
+                
+                document.body.appendChild(errorDiv);
+                
+                // Remove error after 5 seconds
+                setTimeout(() => {
+                    if (errorDiv.parentNode) {
+                        errorDiv.parentNode.removeChild(errorDiv);
+                    }
+                }, 5000);
+            }
+        }
+
+        // Update metrics every 2 seconds with error handling
+        setInterval(updateMetrics, 2000);
+        updateMetrics(); // Initial call
     </script>
 </body>
 </html>
