@@ -65,6 +65,7 @@ type Metrics struct {
 	sync.RWMutex
 	totalQueries      int64
 	startTime         time.Time
+	queryCountHistory []int64
 	TopNXDomains      sync.Map // map[string]int64
 	TopLatencyDomains sync.Map // map[string]LatencyStat
 	QueryTypes        sync.Map // map[string]int64
@@ -187,8 +188,9 @@ func NewMetrics(storagePath string) *Metrics {
 		registry.MustRegister(prometheus.NewGoCollector())
 
 		instance = &Metrics{
-			startTime: time.Now(),
-			registry:  registry,
+			startTime:         time.Now(),
+			registry:          registry,
+			queryCountHistory: make([]int64, 0, 10),
 		}
 
 		// Load historical data
@@ -364,12 +366,22 @@ func (m *Metrics) qpsCalculator() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	var lastQueryCount int64
 	for range ticker.C {
 		m.Lock()
-		currentQueries := m.totalQueries
-		qps := float64(currentQueries - lastQueryCount)
-		lastQueryCount = currentQueries
+		// Add the current total query count to the history
+		m.queryCountHistory = append(m.queryCountHistory, m.totalQueries)
+
+		// Keep the history to the last 10 seconds
+		if len(m.queryCountHistory) > 10 {
+			m.queryCountHistory = m.queryCountHistory[1:]
+		}
+
+		// Calculate QPS over the history window
+		var qps float64
+		if len(m.queryCountHistory) > 1 {
+			qps = float64(m.queryCountHistory[len(m.queryCountHistory)-1]-m.queryCountHistory[0]) / float64(len(m.queryCountHistory)-1)
+		}
+
 		m.QPS = qps
 		m.Unlock()
 		promQPS.Set(qps)
