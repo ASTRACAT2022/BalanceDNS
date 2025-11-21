@@ -71,13 +71,18 @@ func main() {
 	}
 
 	// Initialize and register the adblock plugin
-	// We'll manage the blocklists via the admin panel later.
-	adBlockPlugin := adblock.New([]string{}, 24*time.Hour)
+	// Use blocklists from configuration
+	adBlockPlugin := adblock.New(cfg.AdblockListURLs, 24*time.Hour)
 	pm.Register(adBlockPlugin)
 
 	// Initialize and register the hosts plugin
 	var hostsPlugin *hosts.HostsPlugin
 	if cfg.HostsEnabled {
+		hostsPlugin = hosts.New(cfg.HostsPath)
+		pm.Register(hostsPlugin)
+	} else {
+		// Initialize hosts plugin with default path even if not explicitly enabled
+		// This allows it to be enabled via admin panel later
 		hostsPlugin = hosts.New(cfg.HostsPath)
 		pm.Register(hostsPlugin)
 	}

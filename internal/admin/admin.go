@@ -8,13 +8,16 @@ import (
 	"html/template"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
+	"dns-resolver/internal/config"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
 	"dns-resolver/plugins/adblock"
 	"dns-resolver/plugins/hosts"
 	"golang.org/x/crypto/bcrypt"
+	"gopkg.in/yaml.v3"
 )
 
 // Server provides an admin web interface.
@@ -28,6 +31,7 @@ type Server struct {
 	passwordHash []byte
 	sessionToken string
 	sessionExpiry time.Time
+	configPath   string  // Path to config file
 }
 
 // New creates a new admin server.
@@ -48,6 +52,7 @@ func New(addr string, m *metrics.Metrics, h *hosts.HostsPlugin, ab *adblock.AdBl
 		pm:           pm,
 		username:     username,
 		passwordHash: hash,
+		configPath:   "config.yaml", // Default config path
 	}
 }
 
@@ -64,6 +69,8 @@ func (s *Server) Start() {
 	mux.Handle("/api/metrics", s.authMiddleware(http.HandlerFunc(s.handleApiMetrics)))
 	mux.Handle("/change-password", s.authMiddleware(http.HandlerFunc(s.handleChangePassword)))
 	mux.Handle("/api/hosts/reload", s.authMiddleware(http.HandlerFunc(s.handleHostsReload)))
+	mux.Handle("/api/hosts/content", s.authMiddleware(http.HandlerFunc(s.handleHostsContent)))
+	mux.Handle("/hosts/update", s.authMiddleware(http.HandlerFunc(s.handleHostsUpdate)))
 	mux.Handle("/adblock/add", s.authMiddleware(http.HandlerFunc(s.handleAddBlocklist)))
 	mux.Handle("/adblock/remove", s.authMiddleware(http.HandlerFunc(s.handleRemoveBlocklist)))
 	mux.Handle("/adblock/reload", s.authMiddleware(http.HandlerFunc(s.handleAdBlockReload)))
@@ -179,6 +186,13 @@ func (s *Server) handleAddBlocklist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.adblock.AddBlocklist(url)
+	
+	// Save updated blocklists to config
+	if err := s.saveConfig(); err != nil {
+		log.Printf("Failed to save config: %v", err)
+		// Continue anyway, as the plugin still has the updated list
+	}
+	
 	http.Redirect(w, r, "/?message=Blocklist+added", http.StatusFound)
 }
 
@@ -193,6 +207,13 @@ func (s *Server) handleRemoveBlocklist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.adblock.RemoveBlocklist(url)
+	
+	// Save updated blocklists to config
+	if err := s.saveConfig(); err != nil {
+		log.Printf("Failed to save config: %v", err)
+		// Continue anyway, as the plugin still has the updated list
+	}
+	
 	http.Redirect(w, r, "/?message=Blocklist+removed", http.StatusFound)
 }
 
@@ -205,6 +226,47 @@ func (s *Server) handleAdBlockReload(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/?message=Blocklist+update+started", http.StatusFound)
 }
 
+
+func (s *Server) handleHostsContent(w http.ResponseWriter, r *http.Request) {
+	content, err := s.hosts.ReadFileContent()
+	if err != nil {
+		log.Printf("Failed to read hosts file: %v", err)
+		// Return an empty response if file doesn't exist
+		content = "# Hosts file not found or empty\n"
+	}
+	
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Write([]byte(content))
+}
+
+func (s *Server) handleHostsUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	content := r.FormValue("content")
+	if content == "" {
+		http.Error(w, "Hosts content cannot be empty", http.StatusBadRequest)
+		return
+	}
+	
+	// Write the new content to the hosts file
+	if err := os.WriteFile(s.hosts.GetFilePath(), []byte(content), 0644); err != nil {
+		log.Printf("Failed to write hosts file: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to update hosts file: %v", err), http.StatusInternalServerError)
+		return
+	}
+	
+	// Reload the hosts plugin to use the new content
+	if err := s.hosts.Reload(); err != nil {
+		log.Printf("Failed to reload hosts after update: %v", err)
+		http.Error(w, fmt.Sprintf("Updated hosts file but failed to reload: %v", err), http.StatusInternalServerError)
+		return
+	}
+	
+	http.Redirect(w, r, "/?message=Hosts+file+updated+and+reloaded", http.StatusFound)
+}
 
 func (s *Server) handleHostsReload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -262,6 +324,7 @@ func (s *Server) handleApiMetrics(w http.ResponseWriter, r *http.Request) {
 	data := metrics.DashboardMetrics{
 		QPS:               s.metrics.QPS,
 		TotalQueries:      s.metrics.GetQueries(),
+		BlockedDomains:    s.metrics.BlockedDomains,
 		CPUUsage:          s.metrics.CPUUsage,
 		MemoryUsage:       s.metrics.MemoryUsage,
 		Goroutines:        s.metrics.Goroutines,
@@ -291,6 +354,36 @@ func (s *Server) handlePlugins(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	tpl, _ := template.New("plugins").Parse(pluginsPage)
 	tpl.Execute(w, data)
+}
+
+func (s *Server) saveConfig() error {
+	// Get current config values from plugins
+	cfg := config.NewConfig() // This gets defaults, we need to load the actual config file if it exists
+	
+	// Read existing config file if it exists
+	var existingConfigData []byte
+	var configExists bool
+	if data, err := os.ReadFile(s.configPath); err == nil {
+		existingConfigData = data
+		configExists = true
+	}
+	
+	// If config file exists, unmarshal it to preserve all other settings
+	if configExists {
+		if err := yaml.Unmarshal(existingConfigData, cfg); err != nil {
+			return fmt.Errorf("failed to unmarshal existing config: %v", err)
+		}
+	}
+
+	// Update only the adblock list URLs
+	cfg.AdblockListURLs = s.adblock.GetBlocklists()
+
+	// Write the updated config back to file
+	if err := cfg.Save(s.configPath); err != nil {
+		return fmt.Errorf("failed to save config: %v", err)
+	}
+	
+	return nil
 }
 
 func (s *Server) handlePluginConfigUpdate(w http.ResponseWriter, r *http.Request) {
@@ -473,6 +566,10 @@ const statsPage = `
                     <div class="label">QPS</div>
                 </div>
                 <div class="stat-item">
+                    <div class="value" id="blocked-domains">0</div>
+                    <div class="label">Blocked Domains</div>
+                </div>
+                <div class="stat-item">
                     <div class="value" id="cache-hit-rate">0%</div>
                     <div class="label">Cache Hit Rate</div>
                 </div>
@@ -491,6 +588,23 @@ const statsPage = `
             </div>
             <div style="width: 100%; margin-top: 2rem;">
                 <canvas id="qpsChart"></canvas>
+            </div>
+        </div>
+        <div class="card">
+            <h2>Detailed Statistics</h2>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 2rem;">
+                <div>
+                    <h3>Top Queried Domains</h3>
+                    <ul id="top-queried-domains" style="max-height: 300px; overflow-y: auto;">
+                        <li>Loading...</li>
+                    </ul>
+                </div>
+                <div>
+                    <h3>Top NXDOMAIN Queries</h3>
+                    <ul id="top-nx-domains" style="max-height: 300px; overflow-y: auto;">
+                        <li>Loading...</li>
+                    </ul>
+                </div>
             </div>
         </div>
         <div class="card">
@@ -529,6 +643,24 @@ const statsPage = `
 				{{end}}
 			</ul>
 		</div>
+		<div class="card">
+			<h2>Hosts Management</h2>
+			<form action="/hosts/update" method="post">
+				<div class="form-group">
+					<label for="content">Hosts File Content</label>
+					<textarea id="content" name="content" rows="10" style="width: 100%; font-family: monospace;" placeholder="Example:
+127.0.0.1 localhost
+127.0.0.1 example.com">127.0.0.1 localhost
+127.0.0.1 example.com</textarea>
+				</div>
+				<button type="submit" class="btn">Update Hosts File</button>
+			</form>
+			<div class="form-group" style="margin-top: 1rem;">
+				<form action="/api/hosts/reload" method="post">
+					<button type="submit" class="btn">Reload Hosts File from Disk</button>
+				</form>
+			</div>
+		</div>
     </div>
     <script>
         const qpsData = {
@@ -563,10 +695,37 @@ const statsPage = `
                 .then(data => {
                     document.getElementById('total-queries').innerText = data.total_queries;
                     document.getElementById('qps').innerText = data.qps.toFixed(2);
+                    document.getElementById('blocked-domains').innerText = data.blocked_domains;
                     document.getElementById('cache-hit-rate').innerText = data.cache_hit_rate.toFixed(2) + '%';
                     document.getElementById('cpu-usage').innerText = data.cpu_usage.toFixed(2) + '%';
                     document.getElementById('memory-usage').innerText = data.memory_usage.toFixed(2) + '%';
                     document.getElementById('goroutines').innerText = data.goroutines;
+
+                    // Update top queried domains
+                    const topQueriedList = document.getElementById('top-queried-domains');
+                    topQueriedList.innerHTML = '';
+                    if (data.top_queried_domains && data.top_queried_domains.length > 0) {
+                        data.top_queried_domains.forEach(item => {
+                            const li = document.createElement('li');
+                            li.textContent = item.domain + ': ' + item.count;
+                            topQueriedList.appendChild(li);
+                        });
+                    } else {
+                        topQueriedList.innerHTML = '<li>No data available</li>';
+                    }
+
+                    // Update top NX domains
+                    const topNxList = document.getElementById('top-nx-domains');
+                    topNxList.innerHTML = '';
+                    if (data.top_nx_domains && data.top_nx_domains.length > 0) {
+                        data.top_nx_domains.forEach(item => {
+                            const li = document.createElement('li');
+                            li.textContent = item.domain + ': ' + item.count;
+                            topNxList.appendChild(li);
+                        });
+                    } else {
+                        topNxList.innerHTML = '<li>No data available</li>';
+                    }
 
                     const now = new Date();
                     qpsData.labels.push(now);
@@ -578,11 +737,36 @@ const statsPage = `
                     }
 
                     qpsChart.update();
+                })
+                .catch(error => {
+                    console.error('Error fetching metrics:', error);
+                    // Keep the old values in case of error
                 });
         }
 
         setInterval(updateMetrics, 2000);
         updateMetrics(); // Initial call
+    </script>
+    <script>
+        // Load current hosts file content on page load
+        window.onload = function() {
+            fetch('/api/hosts/content')
+            .then(response => {
+                if (response.ok) {
+                    return response.text();
+                }
+                return "# Failed to load hosts content";
+            })
+            .then(content => {
+                const contentElement = document.getElementById('content');
+                if (contentElement) {
+                    contentElement.value = content;
+                }
+            })
+            .catch(error => {
+                console.error('Error loading hosts content:', error);
+            });
+        };
     </script>
 </body>
 </html>

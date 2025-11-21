@@ -164,3 +164,21 @@ func (p *HostsPlugin) GetConfigFields() []plugins.ConfigField {
 		},
 	}
 }
+
+// GetFilePath returns the hosts file path
+func (p *HostsPlugin) GetFilePath() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.filePath
+}
+
+// ReadFileContent reads and returns the content of the hosts file
+func (p *HostsPlugin) ReadFileContent() (string, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	content, err := os.ReadFile(p.filePath)
+	if err != nil {
+		return "", err
+	}
+	return string(content), nil
+}

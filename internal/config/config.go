@@ -1,6 +1,11 @@
 package config
 
-import "time"
+import (
+	"os"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
 
 // Config holds the configuration for the DNS resolver.
 type Config struct {
@@ -23,6 +28,10 @@ type Config struct {
 	// Hosts file plugin settings
 	HostsEnabled bool
 	HostsPath    string
+
+	// AdBlock plugin settings
+	AdblockEnabled  bool
+	AdblockListURLs []string
 
 	// Rate limit plugin settings
 	RateLimitEnabled bool
@@ -56,10 +65,21 @@ func NewConfig() *Config {
 		ResolverType:         "knot", // Default to Knot resolver
 		HostsEnabled:         true,
 		HostsPath:            "hosts",
+		AdblockEnabled:       true,
+		AdblockListURLs:      []string{"https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"},
 		RateLimitEnabled:     true,
 		RateLimitQPS:         50,
 		RateLimitBurst:       20,
 		AdminAddr:            "0.0.0.0:8080",
 		MetricsStoragePath:   "/tmp/dns_metrics.json",
 	}
+}
+
+// Save saves the configuration to a YAML file.
+func (c *Config) Save(path string) error {
+	data, err := yaml.Marshal(c)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
 }
