@@ -39,7 +39,7 @@ func (s *Server) buildAndSetHandler() {
 		}
 
 		// Execute request plugins
-		pluginCtx := &plugins.PluginContext{ResponseWriter: w}
+		pluginCtx := &plugins.PluginContext{ResponseWriter: w, Metrics: s.metrics}
 		if s.pluginManager.ExecutePlugins(pluginCtx, w, r) {
 			// A plugin has already handled the request.
 			// The plugin is responsible for writing the response.
@@ -94,7 +94,11 @@ func (s *Server) startListener(net string) {
 // metricsWrapper is a middleware that increments the query counter.
 func (s *Server) metricsWrapper(h dns.Handler) dns.Handler {
 	return dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
-		s.metrics.IncrementQueries()
+		domain := ""
+		if len(r.Question) > 0 {
+			domain = r.Question[0].Name
+		}
+		s.metrics.IncrementQueries(domain)
 		h.ServeDNS(w, r)
 	})
 }
