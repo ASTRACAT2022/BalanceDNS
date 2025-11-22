@@ -376,7 +376,7 @@ func (s *Server) saveConfig() error {
 	}
 
 	// Update only the adblock list URLs
-	cfg.AdblockListURLs = s.adblock.GetBlocklists()
+	cfg.AdBlock.BlocklistURLs = s.adblock.GetBlocklists()
 
 	// Write the updated config back to file
 	if err := cfg.Save(s.configPath); err != nil {

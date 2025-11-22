@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"log"
+	"net/http"
 
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/metrics"
@@ -11,6 +13,7 @@ import (
 	"dns-resolver/internal/resolver"
 	"github.com/miekg/dns"
 )
+
 // Server holds the server state.
 type Server struct {
 	config        *config.Config
@@ -53,7 +56,7 @@ func (s *Server) buildAndSetHandler() {
 		req.RecursionDesired = true
 		req.SetEdns0(4096, true)
 
-		ctx, cancel := context.WithTimeout(context.Background(), s.config.RequestTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), s.config.Resolver.RequestTimeout)
 		defer cancel()
 
 		msg, err := s.resolver.Resolve(ctx, req)
@@ -76,16 +79,63 @@ func (s *Server) buildAndSetHandler() {
 
 // ListenAndServe starts the DNS server.
 func (s *Server) ListenAndServe() {
-	go s.startListener("udp")
-	go s.startListener("tcp")
+	go s.startListener("udp", s.config.ListenAddr)
+	go s.startListener("tcp", s.config.ListenAddr)
+
+	if s.config.DoT.Enabled {
+		go s.startTlsListener("tcp-tls", s.config.DoT.ListenAddr, s.config.DoT.CertFile, s.config.DoT.KeyFile)
+	}
+
+	if s.config.DoH.Enabled {
+		go s.startDoHListener()
+	}
 
 	log.Printf("ASTRACAT DNS Resolver is running on %s", s.config.ListenAddr)
 	select {} // Block forever
 }
 
-func (s *Server) startListener(net string) {
-	server := &dns.Server{Addr: s.config.ListenAddr, Net: net, Handler: s.handler}
-	log.Printf("Starting %s listener on %s", net, s.config.ListenAddr)
+func (s *Server) startDoHListener() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dns-query", s.dohHandler)
+
+	httpServer := &http.Server{
+		Addr:    s.config.DoH.ListenAddr,
+		Handler: mux,
+	}
+
+	log.Printf("Starting DoH listener on %s", s.config.DoH.ListenAddr)
+	if err := httpServer.ListenAndServeTLS(s.config.DoH.CertFile, s.config.DoH.KeyFile); err != nil {
+		log.Printf("Failed to start DoH listener: %s", err)
+	}
+}
+
+func (s *Server) startListener(net, addr string) {
+	server := &dns.Server{Addr: addr, Net: net, Handler: s.handler}
+	log.Printf("Starting %s listener on %s", net, addr)
+	if err := server.ListenAndServe(); err != nil {
+		log.Printf("Failed to start %s listener: %s", net, err)
+	}
+}
+
+func (s *Server) startTlsListener(net, addr, certFile, keyFile string) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		log.Printf("Failed to load TLS key pair for %s: %v", net, err)
+		return
+	}
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+	}
+
+	server := &dns.Server{
+		Addr:      addr,
+		Net:       net,
+		Handler:   s.handler,
+		TLSConfig: tlsConfig,
+	}
+
+	log.Printf("Starting %s listener on %s", net, addr)
 	if err := server.ListenAndServe(); err != nil {
 		log.Printf("Failed to start %s listener: %s", net, err)
 	}

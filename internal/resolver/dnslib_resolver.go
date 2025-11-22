@@ -61,7 +61,7 @@ func (r *DnslibResolver) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, e
 	msg.Id = req.Id
 
 	// Cache the response
-	r.cache.Set(key, msg, r.config.StaleWhileRevalidate)
+	r.cache.Set(key, msg, r.config.Cache.StaleWhileRevalidate)
 
 	return msg, nil
 }

@@ -37,12 +37,12 @@ func NewGoDNSResolver(cfg *config.Config, c *cache.Cache, m *metrics.Metrics) *G
 		cache:  c,
 		sf:     singleflight.Group{},
 		client: &dns.Client{
-			Timeout: cfg.UpstreamTimeout,
+			Timeout: cfg.Resolver.UpstreamTimeout,
 			Dialer: &net.Dialer{
-				Timeout: cfg.UpstreamTimeout,
+				Timeout: cfg.Resolver.UpstreamTimeout,
 			},
 		},
-		workerPool: NewWorkerPool(cfg.MaxWorkers),
+		workerPool: NewWorkerPool(cfg.Resolver.MaxWorkers),
 		metrics:    m,
 		// Root servers list - the authoritative DNS servers for the root zone
 		rootServers: []string{
@@ -99,7 +99,7 @@ func (r *GoDNSResolver) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 					}
 					defer r.workerPool.Release()
 
-					ctx, cancel := context.WithTimeout(context.Background(), r.config.UpstreamTimeout)
+					ctx, cancel := context.WithTimeout(context.Background(), r.config.Resolver.UpstreamTimeout)
 					defer cancel()
 
 					// Create a new request for revalidation
@@ -119,7 +119,7 @@ func (r *GoDNSResolver) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 					}
 
 					if msg, ok := res.(*dns.Msg); ok {
-						r.cache.Set(key, msg, r.config.StaleWhileRevalidate)
+						r.cache.Set(key, msg, r.config.Cache.StaleWhileRevalidate)
 						log.Printf("Successfully revalidated and updated cache for %s", q.Name)
 					}
 				}()
@@ -141,7 +141,7 @@ func (r *GoDNSResolver) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 	msg.Id = req.Id
 
 	// Cache the response
-	r.cache.Set(key, msg, r.config.StaleWhileRevalidate)
+	r.cache.Set(key, msg, r.config.Cache.StaleWhileRevalidate)
 
 	return msg, nil
 }
@@ -406,7 +406,7 @@ func (r *GoDNSResolver) resolveNameToIP(ctx context.Context, name string) ([]str
 // sendQuery sends a single DNS query to the specified server
 func (r *GoDNSResolver) sendQuery(ctx context.Context, req *dns.Msg, server string) (*dns.Msg, error) {
 	// Create a context with a deadline for this specific query
-	queryCtx, cancel := context.WithTimeout(ctx, r.config.UpstreamTimeout/3) // Use 1/3 of timeout per attempt
+	queryCtx, cancel := context.WithTimeout(ctx, r.config.Resolver.UpstreamTimeout/3) // Use 1/3 of timeout per attempt
 	defer cancel()
 
 	// Use the client to send the query
