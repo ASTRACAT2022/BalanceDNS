@@ -4,27 +4,25 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"time"
 
+	"dns-resolver/internal/admin"
 	"dns-resolver/internal/cache"
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
 	"dns-resolver/internal/resolver"
-	"dns-resolver/internal/admin"
 	"dns-resolver/internal/server"
 	"dns-resolver/plugins/adblock"
 	"dns-resolver/plugins/example_logger"
 	"dns-resolver/plugins/hosts"
-	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// Старая функция больше не используется, так как теперь используем метод из пакета metrics
-
 func main() {
 	log.SetOutput(os.Stdout)
-	log.Println("Booting up ASTRACAT Relover...")
+	log.Println("Booting up ASTRACAT Resolver...")
 
 	// Load configuration
 	cfg := config.NewConfig()
@@ -42,11 +40,11 @@ func main() {
 	m := metrics.NewMetrics(cfg.MetricsStoragePath)
 
 	// Create cache and resolver
-	c := cache.NewCache(cfg.CacheSize, cache.DefaultShards, cfg.LMDBPath, m)
+	c := cache.NewCache(cfg.Cache.Size, cache.DefaultShards, cfg.Cache.LMDBPath, m)
 	defer c.Close()
-	
+
 	// Create resolver based on configuration
-	res, err := resolver.NewResolver(resolver.ResolverType(cfg.ResolverType), cfg, c, m)
+	res, err := resolver.NewResolver(resolver.ResolverType(cfg.Resolver.Type), cfg, c, m)
 	if err != nil {
 		log.Fatalf("Failed to create resolver: %v", err)
 	}
@@ -62,24 +60,13 @@ func main() {
 	loggerPlugin := example_logger.New()
 	pm.Register(loggerPlugin)
 
-
-
 	// Initialize and register the adblock plugin
-	// Use blocklists from configuration
-	adBlockPlugin := adblock.New(cfg.AdblockListURLs, 24*time.Hour)
+	adBlockPlugin := adblock.New(cfg.AdBlock.BlocklistURLs, 24*time.Hour)
 	pm.Register(adBlockPlugin)
 
 	// Initialize and register the hosts plugin
-	var hostsPlugin *hosts.HostsPlugin
-	if cfg.HostsEnabled {
-		hostsPlugin = hosts.New(cfg.HostsPath)
-		pm.Register(hostsPlugin)
-	} else {
-		// Initialize hosts plugin with default path even if not explicitly enabled
-		// This allows it to be enabled via admin panel later
-		hostsPlugin = hosts.New(cfg.HostsPath)
-		pm.Register(hostsPlugin)
-	}
+	hostsPlugin := hosts.New(cfg.Hosts.Path)
+	pm.Register(hostsPlugin)
 
 	// Start the admin server
 	if cfg.AdminAddr != "" {

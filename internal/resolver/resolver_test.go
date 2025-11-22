@@ -20,8 +20,9 @@ func TestResolver_Resolve(t *testing.T) {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(dir)
+	cfg.Cache.LMDBPath = dir
 	m := metrics.NewMetrics("")
-	c := cache.NewCache(cache.DefaultCacheSize, cache.DefaultShards, dir, m)
+	c := cache.NewCache(cfg.Cache.Size, cache.DefaultShards, cfg.Cache.LMDBPath, m)
 	defer c.Close()
 	r, err := NewResolver(ResolverTypeDnslib, cfg, c, m)
 	if err != nil {
@@ -68,14 +69,15 @@ func TestResolver_Resolve(t *testing.T) {
 func TestResolver_Resolve_DNSSEC(t *testing.T) {
 	cfg := config.NewConfig()
 	// Use a longer timeout for DNSSEC queries as they can be slower.
-	cfg.RequestTimeout = 20 * time.Second
+	cfg.Resolver.RequestTimeout = 20 * time.Second
 	dir, err := os.MkdirTemp("", "test-resolver-dnssec-lmdb")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(dir)
+	cfg.Cache.LMDBPath = dir
 	m := metrics.NewMetrics("")
-	c := cache.NewCache(cache.DefaultCacheSize, cache.DefaultShards, dir, m)
+	c := cache.NewCache(cfg.Cache.Size, cache.DefaultShards, cfg.Cache.LMDBPath, m)
 	defer c.Close()
 	r, err := NewResolver(ResolverTypeDnslib, cfg, c, m)
 	if err != nil {
@@ -126,7 +128,7 @@ func TestResolver_Resolve_DNSSEC(t *testing.T) {
 			req.SetQuestion(tc.domain, tc.qtype)
 			req.SetEdns0(4096, true)
 
-			ctx, cancel := context.WithTimeout(context.Background(), cfg.RequestTimeout)
+			ctx, cancel := context.WithTimeout(context.Background(), cfg.Resolver.RequestTimeout)
 			defer cancel()
 
 			msg, err := r.Resolve(ctx, req)
