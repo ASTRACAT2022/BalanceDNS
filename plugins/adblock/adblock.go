@@ -198,17 +198,18 @@ func (p *AdBlockPlugin) UpdateBlocklists() {
 			// For hosts file format: IP domain [additional domains]
 			if len(parts) >= 2 {
 				ip := net.ParseIP(parts[0])
-				if ip != nil { // It's a hosts file format
-					for i := 1; i < len(parts); i++ {
-						domain := strings.TrimSpace(parts[i])
-						if domain != "" && !strings.HasPrefix(domain, "#") {
-							// Stop processing remaining parts if we encounter a comment
+				if ip != nil {
+					// Only block domains associated with 0.0.0.0 or ::
+					if ip.IsUnspecified() {
+						for i := 1; i < len(parts); i++ {
+							domain := strings.TrimSpace(parts[i])
 							if strings.HasPrefix(domain, "#") {
 								break
 							}
-							// Handle wildcard domains (starting with 0.0.0.0 or other IPs)
-							domain = strings.ToLower(domain)
-							newExactBlocked[domain] = struct{}{}
+							if domain != "" {
+								domain = strings.ToLower(domain)
+								newExactBlocked[domain] = struct{}{}
+							}
 						}
 					}
 				} else {
