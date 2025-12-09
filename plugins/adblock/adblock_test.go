@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 )
@@ -35,33 +34,19 @@ func TestAdBlockPlugin_UpdateBlocklists_WithHostsFormat(t *testing.T) {
 		expected bool
 	}{
 		{"example.com", true},
-		{"www.example.com", false}, // Exact match only
+		{"www.example.com", true}, // Subdomain should be blocked
 		{"another-domain.org", true},
-		{"sub.another-domain.org", false}, // Exact match only
+		{"sub.another-domain.org", true}, // Subdomain should be blocked
 		{"localhost", false}, // Should not be blocked as it's not 0.0.0.0
 		{"google.com", false},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.domain, func(t *testing.T) {
-			isBlocked := plugin.isDomainBlocked(tc.domain)
+			_, isBlocked := plugin.filter.Match(tc.domain)
 			if isBlocked != tc.expected {
 				t.Errorf("Expected domain %s to be blocked=%v, but got %v", tc.domain, tc.expected, isBlocked)
 			}
 		})
-	}
-
-	// Verify the number of blocked domains
-	plugin.mu.RLock()
-	defer plugin.mu.RUnlock()
-	expectedBlockedCount := 2
-	if len(plugin.exactBlocked) != expectedBlockedCount {
-		t.Errorf("Expected %d exact domains to be blocked, but got %d", expectedBlockedCount, len(plugin.exactBlocked))
-		// Log the actual blocked domains for debugging
-		blockedDomains := make([]string, 0, len(plugin.exactBlocked))
-		for domain := range plugin.exactBlocked {
-			blockedDomains = append(blockedDomains, domain)
-		}
-		t.Logf("Blocked domains: %s", strings.Join(blockedDomains, ", "))
 	}
 }
