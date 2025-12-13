@@ -1,7 +1,6 @@
 package cache
 
 import (
-	"bytes"
 	"dns-resolver/internal/metrics"
 	"encoding/binary"
 	"fmt"
@@ -32,63 +31,42 @@ type FixedSizeCacheItem struct {
 
 // Pack serializes the FixedSizeCacheItem into bytes
 func (f *FixedSizeCacheItem) Pack() ([]byte, error) {
-	buf := new(bytes.Buffer)
-	
-	// Write fixed-size metadata
-	err := binary.Write(buf, binary.BigEndian, f.ExpirationUnix)
-	if err != nil {
-		return nil, err
-	}
-	err = binary.Write(buf, binary.BigEndian, f.StaleWhileRevalidateNanoseconds)
-	if err != nil {
-		return nil, err
-	}
-	err = binary.Write(buf, binary.BigEndian, f.MsgBytesLength)
-	if err != nil {
-		return nil, err
-	}
-	
-	// Write variable-length message bytes
-	_, err = buf.Write(f.MsgBytes)
-	if err != nil {
-		return nil, err
-	}
-	
-	return buf.Bytes(), nil
+	// Allocate a buffer with enough space for all data.
+	// 24 bytes for fixed-size metadata + length of the message bytes.
+	buf := make([]byte, 24+f.MsgBytesLength)
+
+	// Use binary.BigEndian to write fixed-size metadata directly to the byte slice.
+	binary.BigEndian.PutUint64(buf[0:8], uint64(f.ExpirationUnix))
+	binary.BigEndian.PutUint64(buf[8:16], uint64(f.StaleWhileRevalidateNanoseconds))
+	binary.BigEndian.PutUint32(buf[16:20], f.MsgBytesLength)
+	// The next 4 bytes are padding and are left as zero.
+
+	// Copy the variable-length message bytes into the buffer.
+	copy(buf[24:], f.MsgBytes)
+
+	return buf, nil
 }
 
 // Unpack deserializes bytes into FixedSizeCacheItem
 func (f *FixedSizeCacheItem) Unpack(data []byte) error {
-	if len(data) < 24 { // 8*3 bytes for the fixed-size fields
-		return fmt.Errorf("data too short")
+	if len(data) < 24 { // Minimum length for the fixed-size metadata.
+		return fmt.Errorf("data too short for unpacking")
 	}
-	
-	buf := bytes.NewReader(data)
-	
-	err := binary.Read(buf, binary.BigEndian, &f.ExpirationUnix)
-	if err != nil {
-		return err
+
+	// Read fixed-size metadata directly from the byte slice.
+	f.ExpirationUnix = int64(binary.BigEndian.Uint64(data[0:8]))
+	f.StaleWhileRevalidateNanoseconds = int64(binary.BigEndian.Uint64(data[8:16]))
+	f.MsgBytesLength = binary.BigEndian.Uint32(data[16:20])
+	// Bytes 20-24 are padding.
+
+	// Check if the remaining data length matches the expected message length.
+	if uint32(len(data)-24) < f.MsgBytesLength {
+		return fmt.Errorf("message bytes length mismatch: expected %d, got %d", f.MsgBytesLength, len(data)-24)
 	}
-	err = binary.Read(buf, binary.BigEndian, &f.StaleWhileRevalidateNanoseconds)
-	if err != nil {
-		return err
-	}
-	err = binary.Read(buf, binary.BigEndian, &f.MsgBytesLength)
-	if err != nil {
-		return err
-	}
-	
-	remaining := buf.Len()
-	if uint32(remaining) < f.MsgBytesLength {
-		return fmt.Errorf("message bytes length mismatch")
-	}
-	
-	f.MsgBytes = make([]byte, f.MsgBytesLength)
-	_, err = buf.Read(f.MsgBytes)
-	if err != nil {
-		return err
-	}
-	
+
+	// Slice the message bytes directly from the input data.
+	f.MsgBytes = data[24 : 24+f.MsgBytesLength]
+
 	return nil
 }
 
@@ -101,11 +79,18 @@ type CacheItem struct {
 
 // Cache is a thread-safe, sharded DNS cache with SLRU eviction policy and LMDB persistence.
 type Cache struct {
-	fastCache *FastCache
-	lmdbEnv   *lmdb.Env
-	lmdbDBI   lmdb.DBI
-	metrics   *metrics.Metrics
-	wg        sync.WaitGroup
+	fastCache    *FastCache
+	lmdbEnv      *lmdb.Env
+	lmdbDBI      lmdb.DBI
+	metrics      *metrics.Metrics
+	writeChan    chan *persistentCacheItemWrapper
+	wg           sync.WaitGroup
+	shutdownChan chan struct{}
+}
+
+type persistentCacheItemWrapper struct {
+	key  string
+	item *FixedSizeCacheItem
 }
 
 // NewCache creates and returns a new Cache with LMDB persistence.
@@ -150,19 +135,45 @@ func NewCache(size int, numShards int, lmdbPath string, m *metrics.Metrics) *Cac
 	}
 
 	c := &Cache{
-		fastCache: NewFastCache(size, numShards),
-		lmdbEnv:   env,
-		lmdbDBI:   dbi,
-		metrics:   m,
+		fastCache:    NewFastCache(size, numShards),
+		lmdbEnv:      env,
+		lmdbDBI:      dbi,
+		metrics:      m,
+		writeChan:    make(chan *persistentCacheItemWrapper, 1024),
+		shutdownChan: make(chan struct{}),
 	}
 
 	c.loadFromDB()
+	c.startWriter()
 
 	return c
 }
 
+func (c *Cache) startWriter() {
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		for itemWrapper := range c.writeChan {
+			packedData, err := itemWrapper.item.Pack()
+			if err != nil {
+				log.Printf("Failed to pack cache item for key %s: %v", itemWrapper.key, err)
+				continue
+			}
+
+			err = c.lmdbEnv.Update(func(txn *lmdb.Txn) error {
+				return txn.Put(c.lmdbDBI, []byte(itemWrapper.key), packedData, 0)
+			})
+			if err != nil {
+				c.metrics.IncrementLMDBErrors()
+				log.Printf("Failed to write to LMDB for key %s: %v", itemWrapper.key, err)
+			}
+		}
+	}()
+}
+
 // Close gracefully closes the cache and its underlying LMDB environment.
 func (c *Cache) Close() {
+	close(c.writeChan)
 	c.wg.Wait()
 	if c.lmdbEnv != nil {
 		c.lmdbEnv.Close()
@@ -261,30 +272,18 @@ func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
 
 	c.fastCache.Set(key, packedMsg, time.Duration(ttl)*time.Second, swr)
 
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		fItem := FixedSizeCacheItem{
-			ExpirationUnix:                  expiration.Unix(),
-			StaleWhileRevalidateNanoseconds: int64(swr),
-			MsgBytesLength:                  uint32(len(packedMsg)),
-			MsgBytes:                        packedMsg,
-		}
+	fItem := &FixedSizeCacheItem{
+		ExpirationUnix:                  expiration.Unix(),
+		StaleWhileRevalidateNanoseconds: int64(swr),
+		MsgBytesLength:                  uint32(len(packedMsg)),
+		MsgBytes:                        packedMsg,
+	}
 
-		packedData, err := fItem.Pack()
-		if err != nil {
-			log.Printf("Failed to pack cache item for key %s: %v", key, err)
-			return
-		}
-
-		err = c.lmdbEnv.Update(func(txn *lmdb.Txn) error {
-			return txn.Put(c.lmdbDBI, []byte(key), packedData, 0)
-		})
-		if err != nil {
-			c.metrics.IncrementLMDBErrors()
-			log.Printf("Failed to write to LMDB for key %s: %v", key, err)
-		}
-	}()
+	select {
+	case c.writeChan <- &persistentCacheItemWrapper{key: key, item: fItem}:
+	default:
+		log.Printf("Warning: Cache write channel is full. Discarding write for key: %s", key)
+	}
 }
 
 func Key(q dns.Question) string {
