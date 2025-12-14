@@ -40,11 +40,15 @@ func (r *DnslibResolver) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, e
 	key := cache.Key(q)
 
 	// Check the cache first.
-	if cachedMsg, found, _ := r.cache.Get(key); found {
-		log.Printf("Cache hit for %s", q.Name)
-		r.metrics.IncrementCacheHits()
-		cachedMsg.Id = req.Id
-		return cachedMsg, nil
+	if cachedBytes, found, _ := r.cache.Get(key); found {
+		cachedMsg := new(dns.Msg)
+		err := cachedMsg.Unpack(cachedBytes)
+		if err == nil {
+			log.Printf("Cache hit for %s", q.Name)
+			cachedMsg.Id = req.Id
+			return cachedMsg, nil
+		}
+		log.Printf("Failed to unpack cached message for %s: %v", q.Name, err)
 	}
 
 	// Use singleflight to ensure only one lookup for a given question is in flight at a time.
