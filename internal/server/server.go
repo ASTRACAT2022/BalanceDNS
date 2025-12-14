@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"log"
 	"net/http"
+	"time"
 
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/metrics"
@@ -82,29 +83,48 @@ func (s *Server) ListenAndServe() {
 	go s.startListener("udp", s.config.ListenAddr)
 	go s.startListener("tcp", s.config.ListenAddr)
 
-	if s.config.DoT.Enabled {
-		go s.startTlsListener("tcp-tls", s.config.DoT.ListenAddr, s.config.DoT.CertFile, s.config.DoT.KeyFile)
+	var tlsConfig *tls.Config
+	// If either DoT or DoH is enabled, create a shared TLS config.
+	if s.config.DoT.Enabled || s.config.DoH.Enabled {
+		// Assuming DoT and DoH use the same certificate and key.
+		cert, err := tls.LoadX509KeyPair(s.config.DoT.CertFile, s.config.DoT.KeyFile)
+		if err != nil {
+			log.Fatalf("Failed to load TLS key pair: %v", err)
+		}
+		tlsConfig = &tls.Config{
+			Certificates:       []tls.Certificate{cert},
+			ClientSessionCache: tls.NewLRUClientSessionCache(128), // Enable session resumption
+		}
 	}
 
-	if s.config.DoH.Enabled {
-		go s.startDoHListener()
+	if s.config.DoT.Enabled && tlsConfig != nil {
+		go s.startTlsListener("tcp-tls", s.config.DoT.ListenAddr, tlsConfig)
+	}
+
+	if s.config.DoH.Enabled && tlsConfig != nil {
+		go s.startDoHListener(tlsConfig)
 	}
 
 	log.Printf("ASTRACAT DNS Resolver is running on %s", s.config.ListenAddr)
 	select {} // Block forever
 }
 
-func (s *Server) startDoHListener() {
+func (s *Server) startDoHListener(tlsConfig *tls.Config) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", s.dohHandler)
 
 	httpServer := &http.Server{
-		Addr:    s.config.DoH.ListenAddr,
-		Handler: mux,
+		Addr:         s.config.DoH.ListenAddr,
+		Handler:      mux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
+		IdleTimeout:  120 * time.Second,
+		TLSConfig:    tlsConfig,
 	}
 
 	log.Printf("Starting DoH listener on %s", s.config.DoH.ListenAddr)
-	if err := httpServer.ListenAndServeTLS(s.config.DoH.CertFile, s.config.DoH.KeyFile); err != nil {
+	// Cert/key files are empty because they are in TLSConfig
+	if err := httpServer.ListenAndServeTLS("", ""); err != nil {
 		log.Printf("Failed to start DoH listener: %s", err)
 	}
 }
@@ -117,17 +137,7 @@ func (s *Server) startListener(net, addr string) {
 	}
 }
 
-func (s *Server) startTlsListener(net, addr, certFile, keyFile string) {
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		log.Printf("Failed to load TLS key pair for %s: %v", net, err)
-		return
-	}
-
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-	}
-
+func (s *Server) startTlsListener(net, addr string, tlsConfig *tls.Config) {
 	server := &dns.Server{
 		Addr:      addr,
 		Net:       net,

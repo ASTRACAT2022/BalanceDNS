@@ -237,23 +237,14 @@ func (c *Cache) deleteFromDB(key string) {
 	}
 }
 
-func (c *Cache) Get(key string) (*dns.Msg, bool, bool) {
+func (c *Cache) Get(key string) ([]byte, bool, bool) {
 	msgBytes, found, revalidate := c.fastCache.Get(key)
 	if !found {
 		c.metrics.IncrementCacheMisses()
 		return nil, false, false
 	}
-
-	msg := new(dns.Msg)
-	if err := msg.Unpack(msgBytes); err != nil {
-		log.Printf("Failed to unpack message from in-memory cache for key %s: %v", key, err)
-		c.metrics.IncrementCacheMisses()
-		return nil, false, false
-	}
-
 	c.metrics.IncrementCacheHits()
-	msg.Id = 0
-	return msg, true, revalidate
+	return msgBytes, true, revalidate
 }
 
 func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
