@@ -50,7 +50,8 @@ func TestCacheSetAndGet(t *testing.T) {
 
 	c.Set(key, msg, 0)
 
-	retrievedMsg, found, revalidate := c.Get(key)
+	retrievedMsg := new(dns.Msg)
+	found, revalidate := c.Get(key, retrievedMsg)
 	if !found {
 		t.Fatal("expected to find message in cache, but didn't")
 	}
@@ -69,7 +70,8 @@ func TestCacheNotFound(t *testing.T) {
 	q := dns.Question{Name: "notfound.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	key := Key(q)
 
-	_, found, _ := c.Get(key)
+	msg := new(dns.Msg)
+	found, _ := c.Get(key, msg)
 	if found {
 		t.Fatal("expected to not find message in cache, but did")
 	}
@@ -87,7 +89,8 @@ func TestCacheExpiration(t *testing.T) {
 
 	time.Sleep(1100 * time.Millisecond)
 
-	_, found, _ := c.Get(key)
+	retrievedMsg := new(dns.Msg)
+	found, _ := c.Get(key, retrievedMsg)
 	if found {
 		t.Fatal("expected message to be expired and not found, but it was found")
 	}
@@ -115,7 +118,8 @@ func TestCachePersistence(t *testing.T) {
 	defer c2.Close()
 
 	// Verify the item is present in the new cache.
-	retrievedMsg, found, _ := c2.Get(key)
+	retrievedMsg := new(dns.Msg)
+	found, _ := c2.Get(key, retrievedMsg)
 	if !found {
 		t.Fatal("expected to find message in persisted cache, but didn't")
 	}
@@ -152,7 +156,8 @@ func TestCachePersistenceExpiration(t *testing.T) {
 	defer c2.Close()
 
 	// The expired item should not be loaded.
-	_, found, _ := c2.Get(key)
+	retrievedMsg := new(dns.Msg)
+	found, _ := c2.Get(key, retrievedMsg)
 	if found {
 		t.Fatal("found an expired message in the cache, but it should have been ignored on load")
 	}
@@ -173,7 +178,8 @@ func TestCacheStaleWhileRevalidate(t *testing.T) {
 	// Wait for item to become stale but not fully expired from SWR window
 	time.Sleep(1100 * time.Millisecond)
 
-	retrievedMsg, found, revalidate := c.Get(key)
+	retrievedMsg := new(dns.Msg)
+	found, revalidate := c.Get(key, retrievedMsg)
 	if !found {
 		t.Fatal("expected to get stale message, but got nothing")
 	}
@@ -191,7 +197,7 @@ func TestCacheStaleWhileRevalidate(t *testing.T) {
 	time.Sleep(swrDuration)
 
 	// After the SWR window, the item should be gone
-	_, found, _ = c.Get(key)
+	found, _ = c.Get(key, retrievedMsg)
 	if found {
 		t.Fatal("expected message to be expired and not found after SWR window, but it was found")
 	}
@@ -233,9 +239,12 @@ func BenchmarkCacheGet(b *testing.B) {
 	c.Set(key, msg, 0)
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		c.Get(key)
-	}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			msg := new(dns.Msg)
+			c.Get(key, msg)
+		}
+	})
 }
 
 func BenchmarkFastCacheSetAndGet(b *testing.B) {

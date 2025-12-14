@@ -47,13 +47,6 @@ rate_limit:
   qps: 100
   burst: 200
 
-# HTTPS RR plugin
-httpsrr:
-  enabled: true
-  records:
-    - domain: "example.com"
-      ech: "AAEAAQAB//8=" # Placeholder ECH value
-
 # DNS-over-HTTPS (DoH) settings
 doh:
   enabled: true

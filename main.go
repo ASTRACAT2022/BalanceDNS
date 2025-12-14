@@ -16,7 +16,6 @@ import (
 	"dns-resolver/plugins/adblock"
 	"dns-resolver/plugins/example_logger"
 	"dns-resolver/plugins/hosts"
-	"dns-resolver/plugins/httpsrr"
 
 	"gopkg.in/yaml.v3"
 )
@@ -68,12 +67,6 @@ func main() {
 	// Initialize and register the hosts plugin
 	hostsPlugin := hosts.New(cfg.Hosts.Path)
 	pm.Register(hostsPlugin)
-
-	// Initialize and register the HTTPS RR plugin
-	if cfg.HttpsRR.Enabled {
-		httpsRRPlugin := httpsrr.New(cfg.HttpsRR.Records)
-		pm.Register(httpsRRPlugin)
-	}
 
 	// Start the admin server
 	if cfg.AdminAddr != "" {

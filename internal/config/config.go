@@ -18,7 +18,6 @@ type Config struct {
 	Hosts              HostsConfig     `yaml:"hosts"`
 	AdBlock            AdBlockConfig   `yaml:"adblock"`
 	RateLimit          RateLimitConfig `yaml:"rate_limit"`
-	HttpsRR            HttpsRRConfig   `yaml:"httpsrr"`
 	DoH                DoHConfig       `yaml:"doh"`
 	DoT                DoTConfig       `yaml:"dot"`
 }
@@ -75,18 +74,6 @@ type DoTConfig struct {
 	KeyFile    string `yaml:"key_file"`
 }
 
-// HttpsRRRecordConfig holds a single HTTPS RR record.
-type HttpsRRRecordConfig struct {
-	Domain string `yaml:"domain"`
-	ECH    string `yaml:"ech"`
-}
-
-// HttpsRRConfig holds settings for the HTTPS RR plugin.
-type HttpsRRConfig struct {
-	Enabled bool                  `yaml:"enabled"`
-	Records []HttpsRRRecordConfig `yaml:"records"`
-}
-
 // NewConfig returns a new Config with default values.
 func NewConfig() *Config {
 	return &Config{
@@ -133,10 +120,6 @@ func NewConfig() *Config {
 			ListenAddr: "0.0.0.0:853",
 			CertFile:   "",
 			KeyFile:    "",
-		},
-		HttpsRR: HttpsRRConfig{
-			Enabled: false,
-			Records: []HttpsRRRecordConfig{},
 		},
 	}
 }

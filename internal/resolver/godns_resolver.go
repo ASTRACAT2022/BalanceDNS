@@ -13,6 +13,7 @@ import (
 	"dns-resolver/internal/cache"
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/metrics"
+	"dns-resolver/internal/pool"
 
 	"github.com/miekg/dns"
 	"golang.org/x/sync/singleflight"
@@ -81,52 +82,46 @@ func (r *GoDNSResolver) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 	key := cache.Key(q)
 
 	// Check the cache first.
-	if msg, found, revalidate := r.cache.Get(key); found {
+	msgFromPool := pool.GetDnsMsg()
+	if found, revalidate := r.cache.Get(key, msgFromPool); found {
 		log.Printf("Cache hit for %s (revalidate: %t)", q.Name, revalidate)
-		if msg == nil {
-			log.Printf("Cache returned nil message for key %s", key)
-			// Treat as cache miss and proceed to resolve
-		} else {
-			msg.Id = req.Id
+		msgFromPool.Id = req.Id
 
-			if revalidate {
-				r.metrics.IncrementCacheRevalidations()
-				// Trigger a background revalidation using the worker pool
-				go func() {
-					if err := r.workerPool.Acquire(context.Background()); err != nil {
-						log.Printf("Failed to acquire worker for revalidation: %v", err)
-						return
-					}
-					defer r.workerPool.Release()
+		if revalidate {
+			r.metrics.IncrementCacheRevalidations()
+			// Create a deep copy for the background revalidation to avoid race conditions.
+			msgForRevalidation := msgFromPool.Copy()
+			// Trigger a background revalidation using the worker pool
+			go func() {
+				defer pool.PutDnsMsg(msgForRevalidation) // Return the copied message to the pool.
+				if err := r.workerPool.Acquire(context.Background()); err != nil {
+					log.Printf("Failed to acquire worker for revalidation: %v", err)
+					return
+				}
+				defer r.workerPool.Release()
 
-					ctx, cancel := context.WithTimeout(context.Background(), r.config.Resolver.UpstreamTimeout)
-					defer cancel()
+				ctx, cancel := context.WithTimeout(context.Background(), r.config.Resolver.UpstreamTimeout)
+				defer cancel()
 
-					// Create a new request for revalidation
-					revalidationReq := new(dns.Msg)
-					revalidationReq.SetQuestion(q.Name, q.Qtype)
-					revalidationReq.RecursionDesired = true
-					if opt := req.IsEdns0(); opt != nil {
-						revalidationReq.SetEdns0(opt.UDPSize(), opt.Do())
-					}
+				// Use the copied message for revalidation
+				res, err, _ := r.sf.Do(key+"-revalidate", func() (interface{}, error) {
+					return r.recursiveLookup(ctx, msgForRevalidation)
+				})
+				if err != nil {
+					log.Printf("Background revalidation failed for %s: %v", q.Name, err)
+					return
+				}
 
-					res, err, _ := r.sf.Do(key+"-revalidate", func() (interface{}, error) {
-						return r.recursiveLookup(ctx, revalidationReq)
-					})
-					if err != nil {
-						log.Printf("Background revalidation failed for %s: %v", q.Name, err)
-						return
-					}
-
-					if msg, ok := res.(*dns.Msg); ok {
-						r.cache.Set(key, msg, r.config.Cache.StaleWhileRevalidate)
-						log.Printf("Successfully revalidated and updated cache for %s", q.Name)
-					}
-				}()
-			}
-			return msg, nil
+				if msg, ok := res.(*dns.Msg); ok {
+					r.cache.Set(key, msg, r.config.Cache.StaleWhileRevalidate)
+					log.Printf("Successfully revalidated and updated cache for %s", q.Name)
+				}
+			}()
 		}
+		// The original message is returned to the caller, who is now responsible for putting it back in the pool.
+		return msgFromPool, nil
 	}
+	pool.PutDnsMsg(msgFromPool) // Return the message to the pool if not found in cache.
 
 	// Use singleflight to ensure only one lookup for a given question is in flight at once.
 	res, err, _ := r.sf.Do(key, func() (interface{}, error) {

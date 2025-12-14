@@ -7,6 +7,7 @@ import (
 	"dns-resolver/internal/cache"
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/metrics"
+	"dns-resolver/internal/pool"
 	"errors"
 	"github.com/miekg/dns"
 	"github.com/nsmithuk/resolver"
@@ -40,12 +41,15 @@ func (r *DnslibResolver) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, e
 	key := cache.Key(q)
 
 	// Check the cache first.
-	if cachedMsg, found, _ := r.cache.Get(key); found {
+	msgFromPool := pool.GetDnsMsg()
+	if found, _ := r.cache.Get(key, msgFromPool); found {
 		log.Printf("Cache hit for %s", q.Name)
 		r.metrics.IncrementCacheHits()
-		cachedMsg.Id = req.Id
-		return cachedMsg, nil
+		msgFromPool.Id = req.Id
+		// The caller is responsible for putting the message back in the pool.
+		return msgFromPool, nil
 	}
+	pool.PutDnsMsg(msgFromPool) // Return the message to the pool if not found in cache.
 
 	// Use singleflight to ensure only one lookup for a given question is in flight at a time.
 	r.metrics.IncrementCacheMisses()

@@ -66,6 +66,7 @@ func (s *Server) buildAndSetHandler() {
 			dns.HandleFailed(w, r)
 			return
 		}
+		defer pool.PutDnsMsg(msg)
 
 		s.metrics.RecordResponseCode(dns.RcodeToString[msg.Rcode])
 		msg.Id = r.Id
@@ -126,6 +127,8 @@ func (s *Server) startTlsListener(net, addr, certFile, keyFile string) {
 
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
+		SessionTicketsDisabled: false,
+		ClientSessionCache:     tls.NewLRUClientSessionCache(128),
 	}
 
 	server := &dns.Server{

@@ -7,7 +7,16 @@ import (
 	"net/http"
 
 	"github.com/miekg/dns"
+	"sync"
 )
+
+var dohWriterPool = sync.Pool{
+	New: func() interface{} {
+		return &dohResponseWriter{
+			headers: http.Header{},
+		}
+	},
+}
 
 // dohHandler is the HTTP handler for DoH requests.
 func (s *Server) dohHandler(w http.ResponseWriter, r *http.Request) {
@@ -42,10 +51,10 @@ func (s *Server) dohHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create a dummy ResponseWriter to capture the response
-	dummyWriter := &dohResponseWriter{
-		headers: http.Header{},
-	}
+	// Get a dummy ResponseWriter from the pool
+	dummyWriter := dohWriterPool.Get().(*dohResponseWriter)
+	defer dohWriterPool.Put(dummyWriter)
+	dummyWriter.msg = nil // Reset the message field
 
 	// Use the existing DNS handler
 	s.handler.ServeDNS(dummyWriter, msg)
