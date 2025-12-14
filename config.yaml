@@ -1,7 +1,7 @@
 # ASTRACAT Resolver Configuration
 
 # Address to listen on for standard DNS (UDP/TCP)
-listen_addr: "0.0.0.0:5053"
+listen_addr: "0.0.0.0:53"
 
 # Address to listen on for Prometheus metrics
 metrics_addr: "0.0.0.0:9090"
@@ -57,13 +57,13 @@ httpsrr:
 # DNS-over-HTTPS (DoH) settings
 doh:
   enabled: true
-  listen_addr: "0.0.0.0:8443"
+  listen_addr: "0.0.0.0:443"
   cert_file: "server.crt"
   key_file: "server.key"
 
 # DNS-over-TLS (DoT) settings
 dot:
   enabled: true
-  listen_addr: "0.0.0.0:8853"
+  listen_addr: "0.0.0.0:853"
   cert_file: "server.crt"
   key_file: "server.key"
