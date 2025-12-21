@@ -23,7 +23,7 @@ type GoDNSResolver struct {
 	config        *config.Config
 	cache         *cache.Cache
 	sf            singleflight.Group
-	client        *dns.Client
+	client        *DNSClient
 	workerPool    *WorkerPool
 	metrics       *metrics.Metrics
 	rootServers   []string
@@ -33,15 +33,10 @@ type GoDNSResolver struct {
 // NewGoDNSResolver creates a new Go DNS resolver instance.
 func NewGoDNSResolver(cfg *config.Config, c *cache.Cache, m *metrics.Metrics) *GoDNSResolver {
 	r := &GoDNSResolver{
-		config: cfg,
-		cache:  c,
-		sf:     singleflight.Group{},
-		client: &dns.Client{
-			Timeout: cfg.Resolver.UpstreamTimeout,
-			Dialer: &net.Dialer{
-				Timeout: cfg.Resolver.UpstreamTimeout,
-			},
-		},
+		config:     cfg,
+		cache:      c,
+		sf:         singleflight.Group{},
+		client:     NewDNSClient(cfg.Resolver.UpstreamTimeout),
 		workerPool: NewWorkerPool(cfg.Resolver.MaxWorkers),
 		metrics:    m,
 		// Root servers list - the authoritative DNS servers for the root zone
@@ -411,8 +406,8 @@ func (r *GoDNSResolver) sendQuery(ctx context.Context, req *dns.Msg, server stri
 	queryCtx, cancel := context.WithTimeout(ctx, r.config.Resolver.UpstreamTimeout/3) // Use 1/3 of timeout per attempt
 	defer cancel()
 
-	// Use the client to send the query
-	resp, _, err := r.client.ExchangeContext(queryCtx, req, server)
+	// Use the custom DNS client to send the query
+	resp, err := r.client.Exchange(queryCtx, req, server)
 	if err != nil {
 		return nil, err
 	}
@@ -483,5 +478,5 @@ func (r *GoDNSResolver) LookupWithoutCache(ctx context.Context, req *dns.Msg) (*
 
 // Close closes the resolver and frees resources.
 func (r *GoDNSResolver) Close() {
-	// No specific cleanup needed for this implementation
+	r.client.Close()
 }
