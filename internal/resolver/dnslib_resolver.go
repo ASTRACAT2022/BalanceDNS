@@ -45,8 +45,10 @@ func (r *DnslibResolver) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, e
 		err := cachedMsg.Unpack(cachedBytes)
 		if err == nil {
 			log.Printf("Cache hit for %s", q.Name)
-			cachedMsg.Id = req.Id
-			return cachedMsg, nil
+			// Clone the message to avoid race conditions if the cached message is modified elsewhere.
+			msg := cachedMsg.Copy()
+			msg.Id = req.Id
+			return msg, nil
 		}
 		log.Printf("Failed to unpack cached message for %s: %v", q.Name, err)
 	}

@@ -293,21 +293,24 @@ func fnv32(key string) uint32 {
 func getMinTTL(msg *dns.Msg) uint32 {
 	var minTTL uint32 = 0
 
-	if len(msg.Answer) > 0 {
-		minTTL = msg.Answer[0].Header().Ttl
-		for _, rr := range msg.Answer {
+	allRRs := append(append(msg.Answer, msg.Ns...), msg.Extra...)
+
+	if len(allRRs) > 0 {
+		// Initialize minTTL with the TTL of the first RR.
+		minTTL = allRRs[0].Header().Ttl
+		// Iterate over all RRs to find the minimum TTL.
+		for _, rr := range allRRs {
 			if rr.Header().Ttl < minTTL {
 				minTTL = rr.Header().Ttl
 			}
 		}
-	} else if len(msg.Ns) > 0 {
-		for _, rr := range msg.Ns {
-			if soa, ok := rr.(*dns.SOA); ok {
-				return soa.Minttl
-			}
-		}
+	} else {
+		// Fallback for messages with no RRs in Answer, NS, or Extra sections.
+		// This is unusual, but we handle it to avoid returning a zero TTL.
+		return 60
 	}
 
+	// If after checking all RRs, minTTL is still 0, return a sensible default.
 	if minTTL == 0 {
 		return 60
 	}
