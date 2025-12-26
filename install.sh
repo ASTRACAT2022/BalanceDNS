@@ -132,7 +132,7 @@ Restart=always
 User=root
 StandardOutput=journal
 StandardError=journal
-Environment=RUST_LOG=info,hickory_server=debug,h2=info,rustls=info
+Environment=RUST_LOG=info
 
 [Install]
 WantedBy=multi-user.target
