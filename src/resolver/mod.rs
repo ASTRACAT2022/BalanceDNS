@@ -57,17 +57,24 @@ impl Resolver for HickoryResolver {
                         msg.set_response_code(hickory_proto::op::ResponseCode::NoError);
                     },
                     ResolveErrorKind::Proto(_proto_err) => {
-                         // Check for NXDomain specifically via string or kind if possible.
                          let s = e.to_string();
                          if s.contains("NXDomain") {
                              msg.set_response_code(hickory_proto::op::ResponseCode::NXDomain);
                          } else {
-                             return Err(anyhow::anyhow!("Resolution error: {}", e));
+                             // Treat other proto errors as ServFail without throwing hard error
+                             msg.set_response_code(hickory_proto::op::ResponseCode::ServFail);
                          }
+                    },
+                    ResolveErrorKind::Timeout => {
+                        // Return ServFail on timeout so client knows to retry/fail
+                        msg.set_response_code(hickory_proto::op::ResponseCode::ServFail);
+                    },
+                    _ => {
+                         // For other errors, log a warning but return ServFail to client
+                         log::warn!("Resolver error for {}: {}", name, e);
+                         msg.set_response_code(hickory_proto::op::ResponseCode::ServFail);
+                         // return Err(anyhow::anyhow!("Resolution error: {}", e)); // Don't return Err to avoid log spam in server
                     }
-                     _ => {
-                         return Err(anyhow::anyhow!("Resolution error: {}", e));
-                     }
                 }
 
             }
