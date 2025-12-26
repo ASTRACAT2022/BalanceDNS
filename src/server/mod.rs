@@ -95,6 +95,8 @@ impl RequestHandler for Handler {
 
                  let response = builder.build(header, answers.iter(), name_servers.iter(), std::iter::empty(), additionals.iter());
 
+                 log::info!("Sent response for {} {}: {}", qtype_str, name, rcode);
+
                  if let Err(e) = response_handle.send_response(response).await {
                      log::error!("Failed to send response: {}", e);
                  }
