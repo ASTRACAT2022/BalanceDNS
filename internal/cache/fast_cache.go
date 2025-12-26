@@ -1,7 +1,7 @@
 package cache
 
 import (
-	"container/list"
+	"hash/maphash"
 	"sync"
 	"time"
 )
@@ -10,20 +10,34 @@ import (
 type FastCache struct {
 	shards    []*fastCacheShard
 	numShards uint32
+	seed      maphash.Seed
 }
 
+// fastCacheShard uses a custom LRU implementation to minimize GC pressure.
 type fastCacheShard struct {
 	sync.Mutex
-	items    map[string]*list.Element
-	lru      *list.List
+	items    map[string]*entry // Map from key to list node
+	head     *entry            // MRU
+	tail     *entry            // LRU
 	capacity int
+	size     int
 }
 
-type fastCacheItem struct {
+// entry is a node in the doubly linked list.
+type entry struct {
 	key        string
 	msgBytes   []byte
 	expiration time.Time
 	swr        time.Duration
+	prev       *entry
+	next       *entry
+}
+
+// entryPool reuses entry objects to reduce GC pressure.
+var entryPool = &sync.Pool{
+	New: func() interface{} {
+		return &entry{}
+	},
 }
 
 // NewFastCache creates a new FastCache.
@@ -39,20 +53,23 @@ func NewFastCache(size int, numShards int) *FastCache {
 	shardSize := size / numShards
 	for i := 0; i < numShards; i++ {
 		shards[i] = &fastCacheShard{
-			items:    make(map[string]*list.Element),
-			lru:      list.New(),
+			items:    make(map[string]*entry),
 			capacity: shardSize,
 		}
 	}
 	return &FastCache{
 		shards:    shards,
 		numShards: uint32(numShards),
+		seed:      maphash.MakeSeed(),
 	}
 }
 
 func (c *FastCache) getShard(key string) *fastCacheShard {
-	hash := fnv32(key)
-	return c.shards[hash%c.numShards]
+	var h maphash.Hash
+	h.SetSeed(c.seed)
+	h.WriteString(key)
+	hash := h.Sum64()
+	return c.shards[hash%uint64(c.numShards)]
 }
 
 // Get retrieves an item from the cache.
@@ -61,20 +78,20 @@ func (c *FastCache) Get(key string) ([]byte, bool, bool) {
 	shard.Lock()
 	defer shard.Unlock()
 
-	if elem, hit := shard.items[key]; hit {
-		item := elem.Value.(*fastCacheItem)
+	if ent, hit := shard.items[key]; hit {
 		now := time.Now()
-		if now.After(item.expiration) {
-			if item.swr > 0 && now.Before(item.expiration.Add(item.swr)) {
-				shard.lru.MoveToFront(elem)
-				return item.msgBytes, true, true
+		if now.After(ent.expiration) {
+			// Check if stale-while-revalidate applies
+			if ent.swr > 0 && now.Before(ent.expiration.Add(ent.swr)) {
+				shard.moveToFront(ent)
+				return ent.msgBytes, true, true
 			}
-			shard.lru.Remove(elem)
-			delete(shard.items, key)
+			// Expired and no SWR, remove it
+			shard.remove(ent)
 			return nil, false, false
 		}
-		shard.lru.MoveToFront(elem)
-		return item.msgBytes, true, false
+		shard.moveToFront(ent)
+		return ent.msgBytes, true, false
 	}
 	return nil, false, false
 }
@@ -87,29 +104,103 @@ func (c *FastCache) Set(key string, msgBytes []byte, ttl time.Duration, swr time
 
 	expiration := time.Now().Add(ttl)
 
-	if elem, hit := shard.items[key]; hit {
-		shard.lru.MoveToFront(elem)
-		item := elem.Value.(*fastCacheItem)
-		item.msgBytes = msgBytes
-		item.expiration = expiration
-		item.swr = swr
+	if ent, hit := shard.items[key]; hit {
+		shard.moveToFront(ent)
+		ent.msgBytes = msgBytes
+		ent.expiration = expiration
+		ent.swr = swr
 		return
 	}
 
-	if shard.lru.Len() >= shard.capacity {
-		elem := shard.lru.Back()
-		if elem != nil {
-			item := shard.lru.Remove(elem).(*fastCacheItem)
-			delete(shard.items, item.key)
-		}
+	// Evict if full
+	if shard.size >= shard.capacity {
+		shard.removeOldest()
 	}
 
-	item := &fastCacheItem{
-		key:        key,
-		msgBytes:   msgBytes,
-		expiration: expiration,
-		swr:        swr,
+	// Add new item
+	ent := entryPool.Get().(*entry)
+	ent.key = key
+	ent.msgBytes = msgBytes
+	ent.expiration = expiration
+	ent.swr = swr
+	ent.prev = nil
+	ent.next = nil
+
+	shard.addToFront(ent)
+	shard.items[key] = ent
+}
+
+// addToFront adds an entry to the front of the list (MRU)
+func (s *fastCacheShard) addToFront(ent *entry) {
+	if s.head == nil {
+		s.head = ent
+		s.tail = ent
+		ent.prev = nil
+		ent.next = nil
+	} else {
+		ent.next = s.head
+		ent.prev = nil
+		s.head.prev = ent
+		s.head = ent
 	}
-	elem := shard.lru.PushFront(item)
-	shard.items[key] = elem
+	s.size++
+}
+
+// moveToFront moves an existing entry to the front
+func (s *fastCacheShard) moveToFront(ent *entry) {
+	if s.head == ent {
+		return
+	}
+
+	// Unlink
+	if ent.prev != nil {
+		ent.prev.next = ent.next
+	}
+	if ent.next != nil {
+		ent.next.prev = ent.prev
+	}
+	if s.tail == ent {
+		s.tail = ent.prev
+	}
+
+	// Link to front
+	ent.next = s.head
+	ent.prev = nil
+	if s.head != nil {
+		s.head.prev = ent
+	}
+	s.head = ent
+}
+
+// remove removes an entry from the list and map
+func (s *fastCacheShard) remove(ent *entry) {
+	delete(s.items, ent.key)
+
+	if ent.prev != nil {
+		ent.prev.next = ent.next
+	} else {
+		s.head = ent.next
+	}
+
+	if ent.next != nil {
+		ent.next.prev = ent.prev
+	} else {
+		s.tail = ent.prev
+	}
+
+	s.size--
+
+	// Clear and return to pool
+	ent.key = ""
+	ent.msgBytes = nil
+	ent.prev = nil
+	ent.next = nil
+	entryPool.Put(ent)
+}
+
+// removeOldest removes the LRU item
+func (s *fastCacheShard) removeOldest() {
+	if s.tail != nil {
+		s.remove(s.tail)
+	}
 }

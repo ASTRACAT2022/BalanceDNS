@@ -2,6 +2,7 @@ package cache
 
 import (
 	"dns-resolver/internal/metrics"
+	"dns-resolver/internal/pool"
 	"encoding/binary"
 	"fmt"
 	"log"
@@ -33,7 +34,23 @@ type FixedSizeCacheItem struct {
 func (f *FixedSizeCacheItem) Pack() ([]byte, error) {
 	// Allocate a buffer with enough space for all data.
 	// 24 bytes for fixed-size metadata + length of the message bytes.
-	buf := make([]byte, 24+f.MsgBytesLength)
+	// We use BytePool to reduce allocations. The caller must ensure to return the buffer to the pool if needed,
+	// but currently for LMDB Put we pass it and then return it.
+
+	// Since BytePool returns 4096 bytes, check if we need more.
+	reqLen := 24 + int(f.MsgBytesLength)
+	var buf []byte
+
+	// If message is small enough, use pool
+	if reqLen <= 4096 {
+		pBuf := pool.GetBytes()
+		buf = *pBuf
+		// Slice to exact length
+		buf = buf[:reqLen]
+	} else {
+		// Too big for pool, allocate new
+		buf = make([]byte, reqLen)
+	}
 
 	// Use binary.BigEndian to write fixed-size metadata directly to the byte slice.
 	binary.BigEndian.PutUint64(buf[0:8], uint64(f.ExpirationUnix))
@@ -161,8 +178,19 @@ func (c *Cache) startWriter() {
 			}
 
 			err = c.lmdbEnv.Update(func(txn *lmdb.Txn) error {
+				// We need to copy the key because LMDB might not copy it immediately?
+				// Actually key is string so []byte(key) allocates.
 				return txn.Put(c.lmdbDBI, []byte(itemWrapper.key), packedData, 0)
 			})
+
+			// Return buffer to pool if it came from pool (based on capacity/address? No, we can just try)
+			// Since we know Pack uses pool for <= 4096.
+			if cap(packedData) == 4096 {
+				// We need to restore the full capacity before putting back
+				b := packedData[:4096]
+				pool.PutBytes(&b)
+			}
+
 			if err != nil {
 				c.metrics.IncrementLMDBErrors()
 				log.Printf("Failed to write to LMDB for key %s: %v", itemWrapper.key, err)
@@ -210,12 +238,17 @@ func (c *Cache) loadFromDB() {
 				continue
 			}
 
-			msg := new(dns.Msg)
+			msg := pool.GetDnsMsg()
 			if err := msg.Unpack(fItem.MsgBytes); err != nil {
 				c.metrics.IncrementLMDBErrors()
 				log.Printf("Failed to unpack DNS message for key %s: %v", string(key), err)
+				pool.PutDnsMsg(msg)
 				continue
 			}
+			// We only needed to unpack to check validity?
+			// Wait, the cache stores BYTES in FastCache.
+			// We don't need to keep 'msg' around.
+			pool.PutDnsMsg(msg)
 
 			c.metrics.IncrementLMDBCacheLoads()
 			c.fastCache.Set(string(key), fItem.MsgBytes, expiration.Sub(time.Now()), time.Duration(fItem.StaleWhileRevalidateNanoseconds))
@@ -281,14 +314,6 @@ func Key(q dns.Question) string {
 	return fmt.Sprintf("%s:%d:%d", strings.ToLower(q.Name), q.Qtype, q.Qclass)
 }
 
-func fnv32(key string) uint32 {
-	hash := uint32(2166136261)
-	for i := 0; i < len(key); i++ {
-		hash *= 16777619
-		hash ^= uint32(key[i])
-	}
-	return hash
-}
 
 func getMinTTL(msg *dns.Msg) uint32 {
 	var minTTL uint32 = 0

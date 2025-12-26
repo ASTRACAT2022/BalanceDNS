@@ -13,6 +13,7 @@ import (
 	"dns-resolver/internal/cache"
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/metrics"
+	"dns-resolver/internal/pool"
 
 	"github.com/miekg/dns"
 	"golang.org/x/sync/singleflight"
@@ -79,9 +80,10 @@ func (r *GoDNSResolver) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 	if msgBytes, found, revalidate := r.cache.Get(key); found {
 		log.Printf("Cache hit for %s (revalidate: %t)", q.Name, revalidate)
 
-		msg := new(dns.Msg)
+		msg := pool.GetDnsMsg()
 		if err := msg.Unpack(msgBytes); err != nil {
 			log.Printf("Failed to unpack message from cache for key %s: %v", key, err)
+			pool.PutDnsMsg(msg)
 			// Treat as cache miss and proceed to resolve
 		} else {
 			msg.Id = req.Id
@@ -100,7 +102,8 @@ func (r *GoDNSResolver) Resolve(ctx context.Context, req *dns.Msg) (*dns.Msg, er
 					defer cancel()
 
 					// Create a new request for revalidation
-					revalidationReq := new(dns.Msg)
+					revalidationReq := pool.GetDnsMsg()
+					defer pool.PutDnsMsg(revalidationReq)
 					revalidationReq.SetQuestion(q.Name, q.Qtype)
 					revalidationReq.RecursionDesired = true
 					if opt := req.IsEdns0(); opt != nil {
@@ -158,13 +161,13 @@ func (r *GoDNSResolver) recursiveLookup(ctx context.Context, req *dns.Msg) (*dns
 		r.metrics.IncrementUnboundErrors()
 		log.Printf("Recursive resolution error for %s: %v", q.Name, err)
 		// Return a SERVFAIL message when resolution fails
-		msg := new(dns.Msg)
+		msg := pool.GetDnsMsg()
 		msg.SetRcode(req, dns.RcodeServerFailure)
 		return msg, err
 	}
 
 	// Set up the response
-	msg := new(dns.Msg)
+	msg := pool.GetDnsMsg()
 	msg.SetReply(req)
 	msg.Rcode = result.Rcode
 
@@ -208,7 +211,7 @@ func (r *GoDNSResolver) iterativeLookup(ctx context.Context, domain string, qtyp
 	// Limit the number of iterations to prevent infinite loops
 	maxIterations := 20
 	iteration := 0
-    var lastError error
+	var lastError error
 
 	currentDomain := domain
 	currentServers := servers
@@ -224,74 +227,149 @@ func (r *GoDNSResolver) iterativeLookup(ctx context.Context, domain string, qtyp
 		// Track if any server responded in this iteration
 		serverResponded := false
 
-		// Try each server until one responds with a useful answer
-		for _, server := range currentServers {
-			// Create a query for the current domain
-			req := new(dns.Msg)
-			req.SetQuestion(currentDomain, qtype)
-			req.RecursionDesired = false // We're doing iterative resolution
+		// Try to query servers in parallel with "fastest response wins" strategy
 
-			// Send query to the current server
-			resp, err := r.sendQuery(ctx, req, server)
-			if err != nil {
-				log.Printf("Failed to query %s for %s: %v", server, currentDomain, err)
-				lastError = err
+		type queryResult struct {
+			resp *dns.Msg
+			err  error
+			server string
+		}
+
+		// Use a buffered channel to avoid blocking goroutines
+		resultChan := make(chan queryResult, len(currentServers))
+		childCtx, cancel := context.WithCancel(ctx)
+		defer cancel() // Ensure cancellation on return
+
+		// Limit parallel queries if there are too many servers
+		concurrency := len(currentServers)
+		if concurrency > 3 {
+			concurrency = 3
+		}
+
+		var wg sync.WaitGroup
+
+		// Take top servers
+		activeServers := currentServers
+		if len(activeServers) > 5 {
+			activeServers = activeServers[:5]
+		}
+
+		for _, server := range activeServers {
+			wg.Add(1)
+			go func(srv string) {
+				defer wg.Done()
+
+				// Create a query for the current domain
+				req := pool.GetDnsMsg()
+				defer pool.PutDnsMsg(req)
+
+				req.SetQuestion(currentDomain, qtype)
+				req.RecursionDesired = false
+
+				// Check context before sending
+				select {
+				case <-childCtx.Done():
+					return
+				default:
+				}
+
+				resp, err := r.sendQuery(childCtx, req, srv)
+
+				select {
+				case resultChan <- queryResult{resp: resp, err: err, server: srv}:
+				case <-childCtx.Done():
+				}
+			}(server)
+		}
+
+		// Wait for goroutines in background to close channel
+		go func() {
+			wg.Wait()
+			close(resultChan)
+		}()
+
+		// Process results as they come in
+		// We want the FIRST success.
+		failures := 0
+		var finalResp *dns.Msg
+
+		for res := range resultChan {
+			if res.err != nil {
+				failures++
+				lastError = res.err
 				continue
 			}
-
-			serverResponded = true
 
 			// Check the response
-			switch resp.Rcode {
-			case dns.RcodeSuccess:
-				// Got a direct answer - return it
-				return resp, nil
-			case dns.RcodeNameError:
-				// Domain doesn't exist
-				return resp, nil
-			case dns.RcodeServerFailure:
-				// Server failure - try next server
-				lastError = fmt.Errorf("server failure from %s for %s", server, currentDomain)
-				continue
-			case dns.RcodeRefused:
-				// Server refused - try next server
-				lastError = fmt.Errorf("server refused query from %s for %s", server, currentDomain)
-				continue
+			switch res.resp.Rcode {
+			case dns.RcodeSuccess, dns.RcodeNameError:
+				// Valid response
+				finalResp = res.resp
+				cancel() // Cancel others
+				serverResponded = true
+				goto ProcessResponse
+			case dns.RcodeServerFailure, dns.RcodeRefused:
+				failures++
+				lastError = fmt.Errorf("rcode %s from %s", dns.RcodeToString[res.resp.Rcode], res.server)
 			default:
-				// For referral (NXDOMAIN, etc.), continue to next iteration
+				finalResp = res.resp
+				cancel()
+				serverResponded = true
+				goto ProcessResponse
+			}
+		}
+
+	ProcessResponse:
+		if finalResp != nil {
+			resp := finalResp
+			serverResponded = true
+
+			// Success or NXDOMAIN
+			if resp.Rcode == dns.RcodeSuccess || resp.Rcode == dns.RcodeNameError {
+				if len(resp.Answer) > 0 || resp.Rcode == dns.RcodeNameError {
+					return resp, nil
+				}
 			}
 
-			// If we get referrals (authority records), use them
+			// Handle Referrals
 			if len(resp.Ns) > 0 {
 				nextServers, err := r.extractServers(ctx, resp.Ns, resp.Extra)
 				if err != nil {
 					log.Printf("Error extracting servers: %v", err)
-					continue
-				}
-				if len(nextServers) > 0 {
+				} else if len(nextServers) > 0 {
 					currentServers = nextServers
-					break // Try the new servers in the next iteration
+					iteration++
+					continue
 				}
 			}
 
-			// If there are additional records (glue records), use them
+			// Handle Glue
 			if len(resp.Extra) > 0 {
 				additionalServers := r.extractGlueServers(resp.Extra)
 				if len(additionalServers) > 0 {
 					currentServers = additionalServers
-					break // Try the new servers in the next iteration
+					iteration++
+					continue
 				}
 			}
 
-			// If we got CNAME records and we're not looking up CNAME itself
+			// Handle CNAME
 			if len(resp.Answer) > 0 && qtype != dns.TypeCNAME {
 				for _, ans := range resp.Answer {
 					if cn, ok := ans.(*dns.CNAME); ok {
 						log.Printf("CNAME redirect: %s -> %s", currentDomain, cn.Target)
 						currentDomain = strings.ToLower(dns.Fqdn(cn.Target))
+						currentServers = r.rootServers
 						break
 					}
 				}
+				iteration++
+				continue
+			}
+
+			// NODATA or empty response
+			if resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0 && len(resp.Ns) == 0 {
+				return resp, nil
 			}
 		}
 
@@ -370,7 +448,8 @@ func (r *GoDNSResolver) resolveNameToIP(ctx context.Context, name string) ([]str
 	// and handle the resolution more efficiently
 
 	// First try A record
-	aReq := new(dns.Msg)
+	aReq := pool.GetDnsMsg()
+	defer pool.PutDnsMsg(aReq)
 	aReq.SetQuestion(name, dns.TypeA)
 	aReq.RecursionDesired = true
 
@@ -417,7 +496,8 @@ func (r *GoDNSResolver) sendQuery(ctx context.Context, req *dns.Msg, server stri
 
 // directLookup is a helper to directly query specific servers
 func (r *GoDNSResolver) directLookup(ctx context.Context, domain string, qtype uint16, qclass uint16, servers []string) (*dns.Msg, error) {
-	req := new(dns.Msg)
+	req := pool.GetDnsMsg()
+	defer pool.PutDnsMsg(req)
 	req.SetQuestion(dns.Fqdn(domain), qtype)
 	req.RecursionDesired = true
 
