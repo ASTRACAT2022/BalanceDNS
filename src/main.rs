@@ -1,4 +1,4 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::signal;
 use log::{info, error};
 
@@ -9,6 +9,7 @@ mod resolver;
 mod plugins;
 mod admin;
 mod server;
+mod protection;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -16,13 +17,28 @@ async fn main() -> anyhow::Result<()> {
     info!("Booting up ASTRACAT Resolver (Rust Port)...");
 
     // Load configuration
-    let cfg = match config::Config::load("config.yaml") {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to load config.yaml: {}, using defaults", e);
-            config::Config::default()
+    // Load configuration
+    let config_paths = vec![
+        "config.yaml",
+        "/etc/astracat-dns/config.yaml",
+        "/usr/local/etc/astracat-dns/config.yaml",
+    ];
+
+    let mut cfg = config::Config::default();
+    let mut config_loaded = false;
+
+    for path in config_paths {
+        if let Ok(c) = config::Config::load(path) {
+            info!("Loaded configuration from {}", path);
+            cfg = c;
+            config_loaded = true;
+            break;
         }
-    };
+    }
+
+    if !config_loaded {
+        error!("Could not load configuration from any standard location. Using defaults.");
+    }
 
     // Initialize metrics
     let metrics = Arc::new(metrics::Metrics::new(&cfg.metrics_storage_path));
@@ -55,9 +71,12 @@ async fn main() -> anyhow::Result<()> {
     let res = resolver::create_resolver(&cfg.resolver.resolver_type, &cfg, cache.clone(), metrics.clone()).await?;
     let res = Arc::new(res);
 
+    // Start metrics collectors
+    metrics.clone().start_collectors();
+
     // Start admin server
     if !cfg.admin_addr.is_empty() {
-         let admin_server = admin::AdminServer::new(&cfg.admin_addr, metrics.clone(), pm.clone());
+         let admin_server = admin::AdminServer::new(&cfg.admin_addr, metrics.clone(), pm.clone(), cfg.admin.clone());
          tokio::spawn(async move {
              if let Err(e) = admin_server.start().await {
                  error!("Admin server error: {}", e);
@@ -65,8 +84,15 @@ async fn main() -> anyhow::Result<()> {
          });
     }
 
+    // Initialize Protection
+    let protection = Arc::new(protection::Protection::new(
+        cfg.rate_limit.enabled,
+        cfg.rate_limit.qps,
+        cfg.rate_limit.burst,
+    ));
+
     // Create and start DNS server
-    let server = server::Server::new(cfg.clone(), metrics.clone(), res.clone(), pm.clone());
+    let server = server::Server::new(cfg.clone(), metrics.clone(), res.clone(), pm.clone(), protection);
 
     // We don't want to lose the server task
     tokio::spawn(async move {

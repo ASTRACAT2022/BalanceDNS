@@ -13,6 +13,7 @@ pub struct Config {
     pub hosts: HostsConfig,
     pub adblock: AdBlockConfig,
     pub rate_limit: RateLimitConfig,
+    pub admin: AdminConfig,
     pub httpsrr: HttpsRRConfig,
     pub doh: DoHConfig,
     pub dot: DoTConfig,
@@ -58,6 +59,12 @@ pub struct RateLimitConfig {
     pub enabled: bool,
     pub qps: u32,
     pub burst: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminConfig {
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +130,10 @@ impl Default for Config {
                 qps: 100,
                 burst: 200,
             },
+            admin: AdminConfig {
+                username: "admin".to_string(),
+                password: "change_me".to_string(),
+            },
             doh: DoHConfig {
                 enabled: false,
                 listen_addr: "0.0.0.0:443".to_string(),
@@ -144,6 +155,7 @@ impl Default for Config {
 }
 
 impl Config {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -157,6 +169,7 @@ impl Config {
         }
     }
 
+    #[allow(dead_code)]
     pub fn save(&self, path: &str) -> anyhow::Result<()> {
         let data = serde_yaml::to_string(self)?;
         fs::write(path, data)?;

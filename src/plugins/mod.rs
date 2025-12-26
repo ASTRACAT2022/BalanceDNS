@@ -1,5 +1,5 @@
 use std::sync::{Arc, RwLock};
-use hickory_proto::op::Message;
+
 use async_trait::async_trait;
 use log::{info, warn};
 use reqwest;
@@ -11,6 +11,7 @@ use tokio::time;
 #[derive(Debug, PartialEq)]
 pub enum PluginAction {
     Continue,
+    #[allow(dead_code)]
     Drop,
     Block, // Returns NXDOMAIN or REFUSED
 }
@@ -19,6 +20,7 @@ pub enum PluginAction {
 pub trait Plugin: Send + Sync {
     fn name(&self) -> &str;
     async fn on_query(&self, name: &str, qtype: u16) -> PluginAction;
+    async fn refresh(&self) {}
 }
 
 pub struct PluginManager {
@@ -46,12 +48,19 @@ impl PluginManager {
         }
         PluginAction::Continue
     }
+
+    pub async fn reload_lists(&self) {
+        info!("Reloading all plugins...");
+        for plugin in &self.plugins {
+            plugin.refresh().await;
+        }
+    }
 }
 
 // --- Plugins ---
 
 pub struct HostsPlugin {
-    hosts: RwLock<HashMap<String, String>>, // Domain -> IP (simplified)
+    _hosts: RwLock<HashMap<String, String>>, // Domain -> IP (simplified)
 }
 
 impl HostsPlugin {
@@ -68,7 +77,7 @@ impl HostsPlugin {
         }
 
         HostsPlugin {
-            hosts: RwLock::new(hosts),
+            _hosts: RwLock::new(hosts),
         }
     }
 }
@@ -160,5 +169,9 @@ impl Plugin for AdBlockPlugin {
             return PluginAction::Block;
         }
         PluginAction::Continue
+    }
+
+    async fn refresh(&self) {
+        self.refresh().await;
     }
 }

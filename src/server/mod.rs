@@ -2,6 +2,7 @@ use std::sync::Arc;
 use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::resolver::Resolver;
+use crate::protection::Protection;
 use crate::plugins::{PluginManager, PluginAction};
 use hickory_server::ServerFuture;
 use hickory_server::authority::MessageResponseBuilder;
@@ -17,12 +18,14 @@ pub struct Server {
     metrics: Arc<Metrics>,
     resolver: Arc<Box<dyn Resolver>>,
     pm: Arc<PluginManager>,
+    protection: Arc<Protection>,
 }
 
 struct Handler {
     metrics: Arc<Metrics>,
     resolver: Arc<Box<dyn Resolver>>,
     pm: Arc<PluginManager>,
+    protection: Arc<Protection>,
 }
 
 #[async_trait]
@@ -42,6 +45,13 @@ impl RequestHandler for Handler {
         self.metrics.increment_queries(&name);
         self.metrics.record_query_type(&qtype_str);
 
+        // 0. Protection (Rate Limit / Blocklist)
+        let src_ip = request.src().ip().to_string();
+        if !self.protection.allow_request(&src_ip) {
+            log::warn!("Dropped request from {} due to protection policy", src_ip);
+            return ResponseInfo::from(Header::response_from_request(request.header()));
+        }
+
         // 1. Run Plugins
         match self.pm.on_query(&name, qtype).await {
             PluginAction::Block => {
@@ -49,6 +59,7 @@ impl RequestHandler for Handler {
 
                 let builder = MessageResponseBuilder::from_message_request(request);
                 let mut header = Header::response_from_request(request.header());
+                header.set_recursion_available(true);
                 header.set_response_code(ResponseCode::NXDomain);
                 let response = builder.build(header, std::iter::empty(), std::iter::empty(), std::iter::empty(), std::iter::empty());
 
@@ -73,6 +84,7 @@ impl RequestHandler for Handler {
 
                  let builder = MessageResponseBuilder::from_message_request(request);
                  let mut header = Header::response_from_request(request.header());
+                 header.set_recursion_available(true);
                  header.set_response_code(msg.response_code());
 
                  let answers = msg.answers();
@@ -90,6 +102,7 @@ impl RequestHandler for Handler {
                 // Send ServFail
                 let builder = MessageResponseBuilder::from_message_request(request);
                 let mut header = Header::response_from_request(request.header());
+                header.set_recursion_available(true);
                 header.set_response_code(ResponseCode::ServFail);
                 let response = builder.build(header, std::iter::empty(), std::iter::empty(), std::iter::empty(), std::iter::empty());
 
@@ -112,12 +125,14 @@ impl Server {
         metrics: Arc<Metrics>,
         resolver: Arc<Box<dyn Resolver>>,
         pm: Arc<PluginManager>,
+        protection: Arc<Protection>,
     ) -> Self {
         Server {
             config,
             metrics,
             resolver,
             pm,
+            protection,
         }
     }
 
@@ -128,6 +143,7 @@ impl Server {
             metrics: self.metrics.clone(),
             resolver: self.resolver.clone(),
             pm: self.pm.clone(),
+            protection: self.protection.clone(),
         };
 
         let mut server = ServerFuture::new(handler);

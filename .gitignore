@@ -1,1 +1,9 @@
 target/
+**/*.rs.bk
+*.log
+*.db
+*.mmdb
+.DS_Store
+.gemini/
+.idea/
+.vscode/

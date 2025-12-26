@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Astracat DNS Admin</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #1a1a1a;
+            color: #f0f0f0;
+            margin: 0;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            border-bottom: 1px solid #333;
+            padding-bottom: 20px;
+        }
+
+        .card-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .card {
+            background: #2d2d2d;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+        }
+
+        .card h3 {
+            margin: 0 0 10px 0;
+            color: #888;
+            font-size: 0.9em;
+            text-transform: uppercase;
+        }
+
+        .card .value {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #4ade80;
+        }
+
+        .chart-container {
+            background: #2d2d2d;
+            padding: 20px;
+            border-radius: 8px;
+            height: 300px;
+            margin-bottom: 20px;
+        }
+
+        button {
+            background: #4ade80;
+            color: #1a1a1a;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+
+        button:hover {
+            background: #22c55e;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th,
+        td {
+            text-align: left;
+            padding: 12px;
+            border-bottom: 1px solid #333;
+        }
+
+        th {
+            color: #888;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Astracat DNS Resolver</h1>
+            <div id="status">Online</div>
+        </div>
+
+        <div class="card-grid">
+            <div class="card">
+                <h3>Total Queries</h3>
+                <div class="value" id="total-queries">0</div>
+            </div>
+            <div class="card">
+                <h3>QPS (Last 1m)</h3>
+                <div class="value" id="qps">0</div>
+            </div>
+            <div class="card">
+                <h3>Cache Hit Rate</h3>
+                <div class="value" id="cache-hit-rate">0%</div>
+            </div>
+            <div class="card">
+                <h3>Blocked</h3>
+                <div class="value" id="blocked">0</div>
+            </div>
+        </div>
+
+        <div style="text-align: center; margin-bottom: 20px;">
+            <button onclick="reloadLists()" style="background: #007bff;">Reload Filter Lists</button>
+        </div>
+
+        <!-- Placeholder for Chart -->
+        <div class="chart-container">
+            <h3>Query Volume History</h3>
+            <canvas id="qpsChart"></canvas>
+        </div>
+
+        <div class="card">
+            <h3>Top Domains</h3>
+            <table id="top-domains">
+                <thead>
+                    <tr>
+                        <th>Domain</th>
+                        <th>Count</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+        // Use Chart.js or similar if fetching external JS is allowed, 
+        // otherwise simple SVG charts.
+        // For local usage, we assume internet access for CDN or embed chart.js
+
+        async function fetchStats() {
+            try {
+                const response = await fetch('/metrics.json'); // Modify metrics/mod.rs to serve this
+                const data = await response.json();
+
+                document.getElementById('total-queries').innerText = data.total_queries || 0;
+                document.getElementById('blocked').innerText = data.blocked_domains || 0;
+
+                // Calculate Hit Rate
+                const hits = data.cache_hits || 0;
+                const misses = data.cache_misses || 0;
+                const total = hits + misses;
+                const rate = total > 0 ? ((hits / total) * 100).toFixed(1) : 0;
+                document.getElementById('cache-hit-rate').innerText = rate + '%';
+
+                // QPS would need time-series data or calculation from previous fetch
+            } catch (e) {
+                console.error("Failed to fetch stats", e);
+            }
+        }
+
+        setInterval(fetchStats, 2000);
+        fetchStats();
+
+        async function reloadLists() {
+            if (confirm("Are you sure you want to reload all filter lists?")) {
+                try {
+                    const res = await fetch('/api/reload', {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': 'Basic ' + btoa('admin:change_me') // Ideally user inputs this or browser prompts
+                        }
+                    });
+
+                    if (res.status === 401) {
+                        alert("Unauthorized! Please log in.");
+                        location.reload(); // Trigger browser auth prompt
+                        return;
+                    }
+
+                    if (res.ok) {
+                        alert("Lists reloaded successfully!");
+                    } else {
+                        alert("Failed: " + res.statusText);
+                    }
+                } catch (e) {
+                    alert("Error: " + e);
+                }
+            }
+        }
+    </script>
+</body>
+
+</html>

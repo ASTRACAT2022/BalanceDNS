@@ -45,7 +45,7 @@ struct CodeCount {
 }
 
 #[derive(Serialize)]
-struct DashboardMetrics {
+pub struct DashboardMetrics {
     qps: f64,
     total_queries: i64,
     blocked_domains: i64,
@@ -80,15 +80,18 @@ pub struct Metrics {
     pub query_types: DashMap<String, i64>,
     pub response_codes: DashMap<String, i64>,
 
-    registry: Registry,
+    pub registry: Registry,
 
     // Prometheus metrics
     prom_qps: Gauge,
     prom_total_queries: Counter,
+    #[allow(dead_code)]
     prom_cache_probation: Gauge,
+    #[allow(dead_code)]
     prom_cache_protected: Gauge,
     prom_cpu_usage: Gauge,
     prom_memory_usage: Gauge,
+    #[allow(dead_code)]
     prom_goroutine_count: Gauge,
     prom_network_sent: Gauge,
     prom_network_recv: Gauge,
@@ -98,14 +101,18 @@ pub struct Metrics {
     prom_query_types: CounterVec,
     prom_response_codes: CounterVec,
     prom_unbound_errors: Counter,
+    #[allow(dead_code)]
     prom_dnssec_validation: CounterVec,
+    #[allow(dead_code)]
     prom_cache_revalidations: Counter,
     prom_cache_hits: Counter,
     prom_cache_misses: Counter,
     prom_blocked_domains: Counter,
+    #[allow(dead_code)]
     prom_cache_evictions: Counter,
     prom_lmdb_cache_loads: Counter,
     prom_lmdb_errors: Counter,
+    #[allow(dead_code)]
     prom_prefetches: Counter,
 
     // Runtime stats
@@ -240,71 +247,26 @@ impl Metrics {
         Ok(())
     }
 
-    pub async fn start_metrics_server(self: Arc<Self>, addr: &str) -> anyhow::Result<()> {
-        let addr: SocketAddr = addr.parse()?;
-
-        // Start background tasks
-        let m = self.clone();
+    pub fn start_collectors(self: Arc<Self>) {
+        let me = self.clone();
         tokio::spawn(async move {
-            m.run_qps_calculator().await;
+            me.run_qps_calculator().await;
         });
-
-        let m = self.clone();
+        
+        let me = self.clone();
         tokio::spawn(async move {
-            m.run_system_metrics_collector().await;
+            me.run_system_metrics_collector().await;
         });
 
-        let m = self.clone();
+        let me = self.clone();
         tokio::spawn(async move {
-            m.run_top_domains_processor().await;
+            me.run_top_domains_processor().await;
         });
-
-        let make_svc = make_service_fn(move |_conn| {
-            let m = self.clone();
-            async move {
-                Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
-                    let m = m.clone();
-                    async move {
-                        match (req.method(), req.uri().path()) {
-                            (&hyper::Method::GET, "/metrics") => {
-                                let encoder = TextEncoder::new();
-                                let mut buffer = Vec::new();
-                                let metric_families = m.registry.gather();
-                                encoder.encode(&metric_families, &mut buffer).unwrap();
-                                Ok::<_, Infallible>(Response::new(Body::from(buffer)))
-                            },
-                            (&hyper::Method::GET, "/metrics.json") => {
-                                let json_metrics = m.get_json_metrics();
-                                let json = serde_json::to_string(&json_metrics).unwrap_or_default();
-                                Ok::<_, Infallible>(Response::builder()
-                                    .header("Content-Type", "application/json")
-                                    .body(Body::from(json))
-                                    .unwrap())
-                            },
-                             (&hyper::Method::GET, "/dashboard") => {
-                                // Simple fallback for now
-                                Ok::<_, Infallible>(Response::new(Body::from("Dashboard placeholder. Serve static file here.")))
-                            },
-                            (&hyper::Method::GET, "/health") => {
-                                Ok::<_, Infallible>(Response::new(Body::from("OK")))
-                            },
-                            _ => Ok::<_, Infallible>(Response::builder()
-                                .status(404)
-                                .body(Body::from("Not Found"))
-                                .unwrap()),
-                        }
-                    }
-                }))
-            }
-        });
-
-        info!("Metrics server starting on {}", addr);
-        let server = Server::bind(&addr).serve(make_svc);
-        server.await?;
-        Ok(())
     }
 
-    fn get_json_metrics(&self) -> DashboardMetrics {
+    /* start_metrics_server moved to admin/mod.rs */
+
+    pub fn get_json_metrics(&self) -> DashboardMetrics {
         let top_nx_domains = self.get_top_map(&self.top_nx_domains, |k, v| DomainCount { domain: k, count: *v });
         let top_latency_domains = self.get_top_latency();
         let top_queried_domains = self.get_top_map(&self.top_queried_domains, |k, v| DomainCount { domain: k, count: *v });
@@ -394,7 +356,7 @@ impl Metrics {
             self.prom_memory_usage.set(mem_usage);
 
             // Threads/Goroutines approximation
-            if let Ok(pid) = get_current_pid() {
+            if let Ok(_pid) = get_current_pid() {
                 // Not supported everywhere, but keeping it simple
             }
 
@@ -442,6 +404,7 @@ impl Metrics {
         *self.top_queried_domains.entry(domain.to_string()).or_insert(0) += 1;
     }
 
+    #[allow(dead_code)]
     pub fn increment_cache_hits(&self) {
         self.cache_hits.fetch_add(1, Ordering::Relaxed);
         self.prom_cache_hits.inc();
@@ -452,6 +415,7 @@ impl Metrics {
         self.prom_cache_misses.inc();
     }
 
+    #[allow(dead_code)]
     pub fn record_nxdomain(&self, domain: &str) {
         *self.top_nx_domains.entry(domain.to_string()).or_insert(0) += 1;
     }

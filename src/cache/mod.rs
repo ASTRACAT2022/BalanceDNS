@@ -1,27 +1,19 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::path::Path;
 use std::fs;
 use crate::metrics::Metrics;
-use lru::LruCache;
-use std::num::NonZeroUsize;
-use lmdb::{Cursor, Database, Environment, EnvironmentBuilder, RwTransaction, Transaction, WriteFlags};
+use moka::sync::Cache as MokaCache;
+use lmdb::{Cursor, Database, Environment, Transaction, WriteFlags};
 use lmdb::DatabaseFlags;
 use serde::{Deserialize, Serialize};
 use bincode;
-
-const DEFAULT_CACHE_SIZE: usize = 5000;
-const DEFAULT_SHARDS: usize = 8;
 
 #[derive(Serialize, Deserialize, Clone)]
 struct FixedSizeCacheItem {
     expiration_unix: i64,
     swr_nanos: i64,
     msg_bytes: Vec<u8>,
-}
-
-struct FastCacheShard {
-    lru: LruCache<String, FastCacheItem>,
 }
 
 #[derive(Clone)]
@@ -32,25 +24,26 @@ struct FastCacheItem {
 }
 
 pub struct Cache {
-    shards: Vec<Mutex<FastCacheShard>>,
+    inner: MokaCache<String, FastCacheItem>,
     env: Option<Arc<Environment>>,
     db: Option<Database>,
     metrics: Arc<Metrics>,
-    write_tx: async_channel::Sender<(String, FixedSizeCacheItem)>,
+    _write_tx: async_channel::Sender<(String, FixedSizeCacheItem)>,
 }
 
 impl Cache {
     pub fn new(size: usize, lmdb_path: &str, metrics: Arc<Metrics>) -> anyhow::Result<Self> {
-        let size = if size == 0 { DEFAULT_CACHE_SIZE } else { size };
-        let num_shards = DEFAULT_SHARDS;
-        let shard_capacity = size / num_shards;
-
-        let mut shards = Vec::with_capacity(num_shards);
-        for _ in 0..num_shards {
-            shards.push(Mutex::new(FastCacheShard {
-                lru: LruCache::new(NonZeroUsize::new(shard_capacity).unwrap()),
-            }));
-        }
+        // Moka cache with high concurrency
+        let cache_size = if size == 0 { 5000 } else { size as u64 };
+        
+        // Create Moka cache
+        // We set a max capacity. 
+        // We can also set time_to_live if we want Moka to handle eviction, 
+        // but we have custom SWR logic, so we might manage expiration check on access 
+        // or set a loose TTL. given we check standard TTL manually.
+        let inner = MokaCache::builder()
+            .max_capacity(cache_size)
+            .build();
 
         // LMDB setup
         let path = Path::new(lmdb_path);
@@ -71,11 +64,11 @@ impl Cache {
         let (tx, rx) = async_channel::bounded(1024);
 
         let cache = Cache {
-            shards,
+            inner,
             env: Some(env_arc.clone()),
             db: Some(db),
             metrics: metrics.clone(),
-            write_tx: tx,
+            _write_tx: tx,
         };
 
         // Load from DB
@@ -90,11 +83,6 @@ impl Cache {
         tokio::spawn(async move {
             while let Ok((key, item)) = rx.recv().await {
                 if let Ok(encoded) = bincode::serialize(&item) {
-                    // Attempt to create write transaction.
-                    // Note: LMDB only allows one write txn at a time.
-                    // If we used a long-lived txn it would block.
-                    // Here we do one small txn per item or batch.
-                    // For simplicity, one per item.
                     let mut txn = match env_clone.begin_rw_txn() {
                         Ok(t) => t,
                         Err(e) => {
@@ -144,9 +132,7 @@ impl Cache {
                     let swr = Duration::from_nanos(item.swr_nanos as u64);
 
                     // Populate in-memory cache
-                    let shard_idx = self.get_shard_idx(&key);
-                    let mut shard = self.shards[shard_idx].lock().unwrap();
-                    shard.lru.put(key, FastCacheItem {
+                    self.inner.insert(key, FastCacheItem {
                         msg_bytes: item.msg_bytes,
                         expiration,
                         swr,
@@ -162,17 +148,8 @@ impl Cache {
         Ok(())
     }
 
-    fn get_shard_idx(&self, key: &str) -> usize {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(key, &mut hasher);
-        (std::hash::Hasher::finish(&hasher) as usize) % self.shards.len()
-    }
-
     pub fn get(&self, key: &str) -> Option<(Vec<u8>, bool)> {
-        let shard_idx = self.get_shard_idx(key);
-        let mut shard = self.shards[shard_idx].lock().unwrap();
-
-        if let Some(item) = shard.lru.get(key) {
+        if let Some(item) = self.inner.get(key) {
              let now = SystemTime::now();
              if now > item.expiration {
                  let revalidate = if item.swr > Duration::ZERO {
@@ -182,7 +159,7 @@ impl Cache {
                  };
 
                  if !revalidate {
-                     shard.lru.pop(key);
+                     self.inner.remove(key);
                      self.metrics.increment_cache_misses();
                      return None;
                  }
@@ -202,16 +179,12 @@ impl Cache {
 
     pub fn set(&self, key: &str, msg_bytes: Vec<u8>, ttl: Duration, swr: Duration) {
         let expiration = SystemTime::now() + ttl;
-        let shard_idx = self.get_shard_idx(key);
-
-        {
-            let mut shard = self.shards[shard_idx].lock().unwrap();
-            shard.lru.put(key.to_string(), FastCacheItem {
-                msg_bytes: msg_bytes.clone(),
-                expiration,
-                swr,
-            });
-        }
+        
+        self.inner.insert(key.to_string(), FastCacheItem {
+            msg_bytes: msg_bytes.clone(),
+            expiration,
+            swr,
+        });
 
         // Persist to LMDB
         let persistent_item = FixedSizeCacheItem {
@@ -220,6 +193,6 @@ impl Cache {
             msg_bytes,
         };
 
-        let _ = self.write_tx.send_blocking((key.to_string(), persistent_item));
+        let _ = self._write_tx.send_blocking((key.to_string(), persistent_item));
     }
 }

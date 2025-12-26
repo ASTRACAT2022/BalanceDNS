@@ -9,6 +9,11 @@ metrics_addr: "0.0.0.0:9090"
 # Admin panel address
 admin_addr: "0.0.0.0:8080"
 
+# Admin credentials (Basic Auth)
+admin:
+  username: "admin"
+  password: "change_me"
+
 # Path to the file for storing historical metrics data
 metrics_storage_path: /tmp/dns_metrics.json
 
@@ -41,29 +46,29 @@ adblock:
   blocklist_urls:
     - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
 
-# Rate limit plugin
+# Rate limit plugin (DDoS Protection)
 rate_limit:
-  enabled: false
+  enabled: true
   qps: 100
   burst: 200
 
-# HTTPS RR plugin
+# HTTPS RR plugin (Future standard for HTTPS records)
 httpsrr:
-  enabled: true
-  records:
-    - domain: "example.com"
-      ech: "AAEAAQAB//8=" # Placeholder ECH value
+  enabled: false
+  records: []
 
 # DNS-over-HTTPS (DoH) settings
+# Requires valid certificates. Set enabled: false if not configured.
 doh:
-  enabled: true
+  enabled: false
   listen_addr: "0.0.0.0:443"
-  cert_file: "server.crt"
-  key_file: "server.key"
+  cert_file: "/etc/astracat-dns/certs/server.crt"
+  key_file: "/etc/astracat-dns/certs/server.key"
 
 # DNS-over-TLS (DoT) settings
+# Requires valid certificates. Set enabled: false if not configured.
 dot:
-  enabled: true
+  enabled: false
   listen_addr: "0.0.0.0:853"
-  cert_file: "server.crt"
-  key_file: "server.key"
+  cert_file: "/etc/astracat-dns/certs/server.crt"
+  key_file: "/etc/astracat-dns/certs/server.key"
