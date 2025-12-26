@@ -1,7 +1,6 @@
 package cache
 
 import (
-	"container/list"
 	"sync"
 	"time"
 )
@@ -14,8 +13,10 @@ type FastCache struct {
 
 type fastCacheShard struct {
 	sync.Mutex
-	items    map[string]*list.Element
-	lru      *list.List
+	items    map[string]*fastCacheItem
+	head     *fastCacheItem // MRU
+	tail     *fastCacheItem // LRU
+	size     int
 	capacity int
 }
 
@@ -24,6 +25,8 @@ type fastCacheItem struct {
 	msgBytes   []byte
 	expiration time.Time
 	swr        time.Duration
+	prev       *fastCacheItem
+	next       *fastCacheItem
 }
 
 // NewFastCache creates a new FastCache.
@@ -39,8 +42,7 @@ func NewFastCache(size int, numShards int) *FastCache {
 	shardSize := size / numShards
 	for i := 0; i < numShards; i++ {
 		shards[i] = &fastCacheShard{
-			items:    make(map[string]*list.Element),
-			lru:      list.New(),
+			items:    make(map[string]*fastCacheItem),
 			capacity: shardSize,
 		}
 	}
@@ -55,25 +57,94 @@ func (c *FastCache) getShard(key string) *fastCacheShard {
 	return c.shards[hash%c.numShards]
 }
 
+// moveToFront moves the item to the front of the list (MRU).
+func (s *fastCacheShard) moveToFront(item *fastCacheItem) {
+	if s.head == item {
+		return
+	}
+
+	// Remove from current position
+	if item.prev != nil {
+		item.prev.next = item.next
+	}
+	if item.next != nil {
+		item.next.prev = item.prev
+	}
+	if item == s.tail {
+		s.tail = item.prev
+	}
+
+	// Insert at head
+	item.next = s.head
+	item.prev = nil
+	if s.head != nil {
+		s.head.prev = item
+	}
+	s.head = item
+	if s.tail == nil {
+		s.tail = item
+	}
+}
+
+// remove removes the item from the list.
+func (s *fastCacheShard) remove(item *fastCacheItem) {
+	if item.prev != nil {
+		item.prev.next = item.next
+	} else {
+		s.head = item.next
+	}
+	if item.next != nil {
+		item.next.prev = item.prev
+	} else {
+		s.tail = item.prev
+	}
+	item.prev = nil
+	item.next = nil
+	s.size--
+}
+
+// pushFront adds an item to the front.
+func (s *fastCacheShard) pushFront(item *fastCacheItem) {
+	item.next = s.head
+	item.prev = nil
+	if s.head != nil {
+		s.head.prev = item
+	}
+	s.head = item
+	if s.tail == nil {
+		s.tail = item
+	}
+	s.size++
+}
+
+// removeTail removes the LRU item.
+func (s *fastCacheShard) removeTail() *fastCacheItem {
+	if s.tail == nil {
+		return nil
+	}
+	item := s.tail
+	s.remove(item)
+	return item
+}
+
 // Get retrieves an item from the cache.
 func (c *FastCache) Get(key string) ([]byte, bool, bool) {
 	shard := c.getShard(key)
 	shard.Lock()
 	defer shard.Unlock()
 
-	if elem, hit := shard.items[key]; hit {
-		item := elem.Value.(*fastCacheItem)
+	if item, hit := shard.items[key]; hit {
 		now := time.Now()
 		if now.After(item.expiration) {
 			if item.swr > 0 && now.Before(item.expiration.Add(item.swr)) {
-				shard.lru.MoveToFront(elem)
+				shard.moveToFront(item)
 				return item.msgBytes, true, true
 			}
-			shard.lru.Remove(elem)
+			shard.remove(item)
 			delete(shard.items, key)
 			return nil, false, false
 		}
-		shard.lru.MoveToFront(elem)
+		shard.moveToFront(item)
 		return item.msgBytes, true, false
 	}
 	return nil, false, false
@@ -87,20 +158,18 @@ func (c *FastCache) Set(key string, msgBytes []byte, ttl time.Duration, swr time
 
 	expiration := time.Now().Add(ttl)
 
-	if elem, hit := shard.items[key]; hit {
-		shard.lru.MoveToFront(elem)
-		item := elem.Value.(*fastCacheItem)
+	if item, hit := shard.items[key]; hit {
+		shard.moveToFront(item)
 		item.msgBytes = msgBytes
 		item.expiration = expiration
 		item.swr = swr
 		return
 	}
 
-	if shard.lru.Len() >= shard.capacity {
-		elem := shard.lru.Back()
-		if elem != nil {
-			item := shard.lru.Remove(elem).(*fastCacheItem)
-			delete(shard.items, item.key)
+	if shard.size >= shard.capacity {
+		removed := shard.removeTail()
+		if removed != nil {
+			delete(shard.items, removed.key)
 		}
 	}
 
@@ -110,6 +179,6 @@ func (c *FastCache) Set(key string, msgBytes []byte, ttl time.Duration, swr time
 		expiration: expiration,
 		swr:        swr,
 	}
-	elem := shard.lru.PushFront(item)
-	shard.items[key] = elem
+	shard.pushFront(item)
+	shard.items[key] = item
 }

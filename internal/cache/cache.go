@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -248,7 +249,8 @@ func (c *Cache) Get(key string) ([]byte, bool, bool) {
 }
 
 func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
-	if msg.Rcode == dns.RcodeServerFailure || msg.Rcode == dns.RcodeNameError {
+	// Cache Success and NXDOMAIN
+	if msg.Rcode == dns.RcodeServerFailure {
 		return
 	}
 
@@ -278,7 +280,17 @@ func (c *Cache) Set(key string, msg *dns.Msg, swr time.Duration) {
 }
 
 func Key(q dns.Question) string {
-	return fmt.Sprintf("%s:%d:%d", strings.ToLower(q.Name), q.Qtype, q.Qclass)
+	var b strings.Builder
+	// Approximate length: name + : + 5 + : + 5
+	b.Grow(len(q.Name) + 12)
+	b.WriteString(strings.ToLower(q.Name))
+	b.WriteString(":")
+	// Use AppendInt to avoid allocating a string
+	buf := make([]byte, 0, 8)
+	b.Write(strconv.AppendInt(buf, int64(q.Qtype), 10))
+	b.WriteString(":")
+	b.Write(strconv.AppendInt(buf, int64(q.Qclass), 10))
+	return b.String()
 }
 
 func fnv32(key string) uint32 {
@@ -291,26 +303,39 @@ func fnv32(key string) uint32 {
 }
 
 func getMinTTL(msg *dns.Msg) uint32 {
-	var minTTL uint32 = 0
+	var minTTL uint32 = 0xFFFFFFFF
+	found := false
 
-	allRRs := append(append(msg.Answer, msg.Ns...), msg.Extra...)
-
-	if len(allRRs) > 0 {
-		// Initialize minTTL with the TTL of the first RR.
-		minTTL = allRRs[0].Header().Ttl
-		// Iterate over all RRs to find the minimum TTL.
-		for _, rr := range allRRs {
+	checkRR := func(rrs []dns.RR) {
+		for _, rr := range rrs {
 			if rr.Header().Ttl < minTTL {
 				minTTL = rr.Header().Ttl
+				found = true
 			}
 		}
-	} else {
-		// Fallback for messages with no RRs in Answer, NS, or Extra sections.
-		// This is unusual, but we handle it to avoid returning a zero TTL.
-		return 60
 	}
 
-	// If after checking all RRs, minTTL is still 0, return a sensible default.
+	checkRR(msg.Answer)
+	checkRR(msg.Ns)
+	checkRR(msg.Extra)
+
+	// If NXDOMAIN, try to find SOA in Authority section for negative TTL
+	if msg.Rcode == dns.RcodeNameError && !found {
+		for _, rr := range msg.Ns {
+			if soa, ok := rr.(*dns.SOA); ok {
+				// RFC 2308: TTL for negative answer is min(SOA.TTL, SOA.Minttl)
+				ttl := soa.Header().Ttl
+				if soa.Minttl < ttl {
+					ttl = soa.Minttl
+				}
+				return ttl
+			}
+		}
+	}
+
+	if !found || minTTL == 0xFFFFFFFF {
+		return 60
+	}
 	if minTTL == 0 {
 		return 60
 	}

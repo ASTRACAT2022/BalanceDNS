@@ -19,32 +19,38 @@ const maxConnectionsPerHost = 10
 
 // DNSClient is a custom DNS client with connection pooling.
 type DNSClient struct {
-	pools   map[string]chan *dns.Conn
-	mu      sync.Mutex
-	timeout time.Duration
-	closed  bool
+	tcpPools  map[string]chan *dns.Conn
+	mu        sync.Mutex
+	timeout   time.Duration
+	udpClient *dns.Client
+	closed    bool
 }
 
 // NewDNSClient creates a new DNSClient.
 func NewDNSClient(timeout time.Duration) *DNSClient {
 	return &DNSClient{
-		pools:   make(map[string]chan *dns.Conn),
-		timeout: timeout,
+		tcpPools: make(map[string]chan *dns.Conn),
+		timeout:  timeout,
+		udpClient: &dns.Client{
+			Net:     "udp",
+			Timeout: timeout,
+			UDPSize: 4096,
+		},
 	}
 }
 
-// getConn gets a connection from the pool or creates a new one.
-func (c *DNSClient) getConn(server string) (*dns.Conn, error) {
+// getTcpConn gets a TCP connection from the pool or creates a new one.
+func (c *DNSClient) getTcpConn(server string) (*dns.Conn, error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		return nil, ErrPoolClosed
 	}
 
-	pool, ok := c.pools[server]
+	pool, ok := c.tcpPools[server]
 	if !ok {
 		pool = make(chan *dns.Conn, maxConnectionsPerHost)
-		c.pools[server] = pool
+		c.tcpPools[server] = pool
 	}
 	c.mu.Unlock()
 
@@ -62,8 +68,8 @@ func (c *DNSClient) getConn(server string) (*dns.Conn, error) {
 	}
 }
 
-// putConn returns a connection to the pool.
-func (c *DNSClient) putConn(conn *dns.Conn) {
+// putTcpConn returns a TCP connection to the pool.
+func (c *DNSClient) putTcpConn(conn *dns.Conn) {
 	if conn == nil {
 		return
 	}
@@ -76,7 +82,7 @@ func (c *DNSClient) putConn(conn *dns.Conn) {
 		c.mu.Unlock()
 		return
 	}
-	pool, ok := c.pools[server]
+	pool, ok := c.tcpPools[server]
 	c.mu.Unlock()
 
 	if !ok {
@@ -95,8 +101,29 @@ func (c *DNSClient) putConn(conn *dns.Conn) {
 }
 
 // Exchange sends a DNS query to the specified server and returns the response.
+// It tries UDP first, and falls back to TCP if the response is truncated.
 func (c *DNSClient) Exchange(ctx context.Context, req *dns.Msg, server string) (*dns.Msg, error) {
-	conn, err := c.getConn(server)
+	// Try UDP first
+	resp, _, err := c.udpClient.ExchangeContext(ctx, req, server)
+
+	// If UDP succeeded and not truncated, return result
+	if err == nil && resp != nil && !resp.Truncated {
+		return resp, nil
+	}
+
+	// If UDP failed with a timeout or other error, we usually let the caller handle it (try next server).
+	// However, if it's truncated, we MUST retry with TCP.
+	if resp != nil && resp.Truncated {
+		return c.exchangeTCP(ctx, req, server)
+	}
+
+	// Return the UDP error/response if we didn't fallback to TCP
+	return resp, err
+}
+
+// exchangeTCP performs a DNS exchange over TCP using the connection pool.
+func (c *DNSClient) exchangeTCP(ctx context.Context, req *dns.Msg, server string) (*dns.Msg, error) {
+	conn, err := c.getTcpConn(server)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +166,7 @@ func (c *DNSClient) Exchange(ctx context.Context, req *dns.Msg, server string) (
 			return nil, err
 		}
 		// On success, return the healthy connection to the pool.
-		c.putConn(conn)
+		c.putTcpConn(conn)
 		return resp, nil
 	}
 }
@@ -154,7 +181,7 @@ func (c *DNSClient) Close() {
 	}
 	c.closed = true
 
-	for _, pool := range c.pools {
+	for _, pool := range c.tcpPools {
 		close(pool)
 		for conn := range pool {
 			if conn != nil {
@@ -162,5 +189,5 @@ func (c *DNSClient) Close() {
 			}
 		}
 	}
-	c.pools = make(map[string]chan *dns.Conn) // Clear the map
+	c.tcpPools = make(map[string]chan *dns.Conn) // Clear the map
 }

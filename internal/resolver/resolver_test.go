@@ -13,6 +13,14 @@ import (
 )
 
 func TestResolver_Resolve(t *testing.T) {
+    runTestResolver_Resolve(t, ResolverTypeDnslib)
+}
+
+func TestResolver_Resolve_GoDNS(t *testing.T) {
+    runTestResolver_Resolve(t, ResolverTypeGoDNS)
+}
+
+func runTestResolver_Resolve(t *testing.T, resolverType ResolverType) {
 	// Create a new cache and resolver for the test.
 	cfg := config.NewConfig()
 	dir, err := os.MkdirTemp("", "test-resolver-lmdb")
@@ -24,7 +32,7 @@ func TestResolver_Resolve(t *testing.T) {
 	m := metrics.NewMetrics("")
 	c := cache.NewCache(cfg.Cache.Size, cache.DefaultShards, cfg.Cache.LMDBPath, m)
 	defer c.Close()
-	r, err := NewResolver(ResolverTypeDnslib, cfg, c, m)
+	r, err := NewResolver(resolverType, cfg, c, m)
 	if err != nil {
 		t.Fatalf("Failed to create resolver: %v", err)
 	}
