@@ -8,9 +8,11 @@ tokio = { version = "1.28", features = ["full"] }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_yaml = "0.9"
-hickory-server = "0.24"
-hickory-proto = "0.24"
-hickory-resolver = { version = "0.24", features = ["dnssec-ring"] }
+hickory-server = { version = "0.24", features = ["dns-over-https-rustls", "dns-over-tls"] }
+hickory-proto = { version = "0.24", features = ["dns-over-https-rustls", "dns-over-tls"] }
+hickory-resolver = { version = "0.24", features = ["dnssec-ring", "dns-over-https-rustls", "dns-over-tls"] }
+rustls = "0.21"
+rustls-pemfile = "1.0"
 prometheus = "0.13"
 lazy_static = "1.4"
 log = "0.4"

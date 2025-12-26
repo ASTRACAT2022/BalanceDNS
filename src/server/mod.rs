@@ -156,8 +156,69 @@ impl Server {
         let tcp_listener = TcpListener::bind(&self.config.listen_addr).await?;
         server.register_listener(tcp_listener, Duration::from_secs(5));
 
+        // register DNS-over-TLS
+        if self.config.dot.enabled {
+            log::info!("Enabling DNS-over-TLS on {}", self.config.dot.listen_addr);
+            let certs = load_certs(&self.config.dot.cert_file)?;
+            let key = load_private_key(&self.config.dot.key_file)?;
+            
+            let tcp_listener = TcpListener::bind(&self.config.dot.listen_addr).await?;
+            server.register_tls_listener(tcp_listener, Duration::from_secs(5), (certs, key));
+        }
+
+        // register DNS-over-HTTPS
+        if self.config.doh.enabled {
+             log::info!("Enabling DNS-over-HTTPS on {}", self.config.doh.listen_addr);
+             let certs = load_certs(&self.config.doh.cert_file)?;
+             let key = load_private_key(&self.config.doh.key_file)?;
+            
+             let tcp_listener = TcpListener::bind(&self.config.doh.listen_addr).await?;
+             // register_https_listener(listener, duration, (certs, key), dns_hostname)
+             server.register_https_listener(tcp_listener, Duration::from_secs(5), (certs, key), None);
+        }
+
+
         server.block_until_done().await?;
 
         Ok(())
     }
+}
+
+// Helpers for Rustls
+use std::fs::File;
+use std::io::BufReader;
+use rustls::{Certificate, PrivateKey};
+
+fn load_certs(path: &str) -> anyhow::Result<Vec<Certificate>> {
+    let certfile = File::open(path).map_err(|e| anyhow::anyhow!("Failed to open cert file {}: {}", path, e))?;
+    let mut reader = BufReader::new(certfile);
+    let certs = rustls_pemfile::certs(&mut reader)
+        .map_err(|e| anyhow::anyhow!("Failed to read certs: {:?}", e))?;
+    
+    Ok(certs.into_iter().map(Certificate).collect())
+}
+
+fn load_private_key(path: &str) -> anyhow::Result<PrivateKey> {
+    let keyfile = File::open(path).map_err(|e| anyhow::anyhow!("Failed to open key file {}: {}", path, e))?;
+    let mut reader = BufReader::new(keyfile);
+
+    // Try PKCS8 first
+    let keys = rustls_pemfile::pkcs8_private_keys(&mut reader)
+         .map_err(|e| anyhow::anyhow!("Failed to read PKCS8 keys: {:?}", e))?;
+    
+    if !keys.is_empty() {
+        return Ok(PrivateKey(keys[0].clone()));
+    }
+    
+    // Rewind and try RSA
+    let keyfile = File::open(path)?;
+    let mut reader = BufReader::new(keyfile);
+    let keys = rustls_pemfile::rsa_private_keys(&mut reader)
+         .map_err(|e| anyhow::anyhow!("Failed to read RSA keys: {:?}", e))?;
+
+    if !keys.is_empty() {
+        return Ok(PrivateKey(keys[0].clone()));
+    }
+
+    Err(anyhow::anyhow!("No private key found in {}", path))
 }

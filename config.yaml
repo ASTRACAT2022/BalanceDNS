@@ -60,7 +60,7 @@ httpsrr:
 # DNS-over-HTTPS (DoH) settings
 # Requires valid certificates. Set enabled: false if not configured.
 doh:
-  enabled: false
+  enabled: true
   listen_addr: "0.0.0.0:443"
   cert_file: "/etc/astracat-dns/certs/server.crt"
   key_file: "/etc/astracat-dns/certs/server.key"
@@ -68,7 +68,7 @@ doh:
 # DNS-over-TLS (DoT) settings
 # Requires valid certificates. Set enabled: false if not configured.
 dot:
-  enabled: false
+  enabled: true
   listen_addr: "0.0.0.0:853"
   cert_file: "/etc/astracat-dns/certs/server.crt"
   key_file: "/etc/astracat-dns/certs/server.key"
