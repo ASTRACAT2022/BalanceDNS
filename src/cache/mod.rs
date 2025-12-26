@@ -72,11 +72,27 @@ impl Cache {
         };
 
         // Load from DB
-        cache.load_from_db()?;
+        if let Err(e) = cache.load_from_db() {
+             if e.to_string().contains("Too many corrupted items") {
+                 log::error!("Cache is corrupted ({}). Wiping and starting fresh...", e);
+                 // Drop everything to close environments
+                 drop(cache);
+                 drop(env_arc);
+                 // db is dropped when cache is dropped (it was moved into cache)
+                 
+                 // Remove directory
+                 let _ = fs::remove_dir_all(lmdb_path);
+                 
+                 // Recursively try again (once)
+                 return Cache::new(size, lmdb_path, metrics);
+             } else {
+                 return Err(e);
+             }
+        }
 
         // Start writer
-        let env_clone = env_arc.clone();
-        let db_clone = db;
+        let env_clone = cache.env.as_ref().unwrap().clone();
+        let db_clone = cache.db.unwrap();
         let metrics_clone = metrics.clone();
 
         // Spawn background writer task
@@ -113,11 +129,16 @@ impl Cache {
         let txn = env.begin_ro_txn()?;
         let mut cursor = txn.open_ro_cursor(db)?;
 
+        let mut corrupted_count = 0;
+        let mut total_count = 0;
+
         for item in cursor.iter() {
+             total_count += 1;
              let (key_bytes, val_bytes) = match item {
                  Ok(x) => x,
                  Err(e) => {
                      log::error!("LMDB cursor iteration error: {}", e);
+                     corrupted_count += 1;
                      continue;
                  }
              };
@@ -142,9 +163,16 @@ impl Cache {
                  Err(e) => {
                      log::error!("Failed to unpack cache item for key {}: {}", key, e);
                      self.metrics.increment_lmdb_errors();
+                     corrupted_count += 1;
                  }
              }
         }
+        
+        // If more than 10% or 100 items are corrupted, consider the DB broken
+        if corrupted_count > 0 && (corrupted_count > 100 || (total_count > 0 && corrupted_count * 10 > total_count)) {
+            return Err(anyhow::anyhow!("Too many corrupted items in cache"));
+        }
+
         Ok(())
     }
 

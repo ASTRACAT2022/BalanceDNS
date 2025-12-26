@@ -87,7 +87,7 @@ pub async fn create_resolver(
     // We use Google or Quad9 with DNSSEC
     let mut opts = ResolverOpts::default();
     opts.validate = false; // Disable DNSSEC validation for debugging
-    opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4thenIpv6; // Ensure IPv4 is tried
+    opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4Only; // Force IPv4 to avoid AAAA timeouts on non-IPv6 networks
     opts.timeout = cfg.resolver.upstream_timeout;
     opts.attempts = 3;
 
