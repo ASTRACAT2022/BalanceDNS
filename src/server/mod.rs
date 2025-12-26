@@ -190,15 +190,17 @@ use std::io::BufReader;
 use rustls::{Certificate, PrivateKey};
 
 fn load_certs(path: &str) -> anyhow::Result<Vec<Certificate>> {
+    log::info!("Loading certificates from: {}", path);
     let certfile = File::open(path).map_err(|e| anyhow::anyhow!("Failed to open cert file {}: {}", path, e))?;
     let mut reader = BufReader::new(certfile);
     let certs = rustls_pemfile::certs(&mut reader)
         .map_err(|e| anyhow::anyhow!("Failed to read certs: {:?}", e))?;
-    
+    log::info!("Loaded {} certificates from {}", certs.len(), path);
     Ok(certs.into_iter().map(Certificate).collect())
 }
 
 fn load_private_key(path: &str) -> anyhow::Result<PrivateKey> {
+    log::info!("Loading private key from: {}", path);
     let keyfile = File::open(path).map_err(|e| anyhow::anyhow!("Failed to open key file {}: {}", path, e))?;
     let mut reader = BufReader::new(keyfile);
 
@@ -207,6 +209,7 @@ fn load_private_key(path: &str) -> anyhow::Result<PrivateKey> {
          .map_err(|e| anyhow::anyhow!("Failed to read PKCS8 keys: {:?}", e))?;
     
     if !keys.is_empty() {
+        log::info!("Loaded PKCS8 private key from {}", path);
         return Ok(PrivateKey(keys[0].clone()));
     }
     
@@ -217,6 +220,7 @@ fn load_private_key(path: &str) -> anyhow::Result<PrivateKey> {
          .map_err(|e| anyhow::anyhow!("Failed to read RSA keys: {:?}", e))?;
 
     if !keys.is_empty() {
+        log::info!("Loaded RSA private key from {}", path);
         return Ok(PrivateKey(keys[0].clone()));
     }
 

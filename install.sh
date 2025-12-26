@@ -50,6 +50,13 @@ fi
 echo "✅ Build successful."
 
 # 5. Install binary
+echo "🛑 Stopping existing service to allow update..."
+if command -v systemctl &> /dev/null; then
+    sudo systemctl stop "$SERVICE_NAME" || true
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+     sudo launchctl unload "/Library/LaunchDaemons/com.astracat.dns-resolver.plist" 2>/dev/null || true
+fi
+
 echo "📦 Installing binary to $BINARY_PATH..."
 sudo cp "$COMPILED_BINARY" "$BINARY_PATH"
 sudo chmod +x "$BINARY_PATH"
