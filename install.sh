@@ -132,7 +132,7 @@ Restart=always
 User=root
 StandardOutput=journal
 StandardError=journal
-LogLevelMax=4
+Environment=RUST_LOG=info
 
 [Install]
 WantedBy=multi-user.target
