@@ -42,6 +42,8 @@ impl RequestHandler for Handler {
         let qtype = u16::from(query.query_type());
         let qtype_str = query.query_type().to_string();
 
+        log::info!("Received query: {} {} from {}", qtype_str, name, request.src().ip());
+
         self.metrics.increment_queries(&name);
         self.metrics.record_query_type(&qtype_str);
 
