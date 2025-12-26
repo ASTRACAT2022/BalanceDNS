@@ -1,17 +1,1 @@
-# Ignore log files
-*.log
-
-# Ignore compiled binaries
-astracat-dns
-dns-resolver
-
-# Ignore sensitive files
-cookies.txt
-*.key
-
-# Ignore temporary files
-dashboard.html
-server.log
-
-# Ignore certificates
-*.crt
+target/
