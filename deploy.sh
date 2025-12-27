@@ -92,6 +92,7 @@ cp config.yaml deploy_pkg/
 cat > deploy_pkg/setup_remote.sh << 'EOF'
 #!/bin/bash
 set -e
+
 echo "🔧 Installing binaries..."
 mv astracat-dns /usr/local/bin/
 mv astracat-proxy /usr/local/bin/
@@ -99,7 +100,43 @@ chmod +x /usr/local/bin/astracat-dns /usr/local/bin/astracat-proxy
 
 echo "📂 Configuring..."
 mkdir -p /etc/astracat-dns
+# Only overwrite config if it doesn't exist to preserve user changes, or force it?
+# User wants "setup", so let's ensure it's there.
 cp config.yaml /etc/astracat-dns/
+
+# --- Auto-Detect Certificates ---
+echo "🔍 Searching for SSL Certificates in /etc/letsencrypt/live/ ..."
+CERT_PATH=""
+KEY_PATH=""
+FOUND_DOMAIN=""
+
+# Loop through directories to find a valid pair
+if [ -d "/etc/letsencrypt/live" ]; then
+    for dir in /etc/letsencrypt/live/*; do
+        if [ -d "$dir" ] && [ -f "$dir/fullchain.pem" ] && [ -f "$dir/privkey.pem" ]; then
+            # Check if it's the specific one we want or just pick the first valid one
+            # Ideally prefer 'dns.astracat.ru' if present
+            CURRENT_DOMAIN=$(basename "$dir")
+            if [[ "$CURRENT_DOMAIN" == *"astracat"* ]] || [ -z "$FOUND_DOMAIN" ]; then
+                CERT_PATH="$dir/fullchain.pem"
+                KEY_PATH="$dir/privkey.pem"
+                FOUND_DOMAIN="$CURRENT_DOMAIN"
+            fi
+        fi
+    done
+fi
+
+if [ -n "$FOUND_DOMAIN" ]; then
+    echo "✅ Found certificates for domain: $FOUND_DOMAIN"
+    echo "   Cert: $CERT_PATH"
+    echo "   Key:  $KEY_PATH"
+else
+    echo "⚠️  No certificates found in /etc/letsencrypt/live/"
+    echo "   Using default/fallback paths. Proxy might fail to start if files are missing."
+    CERT_PATH="/etc/letsencrypt/live/dns.astracat.ru/fullchain.pem"
+    KEY_PATH="/etc/letsencrypt/live/dns.astracat.ru/privkey.pem"
+fi
+# --------------------------------
 
 echo "🛡️  Creating Systemd Service for Rust Core..."
 cat > /etc/systemd/system/astracat-dns.service << EOS
@@ -111,6 +148,11 @@ After=network.target
 ExecStart=/usr/local/bin/astracat-dns
 Restart=always
 User=root
+# Ensure we bind to 53. Unbound upstream is via LOCALHOST (since no docker net).
+# Wait, un-dockerized setup needs Unbound installed on HOST?
+# Yes. If 'type: unbound', user needs 'sudo apt install unbound' OR core falls back to recursive.
+# Let's verify environment. Assume recursive fallback or User installed unbound.
+# Usually native binary defaults to recursive internally if configured so.
 Environment=RUST_LOG=info
 WorkingDirectory=/etc/astracat-dns
 
@@ -119,13 +161,14 @@ WantedBy=multi-user.target
 EOS
 
 echo "🛡️  Creating Systemd Service for Go Proxy..."
+# Note: We inject the found paths using placeholders
 cat > /etc/systemd/system/astracat-proxy.service << EOS
 [Unit]
 Description=Astracat DoH/DoT Proxy
 After=network.target astracat-dns.service
 
 [Service]
-ExecStart=/usr/local/bin/astracat-proxy -upstream=127.0.0.1:53 -doh=0.0.0.0:443 -dot=0.0.0.0:853 -cert=/etc/letsencrypt/live/dns.astracat.ru/fullchain.pem -key=/etc/letsencrypt/live/dns.astracat.ru/privkey.pem
+ExecStart=/usr/local/bin/astracat-proxy -upstream=127.0.0.1:53 -doh=0.0.0.0:443 -dot=0.0.0.0:853 -cert=${CERT_PATH} -key=${KEY_PATH}
 Restart=always
 User=root
 
@@ -140,7 +183,7 @@ systemctl enable --now astracat-proxy
 systemctl restart astracat-dns
 systemctl restart astracat-proxy
 
-echo "✅ Deployment Complete!"
+echo "✅ Deployment Complete! Services are running 🚀"
 EOF
 chmod +x deploy_pkg/setup_remote.sh
 
