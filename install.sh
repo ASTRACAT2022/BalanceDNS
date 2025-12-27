@@ -180,7 +180,7 @@ Restart=always
 User=root
 StandardOutput=journal
 StandardError=journal
-Environment=RUST_LOG=info
+Environment=RUST_LOG=error
 
 [Install]
 WantedBy=multi-user.target
