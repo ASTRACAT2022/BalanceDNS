@@ -167,7 +167,8 @@ impl Server {
             let key = load_private_key(&self.config.dot.key_file)?;
             
             let tcp_listener = TcpListener::bind(&self.config.dot.listen_addr).await?;
-            server.register_tls_listener(tcp_listener, Duration::from_secs(5), (certs, key));
+            server.register_tls_listener(tcp_listener, Duration::from_secs(5), (certs, key))
+                .map_err(|e| anyhow::anyhow!("Failed to register DoT listener: {}", e))?;
         }
 
         // register DNS-over-HTTPS
@@ -178,7 +179,8 @@ impl Server {
             
              let tcp_listener = TcpListener::bind(&self.config.doh.listen_addr).await?;
              // register_https_listener(listener, duration, (certs, key), dns_hostname)
-             server.register_https_listener(tcp_listener, Duration::from_secs(5), (certs, key), None);
+             server.register_https_listener(tcp_listener, Duration::from_secs(5), (certs, key), None)
+                 .map_err(|e| anyhow::anyhow!("Failed to register DoH listener: {}", e))?;
         }
 
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-CERT_DIR="/etc/astracat-dns/certs"
+CERT_DIR="./certs"
 mkdir -p "$CERT_DIR"
 
 if [ -f "$CERT_DIR/server.key" ] && [ -f "$CERT_DIR/server.crt" ]; then
@@ -36,6 +36,6 @@ openssl req -x509 -newkey rsa:4096 -keyout "$CERT_DIR/server.key" -out "$CERT_DI
 
 chmod 600 "$CERT_DIR/server.key"
 chmod 644 "$CERT_DIR/server.crt"
-chown -R $(whoami) "$CERT_DIR"
+# chown -R $(whoami) "$CERT_DIR" # Removed chown as it's not needed/might fail in sandbox if user matches
 
 echo "Certificates generated successfully at $CERT_DIR"
