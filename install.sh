@@ -61,7 +61,7 @@ server:
     # Minimize internal cache (Rust handles caching)
     msg-cache-size: 1m
     rrset-cache-size: 1m
-    cache-max-ttl: 10
+    cache-max-ttl: 0
     infra-cache-numhosts: 100
 EOF
 
