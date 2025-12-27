@@ -103,11 +103,19 @@ sudo chmod +x "$BINARY_PATH"
 # 5.1 Install Config
 CONFIG_DIR="/etc/astracat-dns"
 CONFIG_FILE="$CONFIG_DIR/config.yaml"
+STALE_CONFIG="/usr/local/etc/astracat-dns/config.yaml"
+
 echo "📜 Installing configuration to $CONFIG_FILE..."
 sudo mkdir -p "$CONFIG_DIR"
 if [ -f "$PROJECT_DIR/config.yaml" ]; then
     sudo cp "$PROJECT_DIR/config.yaml" "$CONFIG_FILE"
-    echo "   Config installed."
+    echo "   Config installed to /etc/astracat-dns/config.yaml."
+    
+    # Cleanup stale config to prevent confusion
+    if [ -f "$STALE_CONFIG" ]; then
+        echo "🧹 Removing stale configuration at $STALE_CONFIG..."
+        sudo __rm "$STALE_CONFIG" 2>/dev/null || sudo rm "$STALE_CONFIG"
+    fi
 else
     echo "⚠️  config.yaml not found in project root. Skipping config installation."
 fi
