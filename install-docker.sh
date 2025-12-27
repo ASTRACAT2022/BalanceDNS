@@ -44,6 +44,14 @@ fi
 
 echo "✅ Docker detected. Using command: $DOCKER_COMPOSE_CMD"
 
+# 1.4 Fix common Docker Mount Corruption (File created as Directory)
+if [ -d "config-docker.yaml" ]; then
+    echo "⚠️  Detected 'config-docker.yaml' is a directory (Docker Mount corruption)."
+    echo "🧹 Removing corrupted directory and restoring file..."
+    rm -rf config-docker.yaml
+    git checkout config-docker.yaml
+fi
+
 # 1.5 Parse config.yaml to extract certificate path
 # We want to use the certification path defined in config.yaml for the Docker volume
 CONFIG_FILE="config.yaml"
