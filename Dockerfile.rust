@@ -22,7 +22,7 @@ COPY config.yaml ./config.yaml
 RUN cargo update -p async-lock --precise 3.3.0
 
 # Build Release
-RUN cargo build --release
+RUN cargo build --release --jobs 1
 
 # Runtime Stage
 FROM debian:bullseye-slim
