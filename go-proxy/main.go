@@ -78,6 +78,7 @@ func loadTLSConfig(cert, key string) *tls.Config {
 }
 
 func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg, client *dns.Client, upstream string) {
+	log.Printf("DoT Request from %s for %s", w.RemoteAddr().String(), r.Question[0].Name)
 	resp, _, err := client.Exchange(r, upstream)
 	if err != nil {
 		log.Printf("Upstream error: %s", err)
@@ -90,6 +91,7 @@ func handleDNSRequest(w dns.ResponseWriter, r *dns.Msg, client *dns.Client, upst
 }
 
 func handleDoHRequest(w http.ResponseWriter, r *http.Request, client *dns.Client, upstream string) {
+	log.Printf("DoH Request from %s %s %s", r.RemoteAddr, r.Method, r.URL.Path)
 	if r.Method != "POST" && r.Method != "GET" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
