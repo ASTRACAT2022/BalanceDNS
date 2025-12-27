@@ -93,7 +93,17 @@ echo "📄 Final .env configuration:"
 cat .env
 echo "--------------------------------"
 
-# 2. Stop conflicting system services
+# 2. Build first (while DNS/Internet is definitely working)
+echo "🏗️  Building Containers..."
+# Prune first
+echo "🧹 Cleaning up Docker cache..."
+docker system prune -f > /dev/null 2>&1 || true
+docker builder prune -f > /dev/null 2>&1 || true
+
+# Build now
+$DOCKER_COMPOSE_CMD build
+
+# 3. Stop conflicting system services (Only NOW, before starting containers)
 if systemctl is-active --quiet astracat-dns; then
     echo "🛑 Stopping local astracat-dns systemd service to free port 53..."
     sudo systemctl stop astracat-dns
@@ -106,16 +116,9 @@ if systemctl is-active --quiet unbound; then
     sudo systemctl disable unbound
 fi
 
-# 3. Pull and Build
-echo "🏗️  Building and Starting Containers..."
+echo "🚀 Starting Containers..."
 $DOCKER_COMPOSE_CMD down --remove-orphans || true
-
-# Attempt to free space (common issue on small VPS)
-echo "🧹 Cleaning up Docker cache to ensure sufficient space..."
-docker system prune -f > /dev/null 2>&1 || true
-docker builder prune -f > /dev/null 2>&1 || true
-
-$DOCKER_COMPOSE_CMD up -d --build
+$DOCKER_COMPOSE_CMD up -d --no-build
 
 echo "⏳ Waiting for services to initialize..."
 sleep 5
