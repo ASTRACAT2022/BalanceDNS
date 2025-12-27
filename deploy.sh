@@ -98,7 +98,40 @@ mv astracat-dns /usr/local/bin/
 mv astracat-proxy /usr/local/bin/
 chmod +x /usr/local/bin/astracat-dns /usr/local/bin/astracat-proxy
 
-echo "📂 Configuring..."
+# --- Install & Configure Engine (Unbound) ---
+echo "⚙️  Installing Unbound (DNS Engine)..."
+# Non-interactive to avoid prompts
+DEBIAN_FRONTEND=noninteractive apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y unbound
+
+echo "⚙️  Configuring Unbound on separate port (5353)..."
+# Create config to listen on 5353 (localhost only) so it doesn't conflict with our port 53
+cat > /etc/unbound/unbound.conf << 'UNBOUND_EOF'
+server:
+    verbosity: 1
+    interface: 127.0.0.1
+    port: 5353
+    do-ip4: yes
+    do-udp: yes
+    do-tcp: yes
+    access-control: 127.0.0.0/8 allow
+    cache-max-ttl: 86400
+    cache-min-ttl: 0
+    hide-identity: yes
+    hide-version: yes
+    minimal-responses: yes
+    # Recursion
+    do-not-query-localhost: no
+UNBOUND_EOF
+
+echo "🔄 Restarting Unbound..."
+systemctl stop systemd-resolved || true # Disable resolved if it conflicts
+systemctl disable systemd-resolved || true
+# Ensure configs are valid and restart
+systemctl restart unbound
+systemctl enable unbound
+
+echo "📂 Configuring App..."
 mkdir -p /etc/astracat-dns
 # Only overwrite config if it doesn't exist to preserve user changes, or force it?
 # User wants "setup", so let's ensure it's there.
@@ -153,7 +186,7 @@ User=root
 # Yes. If 'type: unbound', user needs 'sudo apt install unbound' OR core falls back to recursive.
 # Let's verify environment. Assume recursive fallback or User installed unbound.
 # Usually native binary defaults to recursive internally if configured so.
-Environment=RUST_LOG=info
+Environment=RUST_LOG=error
 WorkingDirectory=/etc/astracat-dns
 
 [Install]
@@ -168,7 +201,7 @@ Description=Astracat DoH/DoT Proxy
 After=network.target astracat-dns.service
 
 [Service]
-ExecStart=/usr/local/bin/astracat-proxy -upstream=127.0.0.1:53 -doh=0.0.0.0:443 -dot=0.0.0.0:853 -cert=${CERT_PATH} -key=${KEY_PATH}
+ExecStart=/usr/local/bin/astracat-proxy -upstream=127.0.0.1:53 -doh=0.0.0.0:443 -dot=0.0.0.0:853 -cert=${CERT_PATH} -key=${KEY_PATH} -quiet
 Restart=always
 User=root
 
