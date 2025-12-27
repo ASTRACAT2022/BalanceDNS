@@ -28,11 +28,16 @@ async fn main() -> anyhow::Result<()> {
     let mut config_loaded = false;
 
     for path in config_paths {
-        if let Ok(c) = config::Config::load(path) {
-            info!("Loaded configuration from {}", path);
-            cfg = c;
-            config_loaded = true;
-            break;
+        match config::Config::load(path) {
+            Ok(c) => {
+                info!("Loaded configuration from {}", path);
+                cfg = c;
+                config_loaded = true;
+                break;
+            }
+            Err(e) => {
+                log::warn!("Failed to load configuration from {}: {}", path, e);
+            }
         }
     }
 

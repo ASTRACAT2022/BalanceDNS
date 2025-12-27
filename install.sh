@@ -111,10 +111,11 @@ if [ -f "$PROJECT_DIR/config.yaml" ]; then
     sudo cp "$PROJECT_DIR/config.yaml" "$CONFIG_FILE"
     echo "   Config installed to /etc/astracat-dns/config.yaml."
     
-    # Cleanup stale config to prevent confusion
+    # Cleanup stale config to prevent confusion (Force remove)
+    echo "🧹 Ensuring stale configuration at $STALE_CONFIG is removed..."
+    sudo rm -f "$STALE_CONFIG"
     if [ -f "$STALE_CONFIG" ]; then
-        echo "🧹 Removing stale configuration at $STALE_CONFIG..."
-        sudo __rm "$STALE_CONFIG" 2>/dev/null || sudo rm "$STALE_CONFIG"
+         echo "⚠️  Failed to remove stale config. Please remove manually."
     fi
 else
     echo "⚠️  config.yaml not found in project root. Skipping config installation."
