@@ -84,88 +84,6 @@ impl Resolver for HickoryResolver {
     }
 }
 
-#[allow(dead_code)]
-pub struct KresResolver {
-    ctx: Arc<kres::Context>,
-}
-
-#[async_trait]
-impl Resolver for KresResolver {
-    async fn resolve(&self, name: &str, qtype: u16) -> anyhow::Result<Message> {
-        // Construct DNS question wire format
-        // We can use Hickory to construct the query packet, then pass bytes to kres.
-        let mut query_msg = Message::new();
-        query_msg.set_id(0);
-        query_msg.set_recursion_desired(true);
-        let name_clean = Name::from_str(name)?;
-        query_msg.add_query(hickory_proto::op::Query::query(name_clean, RecordType::from(qtype)));
-        let question_bytes = query_msg.to_vec()?;
-        
-        // Kres logic (based on user example)
-        let ctx = self.ctx.clone();
-        let req = kres::Request::new(ctx);
-        // "from_addr" in consume is the client address. 
-        // Since we are the resolver, we can use a dummy local address or the actual client addr if we propagated it (we don't here).
-        // Let's use 127.0.0.1:0
-        let from_addr = "127.0.0.1:53".parse::<std::net::SocketAddr>().unwrap();
-
-        let mut state = req.consume(&question_bytes, from_addr);
-        
-        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-
-        while state == kres::State::PRODUCE {
-            state = if let Some((msg, addr_set)) = req.produce() {
-                 if addr_set.is_empty() {
-                     break; 
-                 }
-                 let target = addr_set[0]; // Just pick first? 
-                 
-                 // Send
-                 socket.send_to(&msg, target).await?;
-                 
-                 // Receive
-                 let mut buf = [0u8; 4096];
-                 // We need timeout here to prevent indefinite hang
-                 let res = tokio::time::timeout(std::time::Duration::from_secs(2), socket.recv_from(&mut buf)).await;
-                 
-                 match res {
-                     Ok(Ok((amt, src))) => {
-                         req.consume(&buf[..amt], src)
-                     },
-                     _ => {
-                         // Timeout or error, how to notify kres? 
-                         // Implicitly it will retry if we call produce again? 
-                         // Or we must allow kres to decide.
-                         // But if we don't consume anything, state doesn't change?
-                         // "It doesn't require a specific I/O model and instead provides a generic interface for pushing/pulling DNS messages"
-                         // Does consume handle empty/timeout?
-                         // User example doesn't show timeout handling.
-                         // Maybe we just break loop?
-                         break; 
-                     }
-                 }
-            } else {
-                break;
-            }
-        }
-        
-        // Finish
-        // finish(state) returns Result<Vec<u8>, Error>
-        match req.finish(state) {
-            Ok(answer_bytes) => {
-                 let msg = Message::from_vec(&answer_bytes)?;
-                 Ok(msg)
-            },
-            Err(e) => {
-                 // Kres failed
-                 log::error!("Kres resolution failed: {:?}", e);
-                 let mut servfail = Message::new();
-                 servfail.set_response_code(hickory_proto::op::ResponseCode::ServFail);
-                 Ok(servfail)
-            }
-        }
-    }
-}
 
 pub async fn create_resolver(
     resolver_type: &str,
@@ -201,20 +119,6 @@ pub async fn create_resolver(
             metrics,
             _cache: cache,
         }));
-    } else if resolver_type.eq_ignore_ascii_case("kres") {
-        info!("Initializing Knot Resolver (libkres)...");
-        
-        // In a real scenario we might want to configure context (trust anchors etc).
-        // Assuming default context is sufficient or loads system defaults.
-        let ctx = kres::Context::new(); 
-        
-        // Need to handle Ctx creation error? 
-        // User example: Context::new(). Is it safe or result?
-        // Assuming it's Context::new() -> Context
-        
-        Ok(Box::new(KresResolver {
-            ctx: Arc::new(ctx),
-        }))
     }
 
     // Default to Hickory Recursive

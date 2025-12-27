@@ -19,7 +19,7 @@ metrics_storage_path: /tmp/dns_metrics.json
 
 # Resolver settings
 resolver:
-  type: kres
+  type: unbound
   upstream_timeout: 5s
   request_timeout: 5s
   max_workers: 10
