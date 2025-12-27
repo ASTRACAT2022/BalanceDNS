@@ -74,9 +74,26 @@ if [ -f "$CONFIG_FILE" ]; then
              fi
         fi
     fi
+        fi
+    fi
 else
     echo "⚠️  config.yaml not found. Using defaults in .env if available."
 fi
+
+# 1.6 Ensure .env has critical values (Safety Fallback)
+if ! grep -q "HOST_CERT_ROOT" .env 2>/dev/null; then
+    echo "⚠️  Certificate configuration missing. Setting fallback defaults (Self-signed mode)..."
+    # Fallback to local ./certs mapping
+    echo "HOST_CERT_ROOT=./certs" >> .env
+    echo "PROXY_CERT_PATH=/certs_root/server.crt" >> .env
+    echo "PROXY_KEY_PATH=/certs_root/server.key" >> .env
+    echo "UNBOUND_UPSTREAM=unbound:53" >> .env
+fi
+
+# 1.7 Debug .env content
+echo "📄 Final .env configuration:"
+cat .env
+echo "--------------------------------"
 
 # 2. Stop conflicting system services
 if systemctl is-active --quiet astracat-dns; then

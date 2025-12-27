@@ -19,8 +19,8 @@ async fn main() -> anyhow::Result<()> {
     // Load configuration
     // Load configuration
     let config_paths = vec![
-        "config.yaml",
         "/etc/astracat-dns/config.yaml",
+        "config.yaml",
         "/usr/local/etc/astracat-dns/config.yaml",
     ];
 
