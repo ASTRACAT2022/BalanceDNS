@@ -74,6 +74,9 @@ fi
 # 2. Build Go Proxy (Linux x86_64)
 echo "🐭 Building Go Proxy for Linux x86_64..."
 cd go-proxy
+echo "📦 Downloading Go modules..."
+go mod tidy
+echo "🔨 Compiling Go Proxy..."
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o astracat-proxy main.go
 cd ..
 
