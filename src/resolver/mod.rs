@@ -24,56 +24,87 @@ pub struct HickoryResolver {
 #[async_trait]
 impl Resolver for HickoryResolver {
     async fn resolve(&self, name: &str, qtype: u16) -> anyhow::Result<Message> {
+        let rt = RecordType::from(qtype);
+        let name_parsed = Name::from_str(name).unwrap_or(Name::root());
+        let cache_key = format!("{}|{}", name, qtype);
+
+        // 1. Check Cache
+        if let Some((msg_bytes, stale)) = self._cache.get(&cache_key) {
+            if let Ok(msg) = Message::from_vec(&msg_bytes) {
+                if !stale {
+                    // Cache Hit
+                    return Ok(msg);
+                } else {
+                    // Stale hit: we should revalidate in background, but for now just use it?
+                    // Or treat as miss if stale?
+                    // "Stale While Revalidate" logic usually implies serving stale and revalidating.
+                    // For simplicity, we can return stale but trigger a background task.
+                    // BUT our `resolve` is async.
+                    // Let's implement simpler logic: if stale, treat as miss but maybe use it if upstream fails?
+                    // For now, let's treat stale as miss to force refresh.
+                }
+            }
+        }
+
+        // 2. Forward to Upstream (Unbound)
         let mut msg = Message::new();
         msg.set_id(0);
         msg.set_recursion_desired(true);
         msg.set_recursion_available(true);
 
-        let rt = RecordType::from(qtype);
-        let name_parsed = Name::from_str(name).unwrap_or(Name::root());
-
-        // Use lookup for generic record types
-        // Hickory resolver 'lookup' handles CNAME following etc.
         match self.resolver.lookup(name, rt).await {
             Ok(lookup) => {
                 // Lookup successful
+                let mut min_ttl = 300; // Default TTL cap
+                
                 for record in lookup.record_iter() {
                     msg.add_answer(record.clone());
+                    if record.ttl() < min_ttl {
+                        min_ttl = record.ttl();
+                    }
                 }
                 
-                // If DNSSEC validated?
-                // Hickory resolver validates if configured.
-                // We can assume data is authentic if we are relying on the validator.
+                // We trust Unbound for validation
                 msg.set_authentic_data(true); 
+                msg.set_response_code(hickory_proto::op::ResponseCode::NoError);
+
+                // 3. Store in Cache
+                if let Ok(bytes) = msg.to_vec() {
+                     // Store with TTL. min_ttl ensures we respect upstream.
+                     // SWR window: e.g. 10m
+                     self._cache.set(&cache_key, bytes, std::time::Duration::from_secs(min_ttl as u64), std::time::Duration::from_secs(600));
+                }
             },
             Err(e) => {
-                // If it's a NXDOMAIN or NoRecords, we should return that code.
-                // But lookup error structure in Hickory requires checking kind.
                 use hickory_resolver::error::ResolveError;
                 use hickory_resolver::error::ResolveErrorKind;
                 
                 match e.kind() {
                     ResolveErrorKind::NoRecordsFound { .. } => {
                         msg.set_response_code(hickory_proto::op::ResponseCode::NoError);
+                        // Cache NoData? Yes, briefly. 
+                         if let Ok(bytes) = msg.to_vec() {
+                             self._cache.set(&cache_key, bytes, std::time::Duration::from_secs(60), std::time::Duration::from_secs(60));
+                         }
                     },
                     ResolveErrorKind::Proto(_proto_err) => {
                          let s = e.to_string();
                          if s.contains("NXDomain") {
                              msg.set_response_code(hickory_proto::op::ResponseCode::NXDomain);
+                             // Cache NXDOMAIN? Yes.
+                             if let Ok(bytes) = msg.to_vec() {
+                                 self._cache.set(&cache_key, bytes, std::time::Duration::from_secs(300), std::time::Duration::from_secs(60));
+                             }
                          } else {
-                             // Treat other proto errors as ServFail without throwing hard error
                              msg.set_response_code(hickory_proto::op::ResponseCode::ServFail);
                          }
                     },
                     ResolveErrorKind::Timeout => {
-                        // Return ServFail on timeout so client knows to retry/fail
                         msg.set_response_code(hickory_proto::op::ResponseCode::ServFail);
                     },
                     _ => {
-                         // For other errors, log a warning but return ServFail to client
                          log::warn!("Resolver error for {}: {}", name, e);
                          msg.set_response_code(hickory_proto::op::ResponseCode::ServFail);
-                         // return Err(anyhow::anyhow!("Resolution error: {}", e)); // Don't return Err to avoid log spam in server
                     }
                 }
 
