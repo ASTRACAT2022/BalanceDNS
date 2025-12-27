@@ -21,52 +21,19 @@ echo "📁 Project directory: $PROJECT_DIR"
 cd "$PROJECT_DIR"
 
 # 2. Install dependencies (Linux/Debian focused)
-echo "🔧 Checking system dependencies..."
-if command -v apt-get &> /dev/null; then
-    export DEBIAN_FRONTEND=noninteractive
-    echo "   Installing build-essential, pkg-config, libssl-dev, liblmdb-dev, libunbound-dev, unbound..."
+    echo "   Installing build-essential, pkg-config, libssl-dev, liblmdb-dev, libkres-dev, knot-resolver..."
     sudo apt-get update -qq
-    sudo apt-get install -y build-essential pkg-config libssl-dev liblmdb-dev libunbound-dev unbound -qq
+    sudo apt-get install -y build-essential pkg-config libssl-dev liblmdb-dev libkres-dev knot-resolver -qq
 elif command -v yum &> /dev/null; then
-    echo "   Installing development tools, openssl-devel, lmdb-devel, unbound-devel, unbound..."
+    echo "   Installing development tools, openssl-devel, lmdb-devel, knot-resolver-devel..."
     sudo yum groupinstall -y "Development Tools"
-    sudo yum install -y openssl-devel lmdb-devel unbound-devel unbound
+    sudo yum install -y openssl-devel lmdb-devel knot-resolver-devel
 else
     echo "⚠️  Warning: Package manager not found or not supported in this script."
-    echo "   Please ensure you have dependencies installed."
+    echo "   Please ensure you have build-essential, libssl-dev, liblmdb-dev, and libkres-dev installed."
 fi
 
-# Configure Unbound (Local Recursive Resolver)
-echo "🌍 Configuring Unbound as local recursive resolver on 127.0.0.1:5353..."
-if command -v unbound &> /dev/null; then
-    sudo bash -c "cat > /etc/unbound/unbound.conf" <<EOF
-server:
-    verbosity: 1
-    interface: 127.0.0.1@5353
-    port: 5353
-    do-ip4: yes
-    do-ip6: no
-    do-udp: yes
-    do-tcp: yes
-    access-control: 127.0.0.0/8 allow
-    hide-identity: yes
-    hide-version: yes
-    harden-glue: yes
-    harden-dnssec-stripped: yes
-    use-caps-for-id: no
-    edns-buffer-size: 1232
-    prefetch: yes
-    num-threads: 2
-    # Ensure root hints are used (default)
-EOF
 
-    # Restart Unbound
-    echo "🔄 Restarting Unbound service..."
-    if command -v systemctl &> /dev/null; then
-        sudo systemctl enable unbound
-        sudo systemctl restart unbound
-    fi
-fi
 
 # 3. Build project
 echo "🔨 Building project with Cargo (Release mode)..."
