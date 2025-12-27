@@ -8,6 +8,7 @@ RUN go mod download
 
 COPY main.go ./
 
+RUN go mod tidy
 RUN CGO_ENABLED=0 GOOS=linux go build -o go-proxy main.go
 
 FROM scratch
