@@ -92,8 +92,8 @@ pub async fn create_resolver(
 ) -> anyhow::Result<Box<dyn Resolver>> {
     // Configure Resolver for TRUE recursive resolution from root servers
     let mut opts = ResolverOpts::default();
-    opts.validate = true; // Enable DNSSEC validation
-    opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4Only; // Force IPv4 to avoid AAAA timeouts on non-IPv6 networks
+    opts.validate = false; // Disable DNSSEC validation to prevent SERVFAILs
+    opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4Only;
     opts.timeout = cfg.resolver.upstream_timeout;
     opts.attempts = 3;
     opts.recursion_desired = true;
