@@ -125,9 +125,18 @@ pub async fn create_resolver(
     if resolver_type.eq_ignore_ascii_case("unbound") {
          let upstream = cfg.resolver.upstream_addr.as_deref().unwrap_or("127.0.0.1:5353");
          info!("Initializing Hickory Resolver in Forwarding mode to local Unbound ({})...", upstream);
+         
+         // Resolve hostname to IP (e.g. "unbound:53" -> 172.18.0.2:53)
+         let mut addrs = tokio::net::lookup_host(upstream).await
+             .map_err(|e| anyhow::anyhow!("Failed to resolve upstream {}: {}", upstream, e))?;
+         let socket_addr = addrs.next()
+             .ok_or_else(|| anyhow::anyhow!("Could not resolve upstream {}", upstream))?;
+         
+         info!("Resolved upstream {} to {}", upstream, socket_addr);
+
          let mut config = ResolverConfig::new();
          config.add_name_server(hickory_resolver::config::NameServerConfig {
-             socket_addr: upstream.parse()?,
+             socket_addr,
              protocol: hickory_resolver::config::Protocol::Udp,
              tls_dns_name: None,
              trust_negative_responses: true,
