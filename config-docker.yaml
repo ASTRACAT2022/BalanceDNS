@@ -3,19 +3,21 @@
 listen_addr: "0.0.0.0:53"
 metrics_addr: "0.0.0.0:9091"
 admin_addr: "0.0.0.0:8081"
-metrics_storage_path: /tmp/dns_metrics.json
+metrics_storage_path: "/tmp/dns_metrics.json"
 
 admin:
   username: "admin"
   password: "change_me"
 
 resolver:
-  # Calculate upstream to Unbound container
+  # Using Unbound for recursion
   type: unbound
   upstream_timeout: 5s
   request_timeout: 5s
   max_workers: 10
-
+  # Docker specific: Connect to Unbound container
+  upstream_addr: "unbound:53"
+  
 cache:
   lmdb_path: "/tmp/dns_cache.lmdb"
   size: 5000
@@ -25,7 +27,7 @@ cache:
 
 hosts:
   enabled: true
-  path: "/etc/astracat-dns/hosts" # Will need to mount hosts if used
+  path: "/etc/astracat-dns/hosts"
 
 adblock:
   enabled: true
