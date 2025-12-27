@@ -108,6 +108,7 @@ impl Default for Config {
                 upstream_timeout: Duration::from_secs(5),
                 request_timeout: Duration::from_secs(5),
                 max_workers: 10,
+                upstream_addr: None,
             },
             cache: CacheConfig {
                 lmdb_path: "/tmp/dns_cache.lmdb".to_string(),

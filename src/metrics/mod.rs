@@ -347,7 +347,7 @@ impl Metrics {
             interval.tick().await;
             sys.refresh_all();
 
-            let cpu_usage = sys.global_cpu_usage();
+            let cpu_usage = sys.global_cpu_info().cpu_usage();
             *self.cpu_usage.write().unwrap() = cpu_usage;
             self.prom_cpu_usage.set(cpu_usage as f64);
 
