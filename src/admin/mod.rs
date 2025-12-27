@@ -2,6 +2,7 @@ use std::sync::Arc;
 use crate::metrics::Metrics;
 use crate::plugins::PluginManager;
 use crate::config::AdminConfig;
+use crate::resolver::Resolver;
 use hyper::{Body, Request, Response, Server, service::{make_service_fn, service_fn}};
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -13,15 +14,17 @@ pub struct AdminServer {
     metrics: Arc<Metrics>,
     pm: Arc<PluginManager>,
     config: AdminConfig,
+    resolver: Arc<Box<dyn Resolver>>,
 }
 
 impl AdminServer {
-    pub fn new(addr: &str, metrics: Arc<Metrics>, pm: Arc<PluginManager>, config: AdminConfig) -> Self {
+    pub fn new(addr: &str, metrics: Arc<Metrics>, pm: Arc<PluginManager>, config: AdminConfig, resolver: Arc<Box<dyn Resolver>>) -> Self {
         AdminServer {
             addr: addr.to_string(),
             metrics,
             pm,
             config,
+            resolver,
         }
     }
 
@@ -44,8 +47,16 @@ impl AdminServer {
                 Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
                     let srv = srv.clone();
                     let auth = auth.clone();
-                    async move {
-                        // Check Auth
+                async move {
+                        let path = req.uri().path().to_string();
+                        let query = req.uri().query().unwrap_or("");
+                        
+                        // Public endpoint - no auth required
+                        if path == "/api/resolve" {
+                            return handle_resolve(srv.clone(), query).await;
+                        }
+                        
+                        // Check Auth for protected endpoints
                         if !check_auth(&req, &auth) {
                              return Ok::<_, Infallible>(Response::builder()
                                 .status(401)
@@ -113,4 +124,74 @@ fn check_auth(req: &Request<Body>, expected: &str) -> bool {
         }
     }
     false
+}
+
+async fn handle_resolve(srv: Arc<AdminServer>, query: &str) -> Result<Response<Body>, Infallible> {
+    // Parse query parameters: name=domain&type=A
+    let mut name = "";
+    let mut qtype = "A";
+    
+    for param in query.split('&') {
+        let parts: Vec<&str> = param.split('=').collect();
+        if parts.len() == 2 {
+            match parts[0] {
+                "name" => name = parts[1],
+                "type" => qtype = parts[1],
+                _ => {}
+            }
+        }
+    }
+    
+    if name.is_empty() {
+        return Ok(Response::builder()
+            .status(400)
+            .header("Content-Type", "application/json")
+            .body(Body::from(r#"{"error":"Missing 'name' parameter"}"#))
+            .unwrap());
+    }
+    
+    // Convert type string to u16
+    let qtype_num = match qtype {
+        "A" => 1,
+        "AAAA" => 28,
+        "CNAME" => 5,
+        "MX" => 15,
+        "TXT" => 16,
+        "NS" => 2,
+        _ => 1, // default to A
+    };
+    
+    // Perform resolution
+    match srv.resolver.resolve(name, qtype_num).await {
+        Ok(msg) => {
+            // Extract IP addresses from answers
+            let mut ips = Vec::new();
+            for answer in msg.answers() {
+                if let Some(rdata) = answer.data() {
+                    ips.push(
+rdata.to_string());
+                }
+            }
+            
+            let json = serde_json::json!({
+                "name": name,
+                "type": qtype,
+                "answers": ips,
+                "status": msg.response_code().to_string()
+            });
+            
+            Ok(Response::builder()
+                .header("Content-Type", "application/json")
+                .header("Access-Control-Allow-Origin", "*")
+                .body(Body::from(json.to_string()))
+                .unwrap())
+        }
+        Err(e) => {
+            Ok(Response::builder()
+                .status(500)
+                .header("Content-Type", "application/json")
+                .body(Body::from(format!(r#"{{"error":"{}"}}"#, e)))
+                .unwrap())
+        }
+    }
 }

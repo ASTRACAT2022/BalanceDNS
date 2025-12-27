@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Start admin server
     if !cfg.admin_addr.is_empty() {
-         let admin_server = admin::AdminServer::new(&cfg.admin_addr, metrics.clone(), pm.clone(), cfg.admin.clone());
+         let admin_server = admin::AdminServer::new(&cfg.admin_addr, metrics.clone(), pm.clone(), cfg.admin.clone(), res.clone());
          tokio::spawn(async move {
              if let Err(e) = admin_server.start().await {
                  error!("Admin server error: {}", e);
