@@ -49,11 +49,11 @@ services:
       - "-upstream=astracat-dns:53"
       - "-doh=0.0.0.0:443"
       - "-dot=0.0.0.0:853"
-      - "-cert=/certs/fullchain.pem"
-      - "-key=/certs/privkey.pem"
+      - "-cert=${PROXY_CERT_PATH}"
+      - "-key=${PROXY_KEY_PATH}"
     volumes:
-      # Mount Let's Encrypt certs (configured in .env)
-      - ${HOST_CERT_PATH}:/certs:ro
+      # Mount Let's Encrypt Root to handle symlinks
+      - ${HOST_CERT_ROOT}:/certs_root:ro
     networks:
       - dns-net
 

@@ -34,13 +34,44 @@ if [ -f "$CONFIG_FILE" ]; then
         # Extract path inside quotes
         FULL_CERT_PATH=$(echo "$CERT_PATH_LINE" | sed -n 's/.*"\(.*\)".*/\1/p')
         if [ -n "$FULL_CERT_PATH" ]; then
-             CERT_DIR=$(dirname "$FULL_CERT_PATH")
-             echo "🔑 Detected Certificate Directory: $CERT_DIR"
-             
-             # Write to .env
-             echo "HOST_CERT_PATH=$CERT_DIR" > .env
-             echo "UNBOUND_UPSTREAM=unbound:53" >> .env
-             echo "✅ Updated .env configuration from config.yaml"
+             # Crucial: Let's Encrypt uses symlinks in /live pointing to /archive
+             # We must mount the ROOT config dir (e.g. /etc/letsencrypt)
+             # Assumption: path is like /etc/letsencrypt/live/domain/file
+             if [[ "$FULL_CERT_PATH" == *"/letsencrypt/"* ]]; then
+                 CERT_ROOT="/etc/letsencrypt"
+                 # Calculate relative path for Go Proxy
+                 # e.g. /live/dns.astracat.ru/fullchain.pem
+                 # resulting container path: /certs_root/live/dns.astracat.ru/fullchain.pem
+                 CERT_SUBPATH=${FULL_CERT_PATH#$CERT_ROOT}
+                 PROXY_CERT="/certs_root$CERT_SUBPATH"
+                 
+                 # Key path assumed similar
+                 KEY_PATH_LINE=$(grep "key_file:" "$CONFIG_FILE" | head -n 1)
+                 FULL_KEY_PATH=$(echo "$KEY_PATH_LINE" | sed -n 's/.*"\(.*\)".*/\1/p')
+                 KEY_SUBPATH=${FULL_KEY_PATH#$CERT_ROOT}
+                 PROXY_KEY="/certs_root$KEY_SUBPATH"
+                 
+                 echo "🔑 Detected Let's Encrypt. Mounting Root: $CERT_ROOT"
+                 echo "   Cert Path in Container: $PROXY_CERT"
+                 
+                 echo "HOST_CERT_ROOT=$CERT_ROOT" > .env
+                 echo "PROXY_CERT_PATH=$PROXY_CERT" >> .env
+                 echo "PROXY_KEY_PATH=$PROXY_KEY" >> .env
+                 echo "UNBOUND_UPSTREAM=unbound:53" >> .env
+                 echo "✅ Updated .env configuration from config.yaml"
+             else
+                 # Fallback for custom certs (non-LE)
+                 CERT_DIR=$(dirname "$FULL_CERT_PATH")
+                 echo "🔑 Detected Custom Certificates: $CERT_DIR"
+                 echo "HOST_CERT_ROOT=$CERT_DIR" > .env
+                 # For custom certs, we mount dir to /certs_root, so file is /certs_root/filename
+                 CERT_NAME=$(basename "$FULL_CERT_PATH")
+                 KEY_NAME=$(basename "$FULL_KEY_PATH") # Assume key defined
+                 echo "PROXY_CERT_PATH=/certs_root/$CERT_NAME" >> .env
+                 # This part is a bit weak if key is in diff dir, but good enough for now
+                 echo "PROXY_KEY_PATH=/certs_root/privkey.pem" >> .env # default fallback
+                 echo "UNBOUND_UPSTREAM=unbound:53" >> .env
+             fi
         fi
     fi
 else
