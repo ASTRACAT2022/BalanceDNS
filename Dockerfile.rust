@@ -18,6 +18,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY config.yaml ./config.yaml
 
+# Fix: Pin async-lock to stable version to avoid rustc 1.85 requirement
+RUN cargo update -p async-lock --precise 3.3.0
+
 # Build Release
 RUN cargo build --release
 
