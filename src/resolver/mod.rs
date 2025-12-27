@@ -123,10 +123,11 @@ pub async fn create_resolver(
     metrics: Arc<Metrics>
 ) -> anyhow::Result<Box<dyn Resolver>> {
     if resolver_type.eq_ignore_ascii_case("unbound") {
-         info!("Initializing Hickory Resolver in Forwarding mode to local Unbound (127.0.0.1:5353)...");
+         let upstream = cfg.resolver.upstream_addr.as_deref().unwrap_or("127.0.0.1:5353");
+         info!("Initializing Hickory Resolver in Forwarding mode to local Unbound ({})...", upstream);
          let mut config = ResolverConfig::new();
          config.add_name_server(hickory_resolver::config::NameServerConfig {
-             socket_addr: "127.0.0.1:5353".parse()?,
+             socket_addr: upstream.parse()?,
              protocol: hickory_resolver::config::Protocol::Udp,
              tls_dns_name: None,
              trust_negative_responses: true,

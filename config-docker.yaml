@@ -1,0 +1,55 @@
+# ASTRACAT Resolver Configuration (Docker)
+
+listen_addr: "0.0.0.0:53"
+metrics_addr: "0.0.0.0:9091"
+admin_addr: "0.0.0.0:8081"
+metrics_storage_path: /tmp/dns_metrics.json
+
+admin:
+  username: "admin"
+  password: "change_me"
+
+resolver:
+  # Calculate upstream to Unbound container
+  type: unbound
+  upstream_timeout: 5s
+  request_timeout: 5s
+  max_workers: 10
+
+cache:
+  lmdb_path: "/tmp/dns_cache.lmdb"
+  size: 5000
+  max_ttl: 3600s
+  min_ttl: 60s
+  stale_while_revalidate: 1m
+
+hosts:
+  enabled: true
+  path: "/etc/astracat-dns/hosts" # Will need to mount hosts if used
+
+adblock:
+  enabled: true
+  blocklist_urls:
+    - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+
+rate_limit:
+  enabled: true
+  qps: 100
+  burst: 200
+
+# DoH/DoT handled by Go Proxy in Docker, disable internal listeners
+doh:
+  enabled: false
+  listen_addr: "0.0.0.0:443"
+  cert_file: ""
+  key_file: ""
+
+dot:
+  enabled: false
+  listen_addr: "0.0.0.0:853"
+  cert_file: ""
+  key_file: ""
+
+httpsrr:
+  enabled: false
+  records: []

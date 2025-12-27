@@ -28,6 +28,7 @@ pub struct ResolverConfig {
     #[serde(with = "humantime_serde")]
     pub request_timeout: Duration,
     pub max_workers: usize,
+    pub upstream_addr: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

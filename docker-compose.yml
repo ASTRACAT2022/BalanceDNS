@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  # 1. Unbound Recursive Resolver
+  unbound:
+    image: mvance/unbound:latest
+    container_name: astracat-unbound
+    restart: unless-stopped
+    volumes:
+      - ./unbound-docker.conf:/opt/unbound/etc/unbound/unbound.conf:ro
+    networks:
+      - dns-net
+
+  # 2. Astracat DNS (Rust Core)
+  astracat-dns:
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+    container_name: astracat-core
+    restart: unless-stopped
+    depends_on:
+      - unbound
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "9091:9091" # Metrics
+      - "8081:8081" # Admin
+    environment:
+      - RUST_LOG=info
+    volumes:
+      - ./config-docker.yaml:/etc/astracat-dns/config.yaml:ro
+      - dns_cache:/tmp
+    networks:
+      - dns-net
+
+  # 3. Go Proxy (DoH/DoT Frontend)
+  go-proxy:
+    build:
+      context: ./go-proxy
+      dockerfile: Dockerfile
+    container_name: astracat-proxy
+    restart: unless-stopped
+    depends_on:
+      - astracat-dns
+    ports:
+      - "443:443"   # DoH
+      - "853:853"   # DoT
+    command: 
+      - "-upstream=astracat-dns:53"
+      - "-doh=0.0.0.0:443"
+      - "-dot=0.0.0.0:853"
+      - "-cert=/certs/fullchain.pem"
+      - "-key=/certs/privkey.pem"
+    volumes:
+      # Mount Let's Encrypt certs
+      - /etc/letsencrypt/live/dns.astracat.ru:/certs:ro
+    networks:
+      - dns-net
+
+networks:
+  dns-net:
+    driver: bridge
+
+volumes:
+  dns_cache:
