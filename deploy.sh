@@ -21,24 +21,52 @@ echo "🦀 Building Astracat-DNS-RS for Linux x86_64..."
 # 1. Build Rust Binary (Linux x86_64)
 echo "🦀 Building Astracat-DNS-RS for Linux x86_64 (using temporary builder container)..."
 
-# Use explicit Docker build to ensure compatibility and avoid 'cross' toolchain issues
-if ! command -v docker &> /dev/null; then
-    echo "❌ Docker Desktop is required for the *build* step (to compile Linux binary on Mac)."
-    exit 1
+# 1. Build Rust Binary (Linux x86_64) using Zig (No Docker required)
+echo "🦀 Building Astracat-DNS-RS for Linux x86_64 using Zig..."
+
+# Check for Docker (just in case), if not, use Zig
+if command -v docker &> /dev/null; then
+    echo "🐳 Docker found. Utilizing Docker for build..."
+    docker run --rm \
+        -v "$(pwd)":/usr/src/app \
+        -w /usr/src/app \
+        -e CARGO_HOME=/usr/src/app/.cargo-cache \
+        rust:1.83-bullseye \
+        cargo build --release --jobs 4
+    BUILD_ARTIFACT="target/release/astracat-dns-rs"
+else
+    echo "⚠️  Docker not found. Falling back to Zig for cross-compilation..."
+    
+    # Check Brew
+    if ! command -v brew &> /dev/null; then
+        echo "❌ Homebrew not found. Cannot install Zig. Please install Docker or Homebrew."
+        exit 1
+    fi
+
+    # Install Zig
+    if ! command -v zig &> /dev/null; then
+        echo "🍺 Installing Zig via Homebrew..."
+        brew install zig
+    fi
+
+    # Install Cargo Zigbuild
+    if ! command -v cargo-zigbuild &> /dev/null; then
+        echo "📦 Installing cargo-zigbuild..."
+        cargo install cargo-zigbuild
+    fi
+
+    # Add Target
+    rustup target add x86_64-unknown-linux-musl
+
+    # Build
+    echo "🔨 Compiling with Zig..."
+    cargo zigbuild --release --target x86_64-unknown-linux-musl
+    BUILD_ARTIFACT="target/x86_64-unknown-linux-musl/release/astracat-dns-rs"
 fi
 
-# Build using official Rust docker image
-# We mount the cache to speed it up
-docker run --rm \
-    -v "$(pwd)":/usr/src/app \
-    -w /usr/src/app \
-    -e CARGO_HOME=/usr/src/app/.cargo-cache \
-    rust:1.83-bullseye \
-    cargo build --release --jobs 4
-
-# Check artifacts
-if [ ! -f target/release/astracat-dns-rs ]; then
-    echo "❌ Build failed. Binary not found in target/release/astracat-dns-rs"
+# Check artifact
+if [ ! -f "$BUILD_ARTIFACT" ]; then
+    echo "❌ Build failed. Artifact not found at $BUILD_ARTIFACT"
     exit 1
 fi
 
@@ -53,7 +81,7 @@ cd ..
 echo "📦 Packaging..."
 mkdir -p deploy_pkg
 # Default output
-cp target/release/astracat-dns-rs deploy_pkg/astracat-dns
+cp "$BUILD_ARTIFACT" deploy_pkg/astracat-dns
 
 cp go-proxy/astracat-proxy deploy_pkg/
 cp config.yaml deploy_pkg/
