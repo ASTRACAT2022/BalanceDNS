@@ -55,9 +55,14 @@ server:
     harden-dnssec-stripped: yes
     use-caps-for-id: no
     edns-buffer-size: 1232
-    prefetch: yes
+    prefetch: no
     num-threads: 2
-    # Ensure root hints are used (default)
+    
+    # Minimize internal cache (Rust handles caching)
+    msg-cache-size: 1m
+    rrset-cache-size: 1m
+    cache-max-ttl: 10
+    infra-cache-numhosts: 100
 EOF
 
     # Restart Unbound
