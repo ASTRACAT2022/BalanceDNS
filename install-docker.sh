@@ -74,8 +74,6 @@ if [ -f "$CONFIG_FILE" ]; then
              fi
         fi
     fi
-        fi
-    fi
 else
     echo "⚠️  config.yaml not found. Using defaults in .env if available."
 fi
