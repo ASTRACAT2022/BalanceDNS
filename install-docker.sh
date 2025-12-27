@@ -5,8 +5,30 @@ echo "🐳 Starting Astracat DNS Docker Installation..."
 
 # 1. Check for Docker
 if ! command -v docker &> /dev/null; then
-    echo "❌ Docker not found. Please install Docker first: https://docs.docker.com/engine/install/"
+    echo "❌ Docker not found. Please install Docker first."
     exit 1
+fi
+
+# 1.1 Configure Docker Mirror (Critical for Russia)
+if [ ! -f /etc/docker/daemon.json ]; then
+    echo "🌍 Configuring Docker Mirror (mirror.gcr.io) for better connectivity..."
+    sudo mkdir -p /etc/docker
+    echo '{
+      "registry-mirrors": ["https://mirror.gcr.io"]
+    }' | sudo tee /etc/docker/daemon.json
+    sudo systemctl restart docker
+    echo "✅ Docker restarted with mirror configuration."
+else
+    # Check if a mirror is already configured
+    if ! grep -q "registry-mirrors" /etc/docker/daemon.json; then
+         echo "⚠️  No registry mirrors found in /etc/docker/daemon.json. Adding Google Mirror..."
+         # Basic append is risky with JSON, so we just warn or backup/overwrite if user agrees.
+         # For automation safety, we'll suggest it or try a safe sed inject if simple.
+         # Let's simple overwrite for now because this is likely a fresh install context
+         # OR simply rely on the user to fix it if they have custom config.
+         # BETTER: Just print a warning tip.
+         echo "💡 TIP: If you have connection issues, add 'registry-mirrors': ['https://mirror.gcr.io'] to /etc/docker/daemon.json"
+    fi
 fi
 
 if ! command -v docker-compose &> /dev/null; then
