@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use hickory_proto::op::Message;
 use hickory_proto::rr::{Record, RecordType, Name};
 use hickory_resolver::TokioAsyncResolver;
-use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::config::{ResolverConfig, ResolverOpts, NameServerConfig, Protocol};
 use std::str::FromStr;
 use log::{info, error};
 
@@ -85,11 +85,42 @@ impl Resolver for HickoryResolver {
 }
 
 pub async fn create_resolver(
-    _resolver_type: &str,
+    resolver_type: &str,
     cfg: &Config,
     cache: Arc<Cache>,
     metrics: Arc<Metrics>
 ) -> anyhow::Result<Box<dyn Resolver>> {
+    if resolver_type.eq_ignore_ascii_case("unbound") {
+         info!("Initializing Hickory Resolver in Forwarding mode to local Unbound (127.0.0.1:5353)...");
+         let mut config = ResolverConfig::new();
+         config.add_name_server(hickory_resolver::config::NameServerConfig {
+             socket_addr: "127.0.0.1:5353".parse()?,
+             protocol: hickory_resolver::config::Protocol::Udp,
+             tls_dns_name: None,
+             trust_negative_responses: true,
+             bind_addr: None,
+             tls_config: None,
+         });
+
+         let mut opts = ResolverOpts::default();
+         // Unbound handles recursion and validation. We just forward.
+         opts.validate = false; 
+         opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4Only;
+         opts.timeout = cfg.resolver.upstream_timeout;
+         opts.attempts = 3;
+         opts.recursion_desired = true; // Ask Unbound to recurse
+
+         let resolver = TokioAsyncResolver::tokio(config, opts);
+         info!("Initialized Forwarder to Unbound Service.");
+         
+         return Ok(Box::new(HickoryResolver {
+            resolver,
+            metrics,
+            _cache: cache,
+        }));
+    }
+
+    // Default to Hickory Recursive
     // Configure Resolver for TRUE recursive resolution from root servers
     let mut opts = ResolverOpts::default();
     opts.validate = false; // Disable DNSSEC validation to prevent SERVFAILs
@@ -103,7 +134,7 @@ pub async fn create_resolver(
 
     let resolver = TokioAsyncResolver::tokio(config, opts);
 
-    info!("Initialized Hickory Recursive Resolver with DNSSEC validation enabled from root servers");
+    info!("Initialized Hickory Recursive Resolver with DNSSEC enabled (validation disabled) from root servers");
 
     Ok(Box::new(HickoryResolver {
         resolver,
