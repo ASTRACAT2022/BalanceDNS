@@ -171,6 +171,17 @@ else
 fi
 # --------------------------------
 
+# --- Ensure Port 53 is FREE ---
+echo "🧹 Cleaning up Port 53..."
+DEBIAN_FRONTEND=noninteractive apt-get install -y psmisc # for fuser
+systemctl stop systemd-resolved || true
+systemctl disable systemd-resolved || true
+# Kill anything listening on 53 UDP/TCP
+fuser -k 53/udp || true
+fuser -k 53/tcp || true
+# Wait a sec
+sleep 2
+
 echo "🛡️  Creating Systemd Service for Rust Core..."
 cat > /etc/systemd/system/astracat-dns.service << EOS
 [Unit]
