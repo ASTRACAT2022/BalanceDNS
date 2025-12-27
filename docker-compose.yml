@@ -52,8 +52,8 @@ services:
       - "-cert=/certs/fullchain.pem"
       - "-key=/certs/privkey.pem"
     volumes:
-      # Mount Let's Encrypt certs
-      - /etc/letsencrypt/live/dns.astracat.ru:/certs:ro
+      # Mount Let's Encrypt certs (configured in .env)
+      - ${HOST_CERT_PATH}:/certs:ro
     networks:
       - dns-net
 

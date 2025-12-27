@@ -22,6 +22,31 @@ fi
 
 echo "✅ Docker detected. Using command: $DOCKER_COMPOSE_CMD"
 
+# 1.5 Parse config.yaml to extract certificate path
+# We want to use the certification path defined in config.yaml for the Docker volume
+CONFIG_FILE="config.yaml"
+if [ -f "$CONFIG_FILE" ]; then
+    echo "📖 Reading configuration from $CONFIG_FILE..."
+    # Extract cert_file path. simple grep/awk assuming standard formatting
+    # Matches: cert_file: "/path/to/cert"
+    CERT_PATH_LINE=$(grep "cert_file:" "$CONFIG_FILE" | head -n 1)
+    if [ -n "$CERT_PATH_LINE" ]; then
+        # Extract path inside quotes
+        FULL_CERT_PATH=$(echo "$CERT_PATH_LINE" | sed -n 's/.*"\(.*\)".*/\1/p')
+        if [ -n "$FULL_CERT_PATH" ]; then
+             CERT_DIR=$(dirname "$FULL_CERT_PATH")
+             echo "🔑 Detected Certificate Directory: $CERT_DIR"
+             
+             # Write to .env
+             echo "HOST_CERT_PATH=$CERT_DIR" > .env
+             echo "UNBOUND_UPSTREAM=unbound:53" >> .env
+             echo "✅ Updated .env configuration from config.yaml"
+        fi
+    fi
+else
+    echo "⚠️  config.yaml not found. Using defaults in .env if available."
+fi
+
 # 2. Stop conflicting system services
 if systemctl is-active --quiet astracat-dns; then
     echo "🛑 Stopping local astracat-dns systemd service to free port 53..."
