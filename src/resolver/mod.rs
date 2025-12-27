@@ -90,20 +90,20 @@ pub async fn create_resolver(
     cache: Arc<Cache>,
     metrics: Arc<Metrics>
 ) -> anyhow::Result<Box<dyn Resolver>> {
-    // Configure Resolver
-    // We use Google or Quad9 with DNSSEC
+    // Configure Resolver for TRUE recursive resolution from root servers
     let mut opts = ResolverOpts::default();
-    opts.validate = false; // Disable DNSSEC validation for debugging
+    opts.validate = true; // Enable DNSSEC validation
     opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4Only; // Force IPv4 to avoid AAAA timeouts on non-IPv6 networks
     opts.timeout = cfg.resolver.upstream_timeout;
     opts.attempts = 3;
+    opts.recursion_desired = true;
 
-    // Use Google Public DNS as recursive upstream (or Cloudflare/Quad9)
-    let config = ResolverConfig::google(); 
+    // Use default config which queries root servers directly (true recursion)
+    let config = ResolverConfig::default();
 
     let resolver = TokioAsyncResolver::tokio(config, opts);
 
-    info!("Initialized Hickory (Trust-DNS) Resolver with DNSSEC validation enabled.");
+    info!("Initialized Hickory Recursive Resolver with DNSSEC validation enabled from root servers");
 
     Ok(Box::new(HickoryResolver {
         resolver,
