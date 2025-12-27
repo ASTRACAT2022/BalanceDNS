@@ -18,21 +18,29 @@ echo "🚀 Starting Cross-Compilation Deployment for $REMOTE..."
 # 1. Build Rust Binary (Linux x86_64)
 echo "🦀 Building Astracat-DNS-RS for Linux x86_64..."
 
-# Check for cross
-if ! command -v cross &> /dev/null; then
-    echo "❌ 'cross' is not installed. To build Linux binaries on Mac, we need it."
-    echo "👉 Please run: cargo install cross"
-    echo "   (Note: cross requires Docker Desktop to be running in the background to handle the toolchain)"
-    read -p "Attempt to install cross now? [y/N] " confirm
-    if [[ $confirm == [yY] || $confirm == [yY][eE][sS] ]]; then
-        cargo install cross
-    else
-        echo "Please install cross or build on a Linux machine."
-        exit 1
-    fi
+# 1. Build Rust Binary (Linux x86_64)
+echo "🦀 Building Astracat-DNS-RS for Linux x86_64 (using temporary builder container)..."
+
+# Use explicit Docker build to ensure compatibility and avoid 'cross' toolchain issues
+if ! command -v docker &> /dev/null; then
+    echo "❌ Docker Desktop is required for the *build* step (to compile Linux binary on Mac)."
+    exit 1
 fi
 
-cross build --release --target x86_64-unknown-linux-gnu
+# Build using official Rust docker image
+# We mount the cache to speed it up
+docker run --rm \
+    -v "$(pwd)":/usr/src/app \
+    -w /usr/src/app \
+    -e CARGO_HOME=/usr/src/app/.cargo-cache \
+    rust:1.83-bullseye \
+    cargo build --release --jobs 4
+
+# Check artifacts
+if [ ! -f target/release/astracat-dns-rs ]; then
+    echo "❌ Build failed. Binary not found in target/release/astracat-dns-rs"
+    exit 1
+fi
 
 
 # 2. Build Go Proxy (Linux x86_64)
@@ -44,8 +52,8 @@ cd ..
 # 3. Prepare Deployment Package
 echo "📦 Packaging..."
 mkdir -p deploy_pkg
-# Default cross output
-cp target/x86_64-unknown-linux-gnu/release/astracat-dns-rs deploy_pkg/astracat-dns
+# Default output
+cp target/release/astracat-dns-rs deploy_pkg/astracat-dns
 
 cp go-proxy/astracat-proxy deploy_pkg/
 cp config.yaml deploy_pkg/
