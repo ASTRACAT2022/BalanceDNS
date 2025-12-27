@@ -15,103 +15,154 @@ pub trait Resolver: Send + Sync {
     async fn resolve(&self, name: &str, qtype: u16) -> anyhow::Result<Message>;
 }
 
+use singleflight::Group;
+
 pub struct HickoryResolver {
     resolver: TokioAsyncResolver,
     metrics: Arc<Metrics>,
     _cache: Arc<Cache>,
 }
 
+use crate::cache::CacheStatus;
+
 #[async_trait]
 impl Resolver for HickoryResolver {
     async fn resolve(&self, name: &str, qtype: u16) -> anyhow::Result<Message> {
-        let rt = RecordType::from(qtype);
         let name_parsed = Name::from_str(name).unwrap_or(Name::root());
         let cache_key = format!("{}|{}", name, qtype);
+        let mut stale_fallback: Option<Message> = None;
 
         // 1. Check Cache
-        if let Some((msg_bytes, stale)) = self._cache.get(&cache_key) {
-            if let Ok(msg) = Message::from_vec(&msg_bytes) {
-                if !stale {
-                    // Cache Hit
-                    return Ok(msg);
-                } else {
-                    // Stale hit: we should revalidate in background, but for now just use it?
-                    // Or treat as miss if stale?
-                    // "Stale While Revalidate" logic usually implies serving stale and revalidating.
-                    // For simplicity, we can return stale but trigger a background task.
-                    // BUT our `resolve` is async.
-                    // Let's implement simpler logic: if stale, treat as miss but maybe use it if upstream fails?
-                    // For now, let's treat stale as miss to force refresh.
+        match self._cache.get(&cache_key) {
+            Some((msg_bytes, status)) => {
+                if let Ok(msg) = Message::from_vec(&msg_bytes) {
+                    match status {
+                        CacheStatus::Hit => return Ok(msg),
+                        CacheStatus::Prefetch => {
+                             // Zero-wait prefetch: return fresh data, spawn background refresh
+                             let resolver_clone = self.resolver.clone(); // Lightweight Handle clone
+                             let cache_clone = self._cache.clone();
+                             let metric_clone = self.metrics.clone();
+                             let name_string = name.to_string();
+                             let key_clone = cache_key.clone();
+                             
+                             tokio::spawn(async move {
+                                 // Simple background refresh
+                                 let rt = RecordType::from(qtype);
+                                 if let Ok(lookup) = resolver_clone.lookup(name_string, rt).await {
+                                      let mut new_msg = Message::new();
+                                      new_msg.set_id(0);
+                                      new_msg.set_recursion_desired(true);
+                                      new_msg.set_recursion_available(true);
+                                      new_msg.set_authentic_data(true);
+                                      new_msg.set_response_code(hickory_proto::op::ResponseCode::NoError);
+                                      
+                                      let mut min_ttl = 300;
+                                      for record in lookup.record_iter() {
+                                          new_msg.add_answer(record.clone());
+                                          if record.ttl() < min_ttl { min_ttl = record.ttl(); }
+                                      }
+                                      
+                                      if let Ok(bytes) = new_msg.to_vec() {
+                                          cache_clone.set(&key_clone, bytes, std::time::Duration::from_secs(min_ttl as u64), std::time::Duration::from_secs(600));
+                                          metric_clone.increment_cache_prefetch();
+                                      }
+                                 }
+                             });
+                             
+                             return Ok(msg);
+                        },
+                        CacheStatus::Stale => {
+                            // Proceed to upstream, but keep this msg for fallback (Serve-Stale)
+                            stale_fallback = Some(msg);
+                        },
+                        CacheStatus::Miss => {
+                            stale_fallback = None;
+                        }
+                            // This case should ideally not happen if we got Some((msg_bytes, status))
+                            // but if it does, we treat it as a miss.
+                        }
+                    }
                 }
+            },
+            None => {
+                // No cache entry found, stale_fallback remains None.
             }
         }
 
-        // 2. Forward to Upstream (Unbound)
+        // 2. Forward to Upstream (Directly, bypassing Singleflight for now)
+        let rt = RecordType::from(qtype);
         let mut msg = Message::new();
         msg.set_id(0);
         msg.set_recursion_desired(true);
         msg.set_recursion_available(true);
 
-        match self.resolver.lookup(name, rt).await {
+        let res = match self.resolver.lookup(name, rt).await {
             Ok(lookup) => {
-                // Lookup successful
                 let mut min_ttl = 300; // Default TTL cap
-                
                 for record in lookup.record_iter() {
                     msg.add_answer(record.clone());
                     if record.ttl() < min_ttl {
                         min_ttl = record.ttl();
                     }
                 }
-                
-                // We trust Unbound for validation
                 msg.set_authentic_data(true); 
                 msg.set_response_code(hickory_proto::op::ResponseCode::NoError);
 
-                // 3. Store in Cache
+                // 3. Store in Cache (Success)
                 if let Ok(bytes) = msg.to_vec() {
-                     // Store with TTL. min_ttl ensures we respect upstream.
-                     // SWR window: e.g. 10m
                      self._cache.set(&cache_key, bytes, std::time::Duration::from_secs(min_ttl as u64), std::time::Duration::from_secs(600));
                 }
+                Ok(msg)
             },
             Err(e) => {
-                use hickory_resolver::error::ResolveError;
                 use hickory_resolver::error::ResolveErrorKind;
-                
                 match e.kind() {
                     ResolveErrorKind::NoRecordsFound { .. } => {
                         msg.set_response_code(hickory_proto::op::ResponseCode::NoError);
-                        // Cache NoData? Yes, briefly. 
                          if let Ok(bytes) = msg.to_vec() {
+                             // NODATA: 60s
                              self._cache.set(&cache_key, bytes, std::time::Duration::from_secs(60), std::time::Duration::from_secs(60));
                          }
+                         Ok(msg)
                     },
                     ResolveErrorKind::Proto(_proto_err) => {
                          let s = e.to_string();
                          if s.contains("NXDomain") {
                              msg.set_response_code(hickory_proto::op::ResponseCode::NXDomain);
-                             // Cache NXDOMAIN? Yes.
                              if let Ok(bytes) = msg.to_vec() {
-                                 self._cache.set(&cache_key, bytes, std::time::Duration::from_secs(300), std::time::Duration::from_secs(60));
+                                 // NXDOMAIN: 60s
+                                 self._cache.set(&cache_key, bytes, std::time::Duration::from_secs(60), std::time::Duration::from_secs(60));
                              }
+                             Ok(msg)
                          } else {
                              msg.set_response_code(hickory_proto::op::ResponseCode::ServFail);
+                             // SERVFAIL: 10s
+                             if let Ok(bytes) = msg.to_vec() {
+                                 self._cache.set(&cache_key, bytes, std::time::Duration::from_secs(10), std::time::Duration::from_secs(10));
+                             }
+                             Ok(msg)
                          }
-                    },
-                    ResolveErrorKind::Timeout => {
-                        msg.set_response_code(hickory_proto::op::ResponseCode::ServFail);
                     },
                     _ => {
                          log::warn!("Resolver error for {}: {}", name, e);
-                         msg.set_response_code(hickory_proto::op::ResponseCode::ServFail);
+                         Err(e.to_string())
                     }
                 }
-
             }
-        }
+        };
 
-        Ok(msg)
+        match res {
+            Ok(msg) => Ok(msg),
+            Err(e) => {
+                // Upstream failed. Do we have stale data?
+                if let Some(stale_msg) = stale_fallback {
+                    log::warn!("Upstream failed for {}, serving stale cache.", name);
+                    return Ok(stale_msg);
+                }
+                Err(anyhow::anyhow!("Resolution failed: {}", e))
+            },
+        }
     }
 }
 
@@ -122,11 +173,11 @@ pub async fn create_resolver(
     cache: Arc<Cache>,
     metrics: Arc<Metrics>
 ) -> anyhow::Result<Box<dyn Resolver>> {
+    
     if resolver_type.eq_ignore_ascii_case("unbound") {
          let upstream = cfg.resolver.upstream_addr.as_deref().unwrap_or("127.0.0.1:5353");
          info!("Initializing Hickory Resolver in Forwarding mode to local Unbound ({})...", upstream);
          
-         // Resolve hostname to IP (e.g. "unbound:53" -> 172.18.0.2:53)
          let mut addrs = tokio::net::lookup_host(upstream).await
              .map_err(|e| anyhow::anyhow!("Failed to resolve upstream {}: {}", upstream, e))?;
          let socket_addr = addrs.next()
@@ -145,12 +196,11 @@ pub async fn create_resolver(
          });
 
          let mut opts = ResolverOpts::default();
-         // Unbound handles recursion and validation. We just forward.
          opts.validate = false; 
          opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4Only;
          opts.timeout = cfg.resolver.upstream_timeout;
          opts.attempts = 3;
-         opts.recursion_desired = true; // Ask Unbound to recurse
+         opts.recursion_desired = true; 
 
          let resolver = TokioAsyncResolver::tokio(config, opts);
          info!("Initialized Forwarder to Unbound Service.");
@@ -163,15 +213,13 @@ pub async fn create_resolver(
     }
 
     // Default to Hickory Recursive
-    // Configure Resolver for TRUE recursive resolution from root servers
     let mut opts = ResolverOpts::default();
-    opts.validate = false; // Disable DNSSEC validation to prevent SERVFAILs
+    opts.validate = false; 
     opts.ip_strategy = hickory_resolver::config::LookupIpStrategy::Ipv4Only;
     opts.timeout = cfg.resolver.upstream_timeout;
     opts.attempts = 3;
     opts.recursion_desired = true;
 
-    // Use default config which queries root servers directly (true recursion)
     let config = ResolverConfig::default();
 
     let resolver = TokioAsyncResolver::tokio(config, opts);

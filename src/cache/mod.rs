@@ -23,27 +23,34 @@ struct FastCacheItem {
     swr: Duration,
 }
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 pub struct Cache {
-    inner: MokaCache<String, FastCacheItem>,
+    // Sharded in-memory cache
+    shards: Vec<MokaCache<String, FastCacheItem>>,
     env: Option<Arc<Environment>>,
     db: Option<Database>,
     metrics: Arc<Metrics>,
     _write_tx: async_channel::Sender<(String, FixedSizeCacheItem)>,
 }
 
+const SHARD_COUNT: usize = 16; // Power of 2 for easy distribution
+
 impl Cache {
     pub fn new(size: usize, lmdb_path: &str, metrics: Arc<Metrics>) -> anyhow::Result<Self> {
         // Moka cache with high concurrency
-        let cache_size = if size == 0 { 5000 } else { size as u64 };
+        let total_size = if size == 0 { 5000 } else { size as u64 };
+        let shard_size = total_size / (SHARD_COUNT as u64); // Distribute capacity
         
-        // Create Moka cache
-        // We set a max capacity. 
-        // We can also set time_to_live if we want Moka to handle eviction, 
-        // but we have custom SWR logic, so we might manage expiration check on access 
-        // or set a loose TTL. given we check standard TTL manually.
-        let inner = MokaCache::builder()
-            .max_capacity(cache_size)
-            .build();
+        let mut shards = Vec::with_capacity(SHARD_COUNT);
+
+        for _ in 0..SHARD_COUNT {
+             let shard = MokaCache::builder()
+                .max_capacity(shard_size.max(100)) // Ensure at least some capacity
+                .build();
+             shards.push(shard);
+        }
 
         // LMDB setup
         let path = Path::new(lmdb_path);
@@ -64,7 +71,7 @@ impl Cache {
         let (tx, rx) = async_channel::bounded(1024);
 
         let cache = Cache {
-            inner,
+            shards,
             env: Some(env_arc.clone()),
             db: Some(db),
             metrics: metrics.clone(),
@@ -123,6 +130,16 @@ impl Cache {
         Ok(cache)
     }
 
+    fn get_shard(&self, key: &str) -> &MokaCache<String, FastCacheItem> {
+        // Consistent Hashing (simplified for local shards)
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+        // Use wrapping logic or simple modulo
+        let index = (hash as usize) % SHARD_COUNT;
+        &self.shards[index]
+    }
+
     fn load_from_db(&self) -> anyhow::Result<()> {
         let env = self.env.as_ref().unwrap();
         let db = self.db.unwrap();
@@ -152,8 +169,8 @@ impl Cache {
 
                     let swr = Duration::from_nanos(item.swr_nanos as u64);
 
-                    // Populate in-memory cache
-                    self.inner.insert(key, FastCacheItem {
+                    // Populate in-memory cache (routed to correct shard)
+                    self.get_shard(&key).insert(key, FastCacheItem {
                         msg_bytes: item.msg_bytes,
                         expiration,
                         swr,
@@ -177,7 +194,8 @@ impl Cache {
     }
 
     pub fn get(&self, key: &str) -> Option<(Vec<u8>, bool)> {
-        if let Some(item) = self.inner.get(key) {
+        let shard = self.get_shard(key);
+        if let Some(item) = shard.get(key) {
              let now = SystemTime::now();
              if now > item.expiration {
                  let revalidate = if item.swr > Duration::ZERO {
@@ -187,7 +205,7 @@ impl Cache {
                  };
 
                  if !revalidate {
-                     self.inner.remove(key);
+                     shard.remove(key);
                      self.metrics.increment_cache_misses();
                      return None;
                  }
@@ -208,7 +226,8 @@ impl Cache {
     pub fn set(&self, key: &str, msg_bytes: Vec<u8>, ttl: Duration, swr: Duration) {
         let expiration = SystemTime::now() + ttl;
         
-        self.inner.insert(key.to_string(), FastCacheItem {
+        let shard = self.get_shard(key);
+        shard.insert(key.to_string(), FastCacheItem {
             msg_bytes: msg_bytes.clone(),
             expiration,
             swr,
