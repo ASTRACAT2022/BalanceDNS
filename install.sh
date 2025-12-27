@@ -21,9 +21,9 @@ echo "📁 Project directory: $PROJECT_DIR"
 cd "$PROJECT_DIR"
 
 # 2. Install dependencies (Linux/Debian focused)
-    echo "   Installing build-essential, pkg-config, libssl-dev, liblmdb-dev, libkres-dev, knot-resolver..."
+    echo "   Installing build-essential, pkg-config, libssl-dev, liblmdb-dev, libknot-dev, knot-resolver..."
     sudo apt-get update -qq
-    sudo apt-get install -y build-essential pkg-config libssl-dev liblmdb-dev libkres-dev knot-resolver -qq
+    sudo apt-get install -y build-essential pkg-config libssl-dev liblmdb-dev libknot-dev knot-resolver -qq
 elif command -v yum &> /dev/null; then
     echo "   Installing development tools, openssl-devel, lmdb-devel, knot-resolver-devel..."
     sudo yum groupinstall -y "Development Tools"
