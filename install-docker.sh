@@ -63,6 +63,12 @@ fi
 # 3. Pull and Build
 echo "🏗️  Building and Starting Containers..."
 $DOCKER_COMPOSE_CMD down --remove-orphans || true
+
+# Attempt to free space (common issue on small VPS)
+echo "🧹 Cleaning up Docker cache to ensure sufficient space..."
+docker system prune -f > /dev/null 2>&1 || true
+docker builder prune -f > /dev/null 2>&1 || true
+
 $DOCKER_COMPOSE_CMD up -d --build
 
 echo "⏳ Waiting for services to initialize..."
