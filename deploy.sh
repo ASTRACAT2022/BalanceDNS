@@ -88,6 +88,8 @@ cp "$BUILD_ARTIFACT" deploy_pkg/astracat-dns
 
 cp go-proxy/astracat-proxy deploy_pkg/
 cp config.yaml deploy_pkg/
+cp hosts deploy_pkg/ # Copy local hosts file
+
 # We need a simplified install script for the server side
 cat > deploy_pkg/setup_remote.sh << 'EOF'
 #!/bin/bash
@@ -136,6 +138,7 @@ mkdir -p /etc/astracat-dns
 # Only overwrite config if it doesn't exist to preserve user changes, or force it?
 # User wants "setup", so let's ensure it's there.
 cp config.yaml /etc/astracat-dns/
+cp hosts /etc/astracat-dns/ # Install hosts file
 
 # --- Auto-Detect Certificates ---
 echo "🔍 Searching for SSL Certificates in /etc/letsencrypt/live/ ..."
