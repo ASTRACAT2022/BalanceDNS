@@ -1,0 +1,75 @@
+# ASTRACAT Resolver Configuration
+
+# Address to listen on for standard DNS (UDP/TCP)
+listen_addr: "0.0.0.0:53"
+
+# Address to listen on for Prometheus metrics
+metrics_addr: "0.0.0.0:9091"
+
+# Admin panel address
+admin_addr: "0.0.0.0:8081"
+
+# Admin credentials (Basic Auth)
+admin:
+  username: "admin"
+  password: "change_me"
+
+# Path to the file for storing historical metrics data
+metrics_storage_path: /tmp/dns_metrics.json
+
+# Resolver settings
+resolver:
+  # Using Unbound for recursion
+  type: unbound
+  upstream_timeout: 5s
+  request_timeout: 5s
+  max_workers: 10
+
+# Cache settings
+cache:
+  lmdb_path: "/tmp/dns_cache.lmdb"
+  size: 5000
+  max_ttl: 3600s
+  min_ttl: 60s
+  stale_while_revalidate: 1m
+
+# --- Plugins ---
+
+# Hosts file plugin
+hosts:
+  enabled: true
+  path: "/etc/astracat-dns/hosts"
+
+# AdBlock plugin
+adblock:
+  enabled: true
+  # List of URLs for adblock lists
+  blocklist_urls:
+    - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+
+# Rate limit plugin (DDoS Protection)
+rate_limit:
+  enabled: true
+  qps: 100
+  burst: 200
+
+# HTTPS RR plugin (Future standard for HTTPS records)
+httpsrr:
+  enabled: false
+  records: []
+
+# DNS-over-HTTPS (DoH) settings
+# Disabled in Rust core because we use Go Proxy for TLS termination
+doh:
+  enabled: false
+  listen_addr: "0.0.0.0:443"
+  cert_file: "/etc/letsencrypt/live/dns.astracat.ru/fullchain.pem"
+  key_file: "/etc/letsencrypt/live/dns.astracat.ru/privkey.pem"
+
+# DNS-over-TLS (DoT) settings
+# Disabled in Rust core because we use Go Proxy for TLS termination
+dot:
+  enabled: false
+  listen_addr: "0.0.0.0:853"
+  cert_file: "/etc/letsencrypt/live/dns.astracat.ru/fullchain.pem"
+  key_file: "/etc/letsencrypt/live/dns.astracat.ru/privkey.pem"

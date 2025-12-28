@@ -14,6 +14,7 @@ pub enum PluginAction {
     #[allow(dead_code)]
     Drop,
     Block, // Returns NXDOMAIN or REFUSED
+    Reply(std::net::IpAddr), // Returns specific IP
 }
 
 #[async_trait]
@@ -60,19 +61,36 @@ impl PluginManager {
 // --- Plugins ---
 
 pub struct HostsPlugin {
-    _hosts: RwLock<HashMap<String, String>>, // Domain -> IP (simplified)
+    _hosts: RwLock<HashMap<String, String>>, // Domain -> IP
 }
 
 impl HostsPlugin {
     pub fn new(path: &str) -> Self {
         let mut hosts = HashMap::new();
-        if let Ok(content) = fs::read_to_string(path) {
-            for line in content.lines() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if parts[0].starts_with('#') { continue; }
-                    hosts.insert(parts[1].to_string(), parts[0].to_string());
+        match fs::read_to_string(path) {
+            Ok(content) => {
+                let mut count = 0;
+                for line in content.lines() {
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 2 {
+                        if parts[0].starts_with('#') { continue; }
+                        // Format: IP HOST [ALIASES...]
+                        // We map HOST -> IP
+                        // parts[0] is IP
+                        let ip = parts[0];
+                        for host in &parts[1..] {
+                             // Normalize host: lowercase, trailing dot removal?
+                             // Simple normalization for now
+                             let key = host.trim_end_matches('.').to_lowercase();
+                             hosts.insert(key, ip.to_string());
+                             count += 1;
+                        }
+                    }
                 }
+                info!("Loaded {} hosts from {}", count, path);
+            },
+            Err(e) => {
+                 warn!("Could not read hosts file {}: {}", path, e);
             }
         }
 
@@ -88,7 +106,22 @@ impl Plugin for HostsPlugin {
         "hosts"
     }
 
-    async fn on_query(&self, _name: &str, _qtype: u16) -> PluginAction {
+    async fn on_query(&self, name: &str, qtype: u16) -> PluginAction {
+        // Only handle A records (IPv4) for now, as our map is simple IO
+        // If qtype is A (1)
+        if qtype == 1 {
+            let key = name.trim_end_matches('.').to_lowercase();
+            let ip_str = {
+                let r = self._hosts.read().unwrap();
+                r.get(&key).cloned()
+            };
+
+            if let Some(ip) = ip_str {
+                if let Ok(addr) = ip.parse::<std::net::IpAddr>() {
+                    return PluginAction::Reply(addr);
+                }
+            }
+        }
         PluginAction::Continue
     }
 }

@@ -451,4 +451,8 @@ impl Metrics {
     pub fn increment_lmdb_errors(&self) {
         self.prom_lmdb_errors.inc();
     }
+
+    pub fn increment_cache_prefetch(&self) {
+        self.prom_prefetches.inc();
+    }
 }

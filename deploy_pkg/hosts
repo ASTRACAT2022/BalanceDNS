@@ -1,0 +1,267 @@
+### dns.malw.link: hosts file
+# Последнее обновление: 19 декабря 2025
+
+64.188.78.28 tracker.openbittorrent.com
+64.188.78.28 test.dns.malw.link
+64.188.78.28 ntc.party
+64.188.78.28 controlplane.tailscale.com
+64.188.78.28 game.clashroyaleapp.com
+64.188.78.28 gamea.clashofclans.com
+64.188.78.28 game.brawlstarsgame.com
+64.188.78.28 game.squadbustersgame.com
+64.188.78.28 game.mocogame.com
+64.188.78.28 d.rutor.info
+64.188.78.28 instagram.com
+64.188.78.28 www.instagram.com
+64.188.78.28 b.i.instagram.com
+64.188.78.28 z-p42-chat-e2ee-ig.facebook.com
+64.188.78.28 help.instagram.com
+
+# OpenAI
+64.188.78.28 chatgpt.com
+64.188.78.28 ab.chatgpt.com
+64.188.78.28 auth.openai.com
+64.188.78.28 auth0.openai.com
+64.188.78.28 platform.openai.com
+64.188.78.28 cdn.oaistatic.com
+64.188.78.28 files.oaiusercontent.com
+64.188.78.28 cdn.auth0.com
+64.188.78.28 tcr9i.chat.openai.com
+64.188.78.28 webrtc.chatgpt.com
+64.188.78.28 android.chat.openai.com
+64.188.78.28 api.openai.com
+64.188.78.28 operator.chatgpt.com
+64.188.78.28 sora.chatgpt.com
+64.188.78.28 sora.com
+64.188.78.28 videos.openai.com
+64.188.78.28 ios.chat.openai.com
+
+# Google
+64.188.78.28 gemini.google.com
+64.188.78.28 aistudio.google.com
+64.188.78.28 generativelanguage.googleapis.com
+64.188.78.28 aitestkitchen.withgoogle.com
+64.188.78.28 aisandbox-pa.googleapis.com
+64.188.78.28 webchannel-alkalimakersuite-pa.clients6.google.com
+64.188.78.28 alkalimakersuite-pa.clients6.google.com
+64.188.78.28 assistant-s3-pa.googleapis.com
+64.188.78.28 proactivebackend-pa.googleapis.com
+64.188.78.28 robinfrontend-pa.googleapis.com
+64.188.78.28 o.pki.goog
+64.188.78.28 labs.google
+64.188.78.28 notebooklm.google.com
+64.188.78.28 jules.google.com
+64.188.78.28 stitch.withgoogle.com
+
+# Microsoft
+64.188.78.28 copilot.microsoft.com
+64.188.78.28 sydney.bing.com
+64.188.78.28 edgeservices.bing.com
+64.188.78.28 rewards.bing.com
+64.188.78.28 xsts.auth.xboxlive.com
+64.188.78.28 xgpuwebf2p.gssv-play-prod.xboxlive.com
+64.188.78.28 xgpuweb.gssv-play-prod.xboxlive.com
+
+# Spotify
+64.188.78.28 api.spotify.com
+64.188.78.28 login5.spotify.com
+64.188.78.28 encore.scdn.co
+64.188.78.28 gew1-spclient.spotify.com
+64.188.78.28 spclient.wg.spotify.com
+64.188.78.28 api-partner.spotify.com
+64.188.78.28 aet.spotify.com
+64.188.78.28 www.spotify.com
+64.188.78.28 accounts.spotify.com
+64.188.78.28 open.spotify.com
+64.188.78.28 accounts.scdn.co
+64.188.78.28 open-exp.spotifycdn.com
+64.188.78.28 www-growth.scdn.co
+
+# GitHub Copilot
+64.188.78.28 api.github.com
+64.188.78.28 api.individual.githubcopilot.com
+64.188.78.28 proxy.individual.githubcopilot.com
+
+# JetBrains
+64.188.78.28 datalore.jetbrains.com
+64.188.78.28 plugins.jetbrains.com
+64.188.78.28 download.jetbrains.com
+64.188.78.28 api.jetbrains.ai
+64.188.78.28 account.jetbrains.com
+
+# ElevenLabs
+64.188.78.28 elevenlabs.io
+64.188.78.28 api.us.elevenlabs.io
+64.188.78.28 elevenreader.io
+64.188.78.28 api.elevenlabs.io
+64.188.78.28 help.elevenlabs.io
+
+# Grok
+64.188.78.28 grok.com
+64.188.78.28 accounts.x.ai
+64.188.78.28 assets.grok.com
+
+# Tidal
+64.188.78.28 api.tidal.com
+64.188.78.28 listen.tidal.com
+64.188.78.28 login.tidal.com
+64.188.78.28 auth.tidal.com
+64.188.78.28 link.tidal.com
+64.188.78.28 dd.tidal.com
+64.188.78.28 resources.tidal.com
+64.188.78.28 images.tidal.com
+64.188.78.28 fsu.fa.tidal.com
+64.188.78.28 geolocation.onetrust.com
+64.188.78.28 api.squareup.com
+64.188.78.28 api-global.squareup.com
+
+# Supercell
+64.188.78.28 cdn.id.supercell.com
+64.188.78.28 security.id.supercell.com
+64.188.78.28 accounts.supercell.com
+64.188.78.28 game-assets.clashroyaleapp.com
+64.188.78.28 game-assets.clashofclans.com
+64.188.78.28 clashofclans.inbox.supercell.com
+64.188.78.28 game-assets.brawlstarsgame.com
+64.188.78.28 store.supercell.com
+
+# DeepL
+64.188.78.28 deepl.com
+64.188.78.28 www.deepl.com
+64.188.78.28 www2.deepl.com
+64.188.78.28 login-wall.deepl.com
+64.188.78.28 w.deepl.com
+64.188.78.28 s.deepl.com
+64.188.78.28 dict.deepl.com
+64.188.78.28 ita-free.www.deepl.com
+64.188.78.28 write-free.www.deepl.com
+64.188.78.28 experimentation.deepl.com
+64.188.78.28 experimentation-grpc.deepl.com
+64.188.78.28 ita-free.app.deepl.com
+64.188.78.28 shield.deepl.com
+64.188.78.28 ott.deepl.com
+64.188.78.28 api-free.deepl.com
+64.188.78.28 backend.deepl.com
+64.188.78.28 clearance.deepl.com
+64.188.78.28 errortracking.deepl.com
+64.188.78.28 auth.deepl.com
+64.188.78.28 oneshot-free.www.deepl.com
+64.188.78.28 checkout.www.deepl.com
+64.188.78.28 gtm.deepl.com
+
+# Deezer
+64.188.78.28 deezer.com
+64.188.78.28 www.deezer.com
+64.188.78.28 payment.deezer.com
+
+# Weather.com
+64.188.78.28 weather.com
+64.188.78.28 upsx.weather.com
+
+# Fitbit
+64.188.78.28 api.fitbit.com
+64.188.78.28 fitbit-pa.googleapis.com
+64.188.78.28 fitbitvestibuleshim-pa.googleapis.com
+64.188.78.28 fitbit.google.com
+
+# Claude
+64.188.78.28 claude.ai
+64.188.78.28 console.anthropic.com
+64.188.78.28 api.anthropic.com
+
+# Trae.ai
+64.188.78.28 trae-api-sg.mchost.guru
+64.188.78.28 api.trae.ai
+64.188.78.28 api-sg-central.trae.ai
+64.188.78.28 api16-normal-alisg.mchost.guru
+
+# Linear.app
+64.188.78.28 linear.app
+64.188.78.28 client-api.linear.app
+64.188.78.28 static.linear.app
+64.188.78.28 constellation.linear.app
+64.188.78.28 uploads.linear.app
+64.188.78.28 public.linear.app
+64.188.78.28 s.linear.app
+
+# Windsurf
+64.188.78.28 windsurf.com
+64.188.78.28 codeium.com
+64.188.78.28 server.codeium.com
+64.188.78.28 web-backend.codeium.com
+64.188.78.28 unleash.codeium.com
+64.188.78.28 inference.codeium.com
+64.188.78.28 windsurf-stable.codeium.com
+64.188.78.28 windsurf-telemetry.codeium.com
+64.188.78.28 marketplace.windsurf.com
+
+# Twitch
+64.188.78.28 usher.ttvnw.net
+64.188.78.28 gql.twitch.tv
+
+# Manus
+64.188.78.28 manus.im
+64.188.78.28 api.manus.im
+
+# Notion
+64.188.78.28 www.notion.so
+64.188.78.28 calendar.notion.so
+
+# Canva
+64.188.78.28 content-management-files.canva.com
+64.188.78.28 static.canva.com
+
+# Intel
+64.188.78.28 www.intel.com
+
+# Dell
+64.188.78.28 www.dell.com
+
+# TikTok
+64.188.78.28 www.tiktok.com
+
+# Archive.org
+64.188.78.28 web.archive.org
+
+# NVIDIA
+64.188.78.28 developer.nvidia.com
+
+# Parsec
+64.188.78.28 builds.parsec.app
+
+# Tria.ge
+64.188.78.28 tria.ge
+
+# Qwant
+64.188.78.28 www.qwant.com
+
+# guidedhacking.com
+64.188.78.28 guidedhacking.com
+
+# Framer
+64.188.78.28 framer.com
+
+# Autodesk
+64.188.78.28 accounts.autodesk.com
+64.188.78.28 www.autodesk.com
+
+# Pump.fun
+64.188.78.28 pump.fun
+64.188.78.28 frontend-api-v3.pump.fun
+64.188.78.28 images.pump.fun
+64.188.78.28 swap-api.pump.fun
+
+# Truth Social
+64.188.78.28 truthsocial.com
+64.188.78.28 static-assets-1.truthsocial.com
+
+# Elgato
+64.188.78.28 www.elgato.com
+
+# Imgur
+64.188.78.28 api.imgur.com
+
+# Dyson
+
+# Broadcom
+64.188.78.28 profile.broadcom.com

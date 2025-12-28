@@ -21,10 +21,20 @@ struct FastCacheItem {
     msg_bytes: Vec<u8>,
     expiration: SystemTime,
     swr: Duration,
+    hits: Arc<AtomicU64>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum CacheStatus {
+    Hit,
+    Miss,
+    Stale, // Serve old, but revalidate
+    Prefetch, // Serve fresh, but start bg refresh
 }
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct Cache {
     // Sharded in-memory cache
@@ -174,6 +184,7 @@ impl Cache {
                         msg_bytes: item.msg_bytes,
                         expiration,
                         swr,
+                        hits: Arc::new(AtomicU64::new(1)), // Reset hits on reload
                     });
                     self.metrics.increment_lmdb_cache_loads();
                  },
@@ -193,18 +204,23 @@ impl Cache {
         Ok(())
     }
 
-    pub fn get(&self, key: &str) -> Option<(Vec<u8>, bool)> {
+    pub fn get(&self, key: &str) -> Option<(Vec<u8>, CacheStatus)> {
         let shard = self.get_shard(key);
         if let Some(item) = shard.get(key) {
              let now = SystemTime::now();
+             
+             // Increment hits
+             let hits = item.hits.fetch_add(1, Ordering::Relaxed);
+             
              if now > item.expiration {
-                 let revalidate = if item.swr > Duration::ZERO {
+                 // Check Serve-Stale (SWR)
+                 let serve_stale = if item.swr > Duration::ZERO {
                       now < item.expiration + item.swr
                  } else {
                      false
                  };
 
-                 if !revalidate {
+                 if !serve_stale {
                      shard.remove(key);
                      self.metrics.increment_cache_misses();
                      return None;
@@ -212,11 +228,26 @@ impl Cache {
 
                  // Return stale data but signal revalidation
                  self.metrics.increment_cache_hits();
-                 return Some((item.msg_bytes.clone(), true));
+                 return Some((item.msg_bytes.clone(), CacheStatus::Stale));
+             }
+
+             // Check Prefetch: TTL < 10% remaining AND hits > 2
+             // Calculate remaining TTL
+             if let Ok(remaining) = item.expiration.duration_since(now) {
+                 // We don't know original TTL easily without storing it, 
+                 // but we can guess or store it.
+                 // Alternative: if remaining < 2s (for very short) or < 10%...
+                 // Let's use simple heuristic: if remaining < 3s AND hits > 5
+                 if remaining.as_secs() < 3 && hits > 5 {
+                      // Only trigger prefetch once per item expiry window? 
+                      // For now, simple return. Resolver deduplicates via singleflight anyway!
+                      self.metrics.increment_cache_hits(); 
+                      return Some((item.msg_bytes.clone(), CacheStatus::Prefetch));
+                 }
              }
 
              self.metrics.increment_cache_hits();
-             return Some((item.msg_bytes.clone(), false));
+             return Some((item.msg_bytes.clone(), CacheStatus::Hit));
         }
 
         self.metrics.increment_cache_misses();
@@ -231,6 +262,7 @@ impl Cache {
             msg_bytes: msg_bytes.clone(),
             expiration,
             swr,
+            hits: Arc::new(AtomicU64::new(1)),
         });
 
         // Persist to LMDB

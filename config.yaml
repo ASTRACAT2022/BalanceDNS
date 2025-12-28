@@ -38,7 +38,7 @@ cache:
 # Hosts file plugin
 hosts:
   enabled: true
-  path: "hosts"
+  path: "/etc/astracat-dns/hosts"
 
 # AdBlock plugin
 adblock:
@@ -59,17 +59,17 @@ httpsrr:
   records: []
 
 # DNS-over-HTTPS (DoH) settings
-# Requires valid certificates. Set enabled: false if not configured.
+# Disabled in Rust core because we use Go Proxy for TLS termination
 doh:
-  enabled: true
+  enabled: false
   listen_addr: "0.0.0.0:443"
   cert_file: "/etc/letsencrypt/live/dns.astracat.ru/fullchain.pem"
   key_file: "/etc/letsencrypt/live/dns.astracat.ru/privkey.pem"
 
 # DNS-over-TLS (DoT) settings
-# Requires valid certificates. Set enabled: false if not configured.
+# Disabled in Rust core because we use Go Proxy for TLS termination
 dot:
-  enabled: true
+  enabled: false
   listen_addr: "0.0.0.0:853"
   cert_file: "/etc/letsencrypt/live/dns.astracat.ru/fullchain.pem"
   key_file: "/etc/letsencrypt/live/dns.astracat.ru/privkey.pem"

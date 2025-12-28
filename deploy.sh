@@ -117,16 +117,27 @@ server:
     do-udp: yes
     do-tcp: yes
     access-control: 127.0.0.0/8 allow
-    cache-max-ttl: 86400
+    cache-max-ttl: 0
     cache-min-ttl: 0
     hide-identity: yes
     hide-version: yes
     minimal-responses: yes
     # Recursion
     do-not-query-localhost: no
+    
+    # DNSSEC
+    module-config: "validator iterator"
+    auto-trust-anchor-file: "/var/lib/unbound/root.key"
+    val-log-level: 1
+    harden-dnssec-stripped: yes
+    qname-minimisation: yes
 UNBOUND_EOF
 
 echo "🔄 Restarting Unbound..."
+# Ensure trust anchor exists (Debian/Ubuntu usually does this, but good to ensure)
+/usr/sbin/unbound-anchor -a /var/lib/unbound/root.key || true
+chown unbound:unbound /var/lib/unbound/root.key || true
+
 systemctl stop systemd-resolved || true # Disable resolved if it conflicts
 systemctl disable systemd-resolved || true
 # Ensure configs are valid and restart

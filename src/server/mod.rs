@@ -71,6 +71,34 @@ impl RequestHandler for Handler {
                  }
                  return ResponseInfo::from(Header::response_from_request(request.header()));
             }
+            PluginAction::Reply(ip) => {
+                 self.metrics.increment_blocked_domains(); // Count as "intervention" or add new metric?
+                 // Let's count it as normal query for now, or add "rewrites" metric later.
+
+                 let builder = MessageResponseBuilder::from_message_request(request);
+                 let mut header = Header::response_from_request(request.header());
+                 header.set_recursion_available(true);
+                 header.set_response_code(ResponseCode::NoError);
+
+                 // Create A record (using RData enum directly with inner struct)
+                 let rdata = match ip {
+                     std::net::IpAddr::V4(ipv4) => hickory_proto::rr::RData::A(hickory_proto::rr::rdata::A(ipv4)),
+                     std::net::IpAddr::V6(ipv6) => hickory_proto::rr::RData::AAAA(hickory_proto::rr::rdata::AAAA(ipv6)),
+                 };
+                 
+                 // Name from query (parsed manually or use request.query().name())
+                 let query = request.query();
+                 let name = query.name();
+                 let record = hickory_proto::rr::Record::from_rdata(name.into(), 300, rdata); // 300s TTL
+
+                 let response = builder.build(header, std::iter::once(&record), std::iter::empty(), std::iter::empty(), std::iter::empty());
+
+                 if let Ok(_) = response_handle.send_response(response).await {
+                     self.metrics.record_response_code("NOERROR");
+                     return ResponseInfo::from(header);
+                 }
+                 return ResponseInfo::from(Header::response_from_request(request.header()));
+            }
             PluginAction::Drop => {
                  // Do nothing
                  return ResponseInfo::from(Header::response_from_request(request.header()));

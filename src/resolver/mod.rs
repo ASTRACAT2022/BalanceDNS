@@ -15,7 +15,6 @@ pub trait Resolver: Send + Sync {
     async fn resolve(&self, name: &str, qtype: u16) -> anyhow::Result<Message>;
 }
 
-use singleflight::Group;
 
 pub struct HickoryResolver {
     resolver: TokioAsyncResolver,
@@ -28,7 +27,7 @@ use crate::cache::CacheStatus;
 #[async_trait]
 impl Resolver for HickoryResolver {
     async fn resolve(&self, name: &str, qtype: u16) -> anyhow::Result<Message> {
-        let name_parsed = Name::from_str(name).unwrap_or(Name::root());
+        let _name_parsed = Name::from_str(name).unwrap_or(Name::root());
         let cache_key = format!("{}|{}", name, qtype);
         let mut stale_fallback: Option<Message> = None;
 
@@ -78,9 +77,6 @@ impl Resolver for HickoryResolver {
                         },
                         CacheStatus::Miss => {
                             stale_fallback = None;
-                        }
-                            // This case should ideally not happen if we got Some((msg_bytes, status))
-                            // but if it does, we treat it as a miss.
                         }
                     }
                 }
