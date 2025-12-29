@@ -42,7 +42,7 @@ impl RequestHandler for Handler {
         let qtype = u16::from(query.query_type());
         let qtype_str = query.query_type().to_string();
 
-        log::info!("Received query: {} {} from {}", qtype_str, name, request.src().ip());
+        // log::debug!("Received query: {} {} from {}", qtype_str, name, request.src().ip());
 
         self.metrics.increment_queries(&name);
         self.metrics.record_query_type(&qtype_str);
@@ -123,7 +123,7 @@ impl RequestHandler for Handler {
 
                  let response = builder.build(header, answers.iter(), name_servers.iter(), std::iter::empty(), additionals.iter());
 
-                 log::info!("Sent response for {} {}: {}", qtype_str, name, rcode);
+                 // log::debug!("Sent response for {} {}: {}", qtype_str, name, rcode);
 
                  if let Err(e) = response_handle.send_response(response).await {
                      log::error!("Failed to send response: {}", e);

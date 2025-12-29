@@ -20,6 +20,7 @@ pub struct HickoryResolver {
     resolver: TokioAsyncResolver,
     metrics: Arc<Metrics>,
     _cache: Arc<Cache>,
+    sf: Arc<async_singleflight::Group<Message>>,
 }
 
 use crate::cache::CacheStatus;
@@ -44,29 +45,36 @@ impl Resolver for HickoryResolver {
                              let metric_clone = self.metrics.clone();
                              let name_string = name.to_string();
                              let key_clone = cache_key.clone();
+                             let sf_clone = self.sf.clone();
                              
                              tokio::spawn(async move {
-                                 // Simple background refresh
-                                 let rt = RecordType::from(qtype);
-                                 if let Ok(lookup) = resolver_clone.lookup(name_string, rt).await {
-                                      let mut new_msg = Message::new();
-                                      new_msg.set_id(0);
-                                      new_msg.set_recursion_desired(true);
-                                      new_msg.set_recursion_available(true);
-                                      new_msg.set_authentic_data(true);
-                                      new_msg.set_response_code(hickory_proto::op::ResponseCode::NoError);
-                                      
-                                      let mut min_ttl = 300;
-                                      for record in lookup.record_iter() {
-                                          new_msg.add_answer(record.clone());
-                                          if record.ttl() < min_ttl { min_ttl = record.ttl(); }
-                                      }
-                                      
-                                      if let Ok(bytes) = new_msg.to_vec() {
-                                          cache_clone.set(&key_clone, bytes, std::time::Duration::from_secs(min_ttl as u64), std::time::Duration::from_secs(600));
-                                          metric_clone.increment_cache_prefetch();
-                                      }
-                                 }
+                                 // Use SingleFlight to deduplicate prefetch
+                                 let key_internal = key_clone.clone();
+                             let _ = sf_clone.work(&key_clone, async move {
+                                     let rt = RecordType::from(qtype);
+                                     // Perform lookup logic
+                                     if let Ok(lookup) = resolver_clone.lookup(&name_string, rt).await {
+                                          let mut new_msg = Message::new();
+                                          new_msg.set_id(0);
+                                          new_msg.set_recursion_desired(true);
+                                          new_msg.set_recursion_available(true);
+                                          new_msg.set_authentic_data(true);
+                                          new_msg.set_response_code(hickory_proto::op::ResponseCode::NoError);
+                                          
+                                          let mut min_ttl = 300;
+                                          for record in lookup.record_iter() {
+                                              new_msg.add_answer(record.clone());
+                                              if record.ttl() < min_ttl { min_ttl = record.ttl(); }
+                                          }
+                                          
+                                          if let Ok(bytes) = new_msg.to_vec() {
+                                              cache_clone.set(&key_internal, bytes, std::time::Duration::from_secs(min_ttl as u64), std::time::Duration::from_secs(600));
+                                              metric_clone.increment_cache_prefetch();
+                                          }
+                                          return Ok(new_msg); // Result needed for SF
+                                     }
+                                     Err(anyhow::anyhow!("Prefetch failed"))
+                                 }).await;
                              });
                              
                              return Ok(msg);
@@ -86,66 +94,85 @@ impl Resolver for HickoryResolver {
             }
         }
 
-        // 2. Forward to Upstream (Directly, bypassing Singleflight for now)
-        let rt = RecordType::from(qtype);
-        let mut msg = Message::new();
-        msg.set_id(0);
-        msg.set_recursion_desired(true);
-        msg.set_recursion_available(true);
+        // 2. Forward to Upstream (Using Singleflight)
+        let resolver = self.resolver.clone();
+        let cache = self._cache.clone();
+        let _metrics = self.metrics.clone(); // Kept if needed later, but prefixed with _ to suppress warning
+        let name_owned = name.to_string();
+        let key = cache_key.clone();
 
-        let res = match self.resolver.lookup(name, rt).await {
-            Ok(lookup) => {
-                let mut min_ttl = 300; // Default TTL cap
-                for record in lookup.record_iter() {
-                    msg.add_answer(record.clone());
-                    if record.ttl() < min_ttl {
-                        min_ttl = record.ttl();
+        let key_internal = key.clone();
+        let result_tuple = self.sf.work(&key, async move {
+            let rt = RecordType::from(qtype);
+            let mut msg = Message::new();
+            msg.set_id(0);
+            msg.set_recursion_desired(true);
+            msg.set_recursion_available(true);
+
+            match resolver.lookup(&name_owned, rt).await {
+                Ok(lookup) => {
+                    let mut min_ttl = 300; // Default TTL cap
+                    for record in lookup.record_iter() {
+                        msg.add_answer(record.clone());
+                        if record.ttl() < min_ttl {
+                            min_ttl = record.ttl();
+                        }
                     }
-                }
-                msg.set_authentic_data(true); 
-                msg.set_response_code(hickory_proto::op::ResponseCode::NoError);
+                    msg.set_authentic_data(true); 
+                    msg.set_response_code(hickory_proto::op::ResponseCode::NoError);
 
-                // 3. Store in Cache (Success)
-                if let Ok(bytes) = msg.to_vec() {
-                     self._cache.set(&cache_key, bytes, std::time::Duration::from_secs(min_ttl as u64), std::time::Duration::from_secs(600));
-                }
-                Ok(msg)
-            },
-            Err(e) => {
-                use hickory_resolver::error::ResolveErrorKind;
-                match e.kind() {
-                    ResolveErrorKind::NoRecordsFound { .. } => {
-                        msg.set_response_code(hickory_proto::op::ResponseCode::NoError);
-                         if let Ok(bytes) = msg.to_vec() {
-                             // NODATA: 60s
-                             self._cache.set(&cache_key, bytes, std::time::Duration::from_secs(60), std::time::Duration::from_secs(60));
-                         }
-                         Ok(msg)
-                    },
-                    ResolveErrorKind::Proto(_proto_err) => {
-                         let s = e.to_string();
-                         if s.contains("NXDomain") {
-                             msg.set_response_code(hickory_proto::op::ResponseCode::NXDomain);
+                    // 3. Store in Cache (Success)
+                                 // NOTE: Original code used key. Reset to key_internal.
+                                 // Logic: 
+                                 // cache.set(&key_internal, bytes, ...
+                                 // Let's replace usage fully.
+                                 if let Ok(bytes) = msg.to_vec() {
+                                     // Success
+                                     cache.set(&key_internal, bytes, std::time::Duration::from_secs(min_ttl as u64), std::time::Duration::from_secs(600));
+                                 }
+                    Ok(msg)
+                },
+                Err(e) => {
+                    use hickory_resolver::error::ResolveErrorKind;
+                    match e.kind() {
+                        ResolveErrorKind::NoRecordsFound { .. } => {
+                            msg.set_response_code(hickory_proto::op::ResponseCode::NoError);
                              if let Ok(bytes) = msg.to_vec() {
-                                 // NXDOMAIN: 60s
-                                 self._cache.set(&cache_key, bytes, std::time::Duration::from_secs(60), std::time::Duration::from_secs(60));
+                                 // NODATA: 60s
+                                 cache.set(&key_internal, bytes, std::time::Duration::from_secs(60), std::time::Duration::from_secs(60));
                              }
                              Ok(msg)
-                         } else {
-                             msg.set_response_code(hickory_proto::op::ResponseCode::ServFail);
-                             // SERVFAIL: 10s
-                             if let Ok(bytes) = msg.to_vec() {
-                                 self._cache.set(&cache_key, bytes, std::time::Duration::from_secs(10), std::time::Duration::from_secs(10));
+                        },
+                        ResolveErrorKind::Proto(_proto_err) => {
+                             let s = e.to_string();
+                             if s.contains("NXDomain") {
+                                 msg.set_response_code(hickory_proto::op::ResponseCode::NXDomain);
+                                 if let Ok(bytes) = msg.to_vec() {
+                                     // NXDOMAIN: 60s
+                                     cache.set(&key_internal, bytes, std::time::Duration::from_secs(60), std::time::Duration::from_secs(60));
+                                 }
+                                 Ok(msg)
+                             } else {
+                                 msg.set_response_code(hickory_proto::op::ResponseCode::ServFail);
+                                 // SERVFAIL: 10s
+                                 if let Ok(bytes) = msg.to_vec() {
+                                     cache.set(&key_internal, bytes, std::time::Duration::from_secs(10), std::time::Duration::from_secs(10));
+                                 }
+                                 Ok(msg)
                              }
-                             Ok(msg)
-                         }
-                    },
-                    _ => {
-                         log::warn!("Resolver error for {}: {}", name, e);
-                         Err(e.to_string())
+                        },
+                        _ => {
+                             log::warn!("Resolver error for {}: {}", name_owned, e);
+                             Err(anyhow::anyhow!(e.to_string()))
+                        }
                     }
                 }
             }
+        }).await;
+        
+        let res = match result_tuple {
+             (Some(val), _, _) => Ok(val),
+             _ => Err(anyhow::anyhow!("Singleflight internal error")),
         };
 
         match res {
@@ -205,6 +232,7 @@ pub async fn create_resolver(
             resolver,
             metrics,
             _cache: cache,
+            sf: Arc::new(async_singleflight::Group::new()),
         }));
     }
 
@@ -226,5 +254,6 @@ pub async fn create_resolver(
         resolver,
         metrics,
         _cache: cache,
+        sf: Arc::new(async_singleflight::Group::new()),
     }))
 }
