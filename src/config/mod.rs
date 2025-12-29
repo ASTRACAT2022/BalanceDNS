@@ -163,12 +163,9 @@ impl Config {
     }
 
     pub fn load(path: &str) -> anyhow::Result<Self> {
-        if let Ok(data) = fs::read_to_string(path) {
-            let config: Config = serde_yaml::from_str(&data)?;
-            Ok(config)
-        } else {
-            Ok(Self::default())
-        }
+        let data = fs::read_to_string(path)?;
+        let config: Config = serde_yaml::from_str(&data)?;
+        Ok(config)
     }
 
     #[allow(dead_code)]

@@ -43,10 +43,12 @@ func main() {
 	log.Printf("ODoH Initialized with public key config")
 
 	// 2. Prepare Upstream Client
+	// UDP is preferred for localhost as it avoids TCP handshake overhead and socket state
 	client := &dns.Client{
 		Net:            "udp",
-		Timeout:        5 * time.Second,
+		Timeout:        2 * time.Second, // Fast timeout for local
 		SingleInflight: true,
+		UDPSize:        65535, // Avoid truncation
 	}
 
 	// 3. Start DoT Server
@@ -59,6 +61,8 @@ func main() {
 			Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 				handleDNSRequest(w, r, client, *upstreamAddr)
 			}),
+			ReadTimeout:  5 * time.Second,
+			WriteTimeout: 5 * time.Second,
 		}
 		if err := server.ListenAndServe(); err != nil {
 			log.Fatalf("DoT Server failed: %s", err)
@@ -68,21 +72,23 @@ func main() {
 	// 4. Start DoH Server (with ODoH support)
 	log.Printf("Starting DoH/ODoH server on %s", *dohAddr)
 
-	// Standard DoH endpoint
-	http.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dns-query", func(w http.ResponseWriter, r *http.Request) {
 		handleDoHRequest(w, r, client, *upstreamAddr)
 	})
-
-	// ODoH Configs endpoint
-	http.HandleFunc("/odohconfigs", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/odohconfigs", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/oblivious-doh-configs")
 		w.Header().Set("Cache-Control", "max-age=3600")
 		w.Write(odohConfigs.Marshal())
 	})
 
 	srv := &http.Server{
-		Addr:      *dohAddr,
-		TLSConfig: loadTLSConfig(*certFile, *keyFile),
+		Addr:         *dohAddr,
+		Handler:      mux,
+		TLSConfig:    loadTLSConfig(*certFile, *keyFile),
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
+		IdleTimeout:  120 * time.Second, // Keep-alive for 2 mins
 	}
 	// Enable HTTP/2
 	if err := srv.ListenAndServeTLS("", ""); err != nil {
@@ -98,6 +104,12 @@ func loadTLSConfig(cert, key string) *tls.Config {
 	return &tls.Config{
 		Certificates: []tls.Certificate{cer},
 		MinVersion:   tls.VersionTLS12,
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+		},
 	}
 }
 
@@ -158,7 +170,8 @@ func handleDoHRequest(w http.ResponseWriter, r *http.Request, client *dns.Client
 		}
 	} else {
 		// POST: read body
-		body, err := io.ReadAll(r.Body)
+		// Limit to 64KB to prevent DoS
+		body, err := io.ReadAll(io.LimitReader(r.Body, 65536))
 		if err != nil {
 			http.Error(w, "Failed to read body", http.StatusBadRequest)
 			return
@@ -196,7 +209,7 @@ func handleODoHRequest(w http.ResponseWriter, r *http.Request, client *dns.Clien
 		return
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(r.Body, 65536))
 	if err != nil {
 		http.Error(w, "Failed to read body", http.StatusBadRequest)
 		return

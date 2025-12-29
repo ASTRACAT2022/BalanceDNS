@@ -95,6 +95,15 @@ cat > deploy_pkg/setup_remote.sh << 'EOF'
 #!/bin/bash
 set -e
 
+echo "🔧 Tuning System Parameters..."
+sysctl -w net.core.somaxconn=65535 || true
+sysctl -w net.core.rmem_max=16777216 || true
+sysctl -w net.core.wmem_max=16777216 || true
+sysctl -w net.ipv4.tcp_fastopen=3 || true
+sysctl -w fs.file-max=1000000 || true
+# Increase ulimit for open files
+ulimit -n 1000000 || true
+
 echo "🔧 Installing binaries..."
 mv astracat-dns /usr/local/bin/
 mv astracat-proxy /usr/local/bin/

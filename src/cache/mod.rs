@@ -14,14 +14,16 @@ struct FixedSizeCacheItem {
     expiration_unix: i64,
     swr_nanos: i64,
     msg_bytes: Vec<u8>,
+    original_ttl_secs: u32,
 }
 
 #[derive(Clone)]
 struct FastCacheItem {
-    msg_bytes: Vec<u8>,
+    msg_bytes: Arc<Vec<u8>>,
     expiration: SystemTime,
     swr: Duration,
     hits: Arc<AtomicU64>,
+    original_ttl: Duration,
 }
 
 #[derive(Debug, PartialEq)]
@@ -78,7 +80,7 @@ impl Cache {
         let db = env_arc.create_db(Some("cache"), DatabaseFlags::empty())?;
 
         // Write channel for background persistence
-        let (tx, rx) = async_channel::bounded(1024);
+        let (tx, rx) = async_channel::bounded(2048);
 
         let cache = Cache {
             shards,
@@ -113,25 +115,30 @@ impl Cache {
         let metrics_clone = metrics.clone();
 
         // Spawn background writer task
+        // BATched Persistence Implementation
         tokio::spawn(async move {
-            while let Ok((key, item)) = rx.recv().await {
-                if let Ok(encoded) = bincode::serialize(&item) {
-                    let mut txn = match env_clone.begin_rw_txn() {
-                        Ok(t) => t,
-                        Err(e) => {
-                            log::error!("Failed to create LMDB write txn: {}", e);
-                            metrics_clone.increment_lmdb_errors();
-                            continue;
-                        }
-                    };
+            let mut batch = Vec::with_capacity(100);
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
 
-                    if let Err(e) = txn.put(db_clone, &key, &encoded, WriteFlags::empty()) {
-                        log::error!("Failed to write to LMDB for key {}: {}", key, e);
-                        metrics_clone.increment_lmdb_errors();
-                    }
-                    if let Err(e) = txn.commit() {
-                         log::error!("Failed to commit LMDB txn for key {}: {}", key, e);
-                         metrics_clone.increment_lmdb_errors();
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if !batch.is_empty() {
+                            flush_batch(&env_clone, db_clone, &batch, &metrics_clone);
+                            batch.clear();
+                        }
+                    },
+                    res = rx.recv() => {
+                         match res {
+                             Ok((key, item)) => {
+                                 batch.push((key, item));
+                                 if batch.len() >= 100 {
+                                     flush_batch(&env_clone, db_clone, &batch, &metrics_clone);
+                                     batch.clear();
+                                 }
+                             }
+                             Err(_) => break, // Channel closed
+                         }
                     }
                 }
             }
@@ -181,10 +188,11 @@ impl Cache {
 
                     // Populate in-memory cache (routed to correct shard)
                     self.get_shard(&key).insert(key, FastCacheItem {
-                        msg_bytes: item.msg_bytes,
+                        msg_bytes: Arc::new(item.msg_bytes),
                         expiration,
                         swr,
                         hits: Arc::new(AtomicU64::new(1)), // Reset hits on reload
+                        original_ttl: Duration::from_secs(item.original_ttl_secs as u64),
                     });
                     self.metrics.increment_lmdb_cache_loads();
                  },
@@ -204,7 +212,7 @@ impl Cache {
         Ok(())
     }
 
-    pub fn get(&self, key: &str) -> Option<(Vec<u8>, CacheStatus)> {
+    pub fn get(&self, key: &str) -> Option<(Arc<Vec<u8>>, CacheStatus)> {
         let shard = self.get_shard(key);
         if let Some(item) = shard.get(key) {
              let now = SystemTime::now();
@@ -231,18 +239,19 @@ impl Cache {
                  return Some((item.msg_bytes.clone(), CacheStatus::Stale));
              }
 
-             // Check Prefetch: TTL < 10% remaining AND hits > 2
-             // Calculate remaining TTL
+             // Check Prefetch: Intelligent (10% remaining)
              if let Ok(remaining) = item.expiration.duration_since(now) {
-                 // We don't know original TTL easily without storing it, 
-                 // but we can guess or store it.
-                 // Alternative: if remaining < 2s (for very short) or < 10%...
-                 // Let's use simple heuristic: if remaining < 3s AND hits > 5
-                 if remaining.as_secs() < 3 && hits > 5 {
-                      // Only trigger prefetch once per item expiry window? 
-                      // For now, simple return. Resolver deduplicates via singleflight anyway!
-                      self.metrics.increment_cache_hits(); 
-                      return Some((item.msg_bytes.clone(), CacheStatus::Prefetch));
+                 // Precalculate 10% of original
+                 let prefetch_threshold = item.original_ttl.as_secs_f64() * 0.1;
+                 let remaining_secs = remaining.as_secs_f64();
+
+                 // Heuristic: if remaining < 10% AND (hits > 2 OR original TTL was very short)
+                 if remaining_secs < prefetch_threshold {
+                      // Only trigger if we have seen some traffic, or it is about to expire anyway
+                      if hits > 2 {
+                          self.metrics.increment_cache_hits();
+                          return Some((item.msg_bytes.clone(), CacheStatus::Prefetch));
+                      }
                  }
              }
 
@@ -258,11 +267,15 @@ impl Cache {
         let expiration = SystemTime::now() + ttl;
         
         let shard = self.get_shard(key);
+        // Store as Arc to avoid cloning on get
+        let msg_arc = Arc::new(msg_bytes.clone());
+
         shard.insert(key.to_string(), FastCacheItem {
-            msg_bytes: msg_bytes.clone(),
+            msg_bytes: msg_arc,
             expiration,
             swr,
             hits: Arc::new(AtomicU64::new(1)),
+            original_ttl: ttl,
         });
 
         // Persist to LMDB
@@ -270,8 +283,43 @@ impl Cache {
             expiration_unix: expiration.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
             swr_nanos: swr.as_nanos() as i64,
             msg_bytes,
+            original_ttl_secs: ttl.as_secs() as u32,
         };
 
-        let _ = self._write_tx.send_blocking((key.to_string(), persistent_item));
+        // Non-blocking send
+        if let Err(_) = self._write_tx.try_send((key.to_string(), persistent_item)) {
+            // Channel full, drop persistence to favor availability
+            self.metrics.increment_lmdb_errors(); // or "dropped_writes"
+        }
+    }
+}
+
+fn flush_batch(env: &Environment, db: Database, batch: &[(String, FixedSizeCacheItem)], metrics: &Metrics) {
+    let mut txn = match env.begin_rw_txn() {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("Failed to create LMDB write txn: {}", e);
+            metrics.increment_lmdb_errors();
+            return;
+        }
+    };
+
+    let mut count = 0;
+    for (key, item) in batch {
+         if let Ok(encoded) = bincode::serialize(item) {
+             if let Err(e) = txn.put(db, key, &encoded, WriteFlags::empty()) {
+                 log::error!("Failed to write to LMDB for key {}: {}", key, e);
+                 metrics.increment_lmdb_errors();
+             } else {
+                 count += 1;
+             }
+         }
+    }
+
+    if count > 0 {
+        if let Err(e) = txn.commit() {
+             log::error!("Failed to commit LMDB batch: {}", e);
+             metrics.increment_lmdb_errors();
+        }
     }
 }
