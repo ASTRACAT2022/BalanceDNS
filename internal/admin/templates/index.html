@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Astracat DNS | Admin</title>
+    <!-- CSS -->
+    <link rel="stylesheet" href="/static/css/style.css">
+    <!-- Fonts -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Icons -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body>
+    <!-- Sidebar -->
+    <nav class="sidebar">
+        <div class="logo">
+            <i class="ph-planet" style="color: #a78bfa;"></i>
+            <span>Astracat</span>
+        </div>
+        <ul class="nav-links">
+            <li class="nav-item">
+                <a href="#dashboard" class="nav-link active">
+                    <i class="ph-squares-four"></i>
+                    <span>Dashboard</span>
+                </a>
+            </li>
+
+            <li class="nav-item">
+                <a href="#settings" class="nav-link">
+                    <i class="ph-gear"></i>
+                    <span>Settings</span>
+                </a>
+            </li>
+        </ul>
+        <div class="nav-item">
+            <a href="/logout" class="nav-link" style="color: var(--danger-color);">
+                <i class="ph-sign-out"></i>
+                <span>Logout</span>
+            </a>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="main-content" id="content">
+        <!-- Content injected by JS -->
+    </main>
+
+    <!-- App JS -->
+    <script src="/static/js/app.js"></script>
+</body>
+
+</html>
