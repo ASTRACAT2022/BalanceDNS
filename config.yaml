@@ -31,10 +31,10 @@ dot_addr: "0.0.0.0:853"
 doh_addr: "0.0.0.0:443"
 
 # Path to the SSL Certificate file (fullchain.pem)
-cert_file: "/etc/letsencrypt/live/dns.astracat.ru/fullchain.pem"
+cert_file: "./cert.pem"
 
 # Path to the SSL Private Key file (privkey.pem)
-key_file: "/etc/letsencrypt/live/dns.astracat.ru/privkey.pem"
+key_file: "./key.pem"
 
 # ------------------------------------------------------------------------------
 # Performance & Cache

@@ -98,6 +98,27 @@ func (s *Server) ListenAndServe() {
 	go s.startListener("udp")
 	go s.startListener("tcp")
 
+	// Check availability of Cert/Key if DoT or DoH is likely to be used
+	if s.config.DoTAddr != "" || s.config.DoHAddr != "" {
+		// If paths are not provided, default to local files
+		if s.config.CertFile == "" {
+			s.config.CertFile = "cert.pem"
+		}
+		if s.config.KeyFile == "" {
+			s.config.KeyFile = "key.pem"
+		}
+
+		// Generate if missing
+		if !FileExists(s.config.CertFile) || !FileExists(s.config.KeyFile) {
+			log.Printf("TLS certificates not found at %s, %s. Generating self-signed certificates...", s.config.CertFile, s.config.KeyFile)
+			if err := GenerateSelfSignedCert(s.config.CertFile, s.config.KeyFile); err != nil {
+				log.Printf("CRITICAL: Failed to generate self-signed certificates: %v", err)
+			} else {
+				log.Println("Successfully generated self-signed certificates.")
+			}
+		}
+	}
+
 	// Start DoT if certs are provided
 	if s.config.CertFile != "" && s.config.KeyFile != "" {
 		go s.startListener("tcp-tls")

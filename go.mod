@@ -1,13 +1,11 @@
 module dns-resolver
 
-go 1.24.3
+go 1.24.0
 
 require (
 	github.com/cloudflare/odoh-go v1.0.0
-	github.com/google/uuid v1.6.0
 	github.com/miekg/dns v1.1.68
 	github.com/miekg/unbound v0.0.0-20240613151107-1f0f3b231f04
-	github.com/nsmithuk/dnssec-root-anchors-go v1.2.0
 	github.com/nsmithuk/resolver v0.0.0-20250623062907-a1d51ff98c12
 	github.com/prometheus/client_golang v1.23.2
 	github.com/shirou/gopsutil/v3 v3.24.5
@@ -27,9 +25,11 @@ require (
 	github.com/cloudflare/circl v1.0.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/go-ole/go-ole v1.2.6 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/nsmithuk/dnssec-root-anchors-go v1.2.0 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
