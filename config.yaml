@@ -42,8 +42,8 @@ key_file: "./key.pem"
 # Number of worker goroutines for handling requests.
 max_workers: 10
 
-# In-memory cache size (number of items).
-cache_size: 10000
+# Cache size in Megabytes (MB) for Knot Resolver.
+cache_size: 1024
 
 # Path to the persistent BoltDB cache file.
 # This allows the cache to survive restarts.

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"dns-resolver/internal/config"
+	"dns-resolver/internal/knot"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
 	"dns-resolver/plugins/adblock"
@@ -29,6 +30,7 @@ var templatesFS embed.FS
 type Server struct {
 	addr          string
 	metrics       *metrics.Metrics
+	knot          *knot.Adapter
 	hosts         *hosts.HostsPlugin
 	adblock       *adblock.AdBlockPlugin
 	pm            *plugins.PluginManager
@@ -40,7 +42,7 @@ type Server struct {
 }
 
 // New creates a new admin server.
-func New(addr string, m *metrics.Metrics, h *hosts.HostsPlugin, ab *adblock.AdBlockPlugin, pm *plugins.PluginManager) *Server {
+func New(addr string, m *metrics.Metrics, k *knot.Adapter, h *hosts.HostsPlugin, ab *adblock.AdBlockPlugin, pm *plugins.PluginManager) *Server {
 	// In a real application, load this from config
 	username := "astracat"
 	password := "astracat"
@@ -52,6 +54,7 @@ func New(addr string, m *metrics.Metrics, h *hosts.HostsPlugin, ab *adblock.AdBl
 	return &Server{
 		addr:         addr,
 		metrics:      m,
+		knot:         k,
 		hosts:        h,
 		adblock:      ab,
 		pm:           pm,
@@ -74,6 +77,8 @@ func (s *Server) Start() {
 
 	// API Routes (Protected)
 	mux.Handle("/api/metrics", s.authMiddleware(http.HandlerFunc(s.handleApiMetrics)))
+	mux.Handle("/api/control/reload", s.authMiddleware(http.HandlerFunc(s.handleControlReload)))
+	mux.Handle("/api/control/cache/clear", s.authMiddleware(http.HandlerFunc(s.handleControlCacheClear)))
 	// Add other API routes here
 
 	// SPA Catch-all (Protected)
@@ -298,33 +303,38 @@ func (s *Server) saveConfig() error {
 	return nil
 }
 
-func (s *Server) handlePluginConfigUpdate(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleControlReload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	r.ParseForm()
-	pluginName := r.FormValue("pluginName")
-	plugin := s.pm.GetPlugin(pluginName)
-	if plugin == nil {
-		http.Error(w, "Plugin not found", http.StatusNotFound)
+	if s.knot != nil {
+		// Regenerate config first?
+		// For now just call reload
+		if err := s.knot.Reload(); err != nil {
+			http.Error(w, "Failed to reload: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Reload signal sent"})
+}
+
+func (s *Server) handleControlCacheClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	config := make(map[string]any)
-	for _, field := range plugin.GetConfigFields() {
-		config[field.Name] = r.FormValue(field.Name)
+	if s.knot != nil {
+		if err := s.knot.ClearCache(); err != nil {
+			http.Error(w, "Failed to clear cache: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
-	if err := plugin.SetConfig(config); err != nil {
-		// Return JSON error
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-		return
-	}
-
-	// Return JSON success
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"message": "Configuration updated successfully"})
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Cache cleared"})
 }

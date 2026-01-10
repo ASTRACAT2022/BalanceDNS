@@ -63,7 +63,7 @@ func NewConfig() *Config {
 		UpstreamTimeout:      5 * time.Second,
 		RequestTimeout:       5 * time.Second,
 		MaxWorkers:           10,
-		CacheSize:            5000,
+		CacheSize:            1024, // 1024 MB
 		MessageCacheSize:     5000,
 		RRsetCacheSize:       5000,
 		CacheMaxTTL:          3600 * time.Second,

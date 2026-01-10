@@ -4,29 +4,34 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"time"
 
 	"dns-resolver/internal/admin"
-	"dns-resolver/internal/cache"
 	"dns-resolver/internal/config"
+	"dns-resolver/internal/dnsproxy"
+	"dns-resolver/internal/doh"
+	"dns-resolver/internal/knot"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
-	"dns-resolver/internal/resolver"
-	"dns-resolver/internal/server"
+	"dns-resolver/internal/tlsutil"
 	"dns-resolver/plugins/adblock"
-	"dns-resolver/plugins/example_logger"
 	"dns-resolver/plugins/hosts"
-	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// Старая функция больше не используется, так как теперь используем метод из пакета metrics
+const (
+	KresdConfigPath  = "/etc/knot-resolver/kresd.conf"
+	KresdPolicyPath  = "/etc/knot-resolver/policy.lua"
+	KresdSocketPath  = "/run/knot-resolver/control.sock"
+	KresdBackendAddr = "127.0.0.1:5353"
+)
 
 func main() {
 	log.SetOutput(os.Stdout)
-	log.Println("Booting up ASTRACAT Relover...")
+	log.Println("Booting up ASTRACAT Control Plane...")
 
-	// Load configuration
+	// 1. Load configuration
 	cfg := config.NewConfig()
 	if _, err := os.Stat("config.yaml"); err == nil {
 		log.Println("Found config.yaml, loading...")
@@ -42,68 +47,107 @@ func main() {
 		log.Println("config.yaml not found, using default configuration.")
 	}
 
-	// Initialize metrics
-	m := metrics.NewMetrics(cfg.MetricsStoragePath)
-
-	// Create cache and resolver
-	// BoltDB expects a file path, e.g., "cache/dns.db"
-	// Ensure config.yaml provides a path that works (e.g., ends in .db or is a file)
-	c := cache.NewCache(cfg.CacheSize, cache.DefaultShards, cfg.CachePath, m)
-	defer c.Close()
-
-	// Create resolver based on configuration
-	res, err := resolver.NewResolver(resolver.ResolverType(cfg.ResolverType), cfg, c, m)
+	// 2. Generate Knot Resolver Config
+	log.Println("Generating Knot Resolver configuration...")
+	kresdConf, err := knot.GenerateConfig(cfg)
 	if err != nil {
-		log.Fatalf("Failed to create resolver: %v", err)
+		log.Printf("Error generating kresd.conf: %v", err)
+	} else {
+		if os.Geteuid() == 0 {
+			if err := os.WriteFile(KresdConfigPath, []byte(kresdConf), 0644); err != nil {
+				log.Printf("Failed to write %s: %v", KresdConfigPath, err)
+			}
+		} else {
+			log.Println("Non-root user: Skipping write to /etc/kresd/, printing config instead:")
+			log.Println(kresdConf)
+		}
 	}
-	defer res.Close()
 
-	// Start the metrics server
+	// 3. Generate Policy (Basic)
+	log.Println("Generating Policy...")
+	// We generate a basic policy. Real policy management might be done via plugins later via Admin.
+	policyContent, err := knot.GeneratePolicy([]string{"example-malware.com"}, nil)
+	if err != nil {
+		log.Printf("Error generating policy.lua: %v", err)
+	} else {
+		if os.Geteuid() == 0 {
+			if err := os.WriteFile(KresdPolicyPath, []byte(policyContent), 0644); err != nil {
+				log.Printf("Failed to write %s: %v", KresdPolicyPath, err)
+			}
+		}
+	}
+
+	// 4. Initialize Metrics (Needed early if plugins use it?)
+	m := metrics.NewMetrics(cfg.MetricsStoragePath)
 	go m.StartMetricsServer(cfg.MetricsAddr)
 
-	// Initialize plugin manager
+	// 5. Initialize Plugin Manager & Plugins
 	pm := plugins.NewPluginManager()
 
-	// Register the example logger plugin
-	loggerPlugin := example_logger.New()
-	pm.Register(loggerPlugin)
-
-	// Initialize and register the adblock plugin
-	// Use blocklists from configuration
 	adBlockPlugin := adblock.New(cfg.AdblockListURLs, 24*time.Hour)
 	pm.Register(adBlockPlugin)
 
-	// Initialize and register the hosts plugin
-	var hostsPlugin *hosts.HostsPlugin
-	if cfg.HostsEnabled {
-		hostsPlugin = hosts.New(cfg.HostsPath, cfg.HostsURL, cfg.HostsUpdateInterval)
-		pm.Register(hostsPlugin)
-	} else {
-		// Initialize hosts plugin with default path even if not explicitly enabled
-		hostsPlugin = hosts.New(cfg.HostsPath, cfg.HostsURL, cfg.HostsUpdateInterval)
-		pm.Register(hostsPlugin)
+	hostsPlugin := hosts.New(cfg.HostsPath, cfg.HostsURL, cfg.HostsUpdateInterval)
+	pm.Register(hostsPlugin)
+
+	// 6. Setup TLS and Start DoH Server
+	if cfg.DoHAddr != "" {
+		certFile := cfg.CertFile
+		keyFile := cfg.KeyFile
+
+		if certFile == "" {
+			certFile = "cert.pem"
+		}
+		if keyFile == "" {
+			keyFile = "key.pem"
+		}
+
+		log.Printf("Ensuring TLS certificates for DoH (%s, %s)...", certFile, keyFile)
+		if err := tlsutil.EnsureCertificate(certFile, keyFile, "astracat.dns"); err != nil {
+			log.Printf("Failed to generate/ensure certificates: %v. DoH might fail.", err)
+		}
+
+		// Pass 'pm' and 'm' to DoH
+		dohServer := doh.NewServer(cfg.DoHAddr, certFile, keyFile, KresdBackendAddr, pm, m)
+		go func() {
+			if err := dohServer.Start(); err != nil {
+				log.Printf("DoH Server Error: %v", err)
+			}
+		}()
 	}
 
-	// Start the admin server
+	// 7. Start Go DNS Proxy (Port 53 -> Kresd 5353)
+	proxyAddr := cfg.ListenAddr
+	if proxyAddr == "" {
+		proxyAddr = "0.0.0.0:53"
+	}
+	log.Printf("DEBUG: Initializing DNS Proxy on %s target %s", proxyAddr, KresdBackendAddr)
+	// Pass 'pm' and 'm' to DNS Proxy
+	dnsProxy := dnsproxy.NewProxy(proxyAddr, KresdBackendAddr, pm, m)
+	go func() {
+		if err := dnsProxy.Start(); err != nil {
+			log.Printf("DNS Proxy Error: %v", err)
+		}
+	}()
+
+	// 8. Initialize Knot Adapter (for Admin)
+	knotAdapter := knot.NewAdapter(KresdSocketPath, 5*time.Second)
+
+	// 9. Start the admin server
 	if cfg.AdminAddr != "" {
-		adminServer := admin.New(cfg.AdminAddr, m, hostsPlugin, adBlockPlugin, pm)
+		adminServer := admin.New(cfg.AdminAddr, m, knotAdapter, hostsPlugin, adBlockPlugin, pm)
 		go adminServer.Start()
 	}
 
-	// Create and start the server
-	srv := server.NewServer(cfg, m, res, pm)
+	log.Println("ASTRACAT Control Plane is running (Managing Knot Resolver + DoH Proxy + DNS Proxy)")
 
-	// Graceful shutdown
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt)
-		<-sig
-		log.Println("Shutting down...")
-		if err := m.SaveHistoricalData(cfg.MetricsStoragePath); err != nil {
-			log.Printf("Failed to save metrics: %v", err)
-		}
-		os.Exit(0)
-	}()
-
-	srv.ListenAndServe()
+	// 10. Graceful shutdown
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	<-sig
+	log.Println("Shutting down...")
+	if err := m.SaveHistoricalData(cfg.MetricsStoragePath); err != nil {
+		log.Printf("Failed to save metrics: %v", err)
+	}
+	os.Exit(0)
 }
