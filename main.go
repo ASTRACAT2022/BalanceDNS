@@ -10,6 +10,7 @@ import (
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/dnsproxy"
 	"dns-resolver/internal/doh"
+	"dns-resolver/internal/dot"
 	"dns-resolver/internal/knot"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
@@ -114,6 +115,18 @@ func main() {
 				log.Printf("DoH Server Error: %v", err)
 			}
 		}()
+
+		// Start DoT Server (if enabled)
+		// User requested: Disabled by default, enabled via config changes.
+		// We use the same Cert/Key as DoH.
+		if cfg.DoTAddr != "" {
+			dotServer := dot.NewServer(cfg.DoTAddr, certFile, keyFile, KresdBackendAddr, pm, m)
+			go func() {
+				if err := dotServer.Start(); err != nil {
+					log.Printf("DoT Server Error: %v", err)
+				}
+			}()
+		}
 	}
 
 	// 7. Start Go DNS Proxy (Port 53 -> Kresd 5353)

@@ -79,7 +79,7 @@ func NewConfig() *Config {
 		AdblockListURLs:      []string{"https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"},
 		AdminAddr:            "0.0.0.0:8080",
 		MetricsStoragePath:   "/tmp/dns_metrics.json",
-		DoTAddr:              "0.0.0.0:853",
+		DoTAddr:              "", // Disabled by default
 		DoHAddr:              "0.0.0.0:443",
 		CertFile:             "",
 		KeyFile:              "",
