@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"dns-resolver/internal/config"
-	"dns-resolver/internal/knot"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
+	"dns-resolver/internal/unbound"
 	"dns-resolver/plugins/adblock"
 	"dns-resolver/plugins/hosts"
 
@@ -30,7 +30,7 @@ var templatesFS embed.FS
 type Server struct {
 	addr          string
 	metrics       *metrics.Metrics
-	knot          *knot.Adapter
+	resolver      *unbound.Resolver
 	hosts         *hosts.HostsPlugin
 	adblock       *adblock.AdBlockPlugin
 	pm            *plugins.PluginManager
@@ -42,7 +42,7 @@ type Server struct {
 }
 
 // New creates a new admin server.
-func New(addr string, m *metrics.Metrics, k *knot.Adapter, h *hosts.HostsPlugin, ab *adblock.AdBlockPlugin, pm *plugins.PluginManager) *Server {
+func New(addr string, m *metrics.Metrics, r *unbound.Resolver, h *hosts.HostsPlugin, ab *adblock.AdBlockPlugin, pm *plugins.PluginManager) *Server {
 	// In a real application, load this from config
 	username := "astracat"
 	password := "astracat"
@@ -54,7 +54,7 @@ func New(addr string, m *metrics.Metrics, k *knot.Adapter, h *hosts.HostsPlugin,
 	return &Server{
 		addr:         addr,
 		metrics:      m,
-		knot:         k,
+		resolver:     r,
 		hosts:        h,
 		adblock:      ab,
 		pm:           pm,
@@ -309,17 +309,16 @@ func (s *Server) handleControlReload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.knot != nil {
-		// Regenerate config first?
-		// For now just call reload
-		if err := s.knot.Reload(); err != nil {
+	if s.resolver != nil {
+		if err := s.resolver.Reload(); err != nil {
+			log.Printf("Reload failed: %v", err)
 			http.Error(w, "Failed to reload: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Reload signal sent"})
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Reload successful"})
 }
 
 func (s *Server) handleControlCacheClear(w http.ResponseWriter, r *http.Request) {
@@ -328,8 +327,9 @@ func (s *Server) handleControlCacheClear(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if s.knot != nil {
-		if err := s.knot.ClearCache(); err != nil {
+	if s.resolver != nil {
+		if err := s.resolver.ClearCache(); err != nil {
+			log.Printf("Cache clear failed: %v", err)
 			http.Error(w, "Failed to clear cache: "+err.Error(), http.StatusInternalServerError)
 			return
 		}

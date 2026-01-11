@@ -7,15 +7,14 @@ import (
 	"time"
 
 	"dns-resolver/internal/admin"
+	"dns-resolver/internal/cache"
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/dnsproxy"
-	"dns-resolver/internal/doh"
-	"dns-resolver/internal/dot"
-	"dns-resolver/internal/knot"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
-	"dns-resolver/internal/tlsutil"
+	"dns-resolver/internal/unbound"
 	"dns-resolver/plugins/adblock"
+	"dns-resolver/plugins/doh"
 	"dns-resolver/plugins/hosts"
 
 	"gopkg.in/yaml.v3"
@@ -48,41 +47,20 @@ func main() {
 		log.Println("config.yaml not found, using default configuration.")
 	}
 
-	// 2. Generate Knot Resolver Config
-	log.Println("Generating Knot Resolver configuration...")
-	kresdConf, err := knot.GenerateConfig(cfg)
+	// 2. Initialize Unbound Resolver
+	log.Println("Initializing Unbound Resolver...")
+	resolver, err := unbound.NewResolver()
 	if err != nil {
-		log.Printf("Error generating kresd.conf: %v", err)
-	} else {
-		if os.Geteuid() == 0 {
-			if err := os.WriteFile(KresdConfigPath, []byte(kresdConf), 0644); err != nil {
-				log.Printf("Failed to write %s: %v", KresdConfigPath, err)
-			}
-		} else {
-			log.Println("Non-root user: Skipping write to /etc/kresd/, printing config instead:")
-			log.Println(kresdConf)
-		}
+		log.Fatalf("Failed to initialize Unbound: %v", err)
 	}
+	// No defer Close() here because we want it to run until exit.
+	// We could handle it in signal handling, but OS cleanup is fine for now or explicit close later.
 
-	// 3. Generate Policy (Basic)
-	log.Println("Generating Policy...")
-	// We generate a basic policy. Real policy management might be done via plugins later via Admin.
-	policyContent, err := knot.GeneratePolicy([]string{"example-malware.com"}, nil)
-	if err != nil {
-		log.Printf("Error generating policy.lua: %v", err)
-	} else {
-		if os.Geteuid() == 0 {
-			if err := os.WriteFile(KresdPolicyPath, []byte(policyContent), 0644); err != nil {
-				log.Printf("Failed to write %s: %v", KresdPolicyPath, err)
-			}
-		}
-	}
-
-	// 4. Initialize Metrics (Needed early if plugins use it?)
+	// 3. Initialize Metrics
 	m := metrics.NewMetrics(cfg.MetricsStoragePath)
 	go m.StartMetricsServer(cfg.MetricsAddr)
 
-	// 5. Initialize Plugin Manager & Plugins
+	// 4. Initialize Plugin Manager & Plugins
 	pm := plugins.NewPluginManager()
 
 	adBlockPlugin := adblock.New(cfg.AdblockListURLs, 24*time.Hour)
@@ -91,74 +69,62 @@ func main() {
 	hostsPlugin := hosts.New(cfg.HostsPath, cfg.HostsURL, cfg.HostsUpdateInterval)
 	pm.Register(hostsPlugin)
 
-	// 6. Setup TLS and Start DoH Server
-	if cfg.DoHAddr != "" {
-		certFile := cfg.CertFile
-		keyFile := cfg.KeyFile
+	// 5. Setup TLS and Start DoH Server
 
-		if certFile == "" {
-			certFile = "cert.pem"
-		}
-		if keyFile == "" {
-			keyFile = "key.pem"
-		}
-
-		log.Printf("Ensuring TLS certificates for DoH (%s, %s)...", certFile, keyFile)
-		if err := tlsutil.EnsureCertificate(certFile, keyFile, "astracat.dns"); err != nil {
-			log.Printf("Failed to generate/ensure certificates: %v. DoH might fail.", err)
-		}
-
-		// Pass 'pm' and 'm' to DoH
-		dohServer := doh.NewServer(cfg.DoHAddr, certFile, keyFile, KresdBackendAddr, pm, m)
-		go func() {
-			if err := dohServer.Start(); err != nil {
-				log.Printf("DoH Server Error: %v", err)
-			}
-		}()
-
-		// Start DoT Server (if enabled)
-		// User requested: Disabled by default, enabled via config changes.
-		// We use the same Cert/Key as DoH.
-		if cfg.DoTAddr != "" {
-			dotServer := dot.NewServer(cfg.DoTAddr, certFile, keyFile, KresdBackendAddr, pm, m)
-			go func() {
-				if err := dotServer.Start(); err != nil {
-					log.Printf("DoT Server Error: %v", err)
-				}
-			}()
-		}
-	}
-
-	// 7. Start Go DNS Proxy (Port 53 -> Kresd 5353)
+	// Determine Listen Address
 	proxyAddr := cfg.ListenAddr
 	if proxyAddr == "" {
 		proxyAddr = "0.0.0.0:53"
 	}
-	log.Printf("DEBUG: Initializing DNS Proxy on %s target %s", proxyAddr, KresdBackendAddr)
-	// Pass 'pm' and 'm' to DNS Proxy
-	dnsProxy := dnsproxy.NewProxy(proxyAddr, KresdBackendAddr, pm, m)
+
+	// If bound to 0.0.0.0, we can reach it via 127.0.0.1:53 usually.
+	dnsProxyAddr := "127.0.0.1:53"
+	// (Assuming standard port or parsed from proxyAddr).
+
+	// 5. Start DoH/DoT Service Plugin (Manages Certs & Servers)
+	dohConfig := doh.Config{
+		DoHAddr:      cfg.DoHAddr,
+		DoTAddr:      cfg.DoTAddr,
+		CertFile:     cfg.CertFile,
+		KeyFile:      cfg.KeyFile,
+		DNSProxyAddr: dnsProxyAddr,
+	}
+	dohPlugin := doh.New(dohConfig, pm, m)
+	dohPlugin.Start()
+
+	// 5.1 Initialize Hybrid Policy Cache (L1: Ristretto, L2: BoltDB)
+	log.Printf("Initializing Hybrid Policy Cache (L1: %d MB, L2: %s)...", cfg.CacheRAMSize, cfg.CachePath)
+	hybridCache, err := cache.NewCache(cfg.CacheRAMSize, cfg.CachePath)
+	if err != nil {
+		log.Printf("Warning: Failed to initialize hybrid cache: %v. Proceeding without cache.", err)
+	} else {
+		defer hybridCache.Close()
+	}
+
+	// 6. Start Go DNS Proxy
+	log.Printf("DEBUG: Initializing DNS Proxy on %s using Embedded Unbound", proxyAddr)
+	// Pass 'resolver' and 'hybridCache'
+	dnsProxy := dnsproxy.NewProxy(proxyAddr, resolver, pm, m, hybridCache)
 	go func() {
 		if err := dnsProxy.Start(); err != nil {
 			log.Printf("DNS Proxy Error: %v", err)
 		}
 	}()
 
-	// 8. Initialize Knot Adapter (for Admin)
-	knotAdapter := knot.NewAdapter(KresdSocketPath, 5*time.Second)
-
-	// 9. Start the admin server
+	// 7. Initialize Admin Server
 	if cfg.AdminAddr != "" {
-		adminServer := admin.New(cfg.AdminAddr, m, knotAdapter, hostsPlugin, adBlockPlugin, pm)
+		adminServer := admin.New(cfg.AdminAddr, m, resolver, hostsPlugin, adBlockPlugin, pm)
 		go adminServer.Start()
 	}
 
-	log.Println("ASTRACAT Control Plane is running (Managing Knot Resolver + DoH Proxy + DNS Proxy)")
+	log.Println("ASTRACAT Control Plane is running (Embedded Unbound)")
 
-	// 10. Graceful shutdown
+	// 8. Graceful shutdown
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
 	<-sig
 	log.Println("Shutting down...")
+	resolver.Close()
 	if err := m.SaveHistoricalData(cfg.MetricsStoragePath); err != nil {
 		log.Printf("Failed to save metrics: %v", err)
 	}

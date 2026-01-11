@@ -30,7 +30,9 @@ type Config struct {
 	CacheMinTTL          time.Duration `yaml:"cache_min_ttl"`
 	StaleWhileRevalidate time.Duration `yaml:"stale_while_revalidate"`
 	CachePath            string        `yaml:"cache_path"`
-	ResolverType         string        `yaml:"resolver_type"` // "unbound" or "knot"
+	CacheRAMSize         int           `yaml:"cache_ram_size"`  // MB
+	CacheDiskSize        int           `yaml:"cache_disk_size"` // MB (Guideline)
+	ResolverType         string        `yaml:"resolver_type"`   // "unbound" or "knot"
 
 	// Hosts file plugin settings
 	HostsEnabled        bool          `yaml:"hosts_enabled"`
@@ -63,13 +65,12 @@ func NewConfig() *Config {
 		UpstreamTimeout:      5 * time.Second,
 		RequestTimeout:       5 * time.Second,
 		MaxWorkers:           10,
-		CacheSize:            1024, // 1024 MB
-		MessageCacheSize:     5000,
-		RRsetCacheSize:       5000,
 		CacheMaxTTL:          3600 * time.Second,
 		CacheMinTTL:          60 * time.Second,
 		StaleWhileRevalidate: 1 * time.Minute,
-		CachePath:            "cache/dns.db",
+		CachePath:            "cache.db",
+		CacheRAMSize:         30,     // 30MB L1
+		CacheDiskSize:        1024,   // 1GB L2 (Concept)
 		ResolverType:         "knot", // Default to Knot resolver
 		HostsEnabled:         true,
 		HostsPath:            "hosts",

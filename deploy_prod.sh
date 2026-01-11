@@ -32,7 +32,8 @@ fi
 
 # 3. Create Remote Directory & Upload Files
 echo -e "${GREEN}[2/5] Preparing remote environment & Uploading...${NC}"
-ssh $REMOTE_USER@$REMOTE_HOST "mkdir -p $REMOTE_DIR"
+# Clean directory first to avoid stale files (e.g. old cache implementations)
+ssh $REMOTE_USER@$REMOTE_HOST "rm -rf $REMOTE_DIR && mkdir -p $REMOTE_DIR"
 
 # Upload source tarball, config, and installation script
 scp source_deploy.tar.gz $CONFIG_FILE remote_install.sh $REMOTE_USER@$REMOTE_HOST:$REMOTE_DIR/
