@@ -14,8 +14,8 @@ import (
 	"dns-resolver/internal/plugins"
 	"dns-resolver/internal/unbound"
 	"dns-resolver/plugins/adblock"
-	"dns-resolver/plugins/doh"
 	"dns-resolver/plugins/hosts"
+	"dns-resolver/plugins/odoh"
 
 	"gopkg.in/yaml.v3"
 )
@@ -82,15 +82,17 @@ func main() {
 	// (Assuming standard port or parsed from proxyAddr).
 
 	// 5. Start DoH/DoT Service Plugin (Manages Certs & Servers)
-	dohConfig := doh.Config{
-		DoHAddr:      cfg.DoHAddr,
-		DoTAddr:      cfg.DoTAddr,
+	// dohPlugin reference removed.
+
+	// 5.0.1 Start ODoH Service Plugin
+	odohConfig := odoh.Config{
+		ODoHAddr:     cfg.ODoHAddr,
 		CertFile:     cfg.CertFile,
 		KeyFile:      cfg.KeyFile,
 		DNSProxyAddr: dnsProxyAddr,
 	}
-	dohPlugin := doh.New(dohConfig, pm, m)
-	dohPlugin.Start()
+	odohPlugin := odoh.New(odohConfig, pm, m)
+	odohPlugin.Start()
 
 	// 5.1 Initialize Hybrid Policy Cache (L1: Ristretto, L2: BoltDB)
 	log.Printf("Initializing Hybrid Policy Cache (L1: %d MB, L2: %s)...", cfg.CacheRAMSize, cfg.CachePath)

@@ -17,8 +17,9 @@ type Config struct {
 	RequestTimeout      time.Duration `yaml:"request_timeout"`
 
 	// TLS Settings (DoT/DoH)
-	DoTAddr  string `yaml:"dot_addr"`
-	DoHAddr  string `yaml:"doh_addr"`
+	DoTAddr string `yaml:"dot_addr"`
+	// DoHAddr removed
+	ODoHAddr string `yaml:"odoh_addr"`
 	CertFile string `yaml:"cert_file"`
 	KeyFile  string `yaml:"key_file"`
 
@@ -81,7 +82,7 @@ func NewConfig() *Config {
 		AdminAddr:            "0.0.0.0:8080",
 		MetricsStoragePath:   "/tmp/dns_metrics.json",
 		DoTAddr:              "", // Disabled by default
-		DoHAddr:              "0.0.0.0:443",
+		ODoHAddr:             "", // Disabled by default
 		CertFile:             "",
 		KeyFile:              "",
 		RootAnchorPath:       "/opt/homebrew/etc/unbound/root.key", // Default macos path for homebrew unbound

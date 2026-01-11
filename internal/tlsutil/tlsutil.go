@@ -15,8 +15,8 @@ import (
 )
 
 // EnsureCertificate checks if certFile and keyFile exist.
-// If not, it generates a self-signed ECDSA P256 certificate and saves them.
-func EnsureCertificate(certFile, keyFile, domain string) error {
+// If not, it generates a self-signed ECDSA P256 certificate for the provided hosts and saves them.
+func EnsureCertificate(certFile, keyFile string, hosts []string) error {
 	// Check if files exist
 	if _, err := os.Stat(certFile); err == nil {
 		if _, err := os.Stat(keyFile); err == nil {
@@ -25,7 +25,11 @@ func EnsureCertificate(certFile, keyFile, domain string) error {
 		}
 	}
 
-	fmt.Printf("Generating self-signed certificate for %s...\n", domain)
+	if len(hosts) == 0 {
+		return fmt.Errorf("at least one host required for certificate generation")
+	}
+
+	fmt.Printf("Generating self-signed certificate for %v...\n", hosts)
 
 	// Generate ECDSA key
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -47,7 +51,7 @@ func EnsureCertificate(certFile, keyFile, domain string) error {
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			Organization: []string{"AstracatDNS Self-Signed"},
-			CommonName:   domain,
+			CommonName:   hosts[0],
 		},
 		NotBefore:             notBefore,
 		NotAfter:              notAfter,
@@ -56,11 +60,13 @@ func EnsureCertificate(certFile, keyFile, domain string) error {
 		BasicConstraintsValid: true,
 	}
 
-	// Add IP SANs if domain looks like IP, otherwise DNS name
-	if ip := net.ParseIP(domain); ip != nil {
-		template.IPAddresses = append(template.IPAddresses, ip)
-	} else {
-		template.DNSNames = append(template.DNSNames, domain)
+	// Add SANs
+	for _, h := range hosts {
+		if ip := net.ParseIP(h); ip != nil {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		} else {
+			template.DNSNames = append(template.DNSNames, h)
+		}
 	}
 
 	// Create certificate
