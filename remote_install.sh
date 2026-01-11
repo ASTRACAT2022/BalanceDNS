@@ -181,7 +181,7 @@ if systemctl is-active --quiet $SERVICE_NAME; then
         echo "Waiting for DNS to be ready..."
         # Retry up to 10 times
         for i in {1..10}; do
-            RESPONSE=$(dig @127.0.0.1 -p 53 google.com +short +time=2)
+            RESPONSE=$(dig @127.0.0.1 -p 53 google.com +short +time=2 || true)
             if [ -n "$RESPONSE" ]; then
                 echo -e "SUCCESS: Resolved google.com to $RESPONSE"
                 break
