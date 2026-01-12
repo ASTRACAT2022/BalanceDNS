@@ -1,0 +1,30 @@
+{{define "title"}}Plugins - ASTRACAT DNS{{end}}
+
+{{define "content"}}
+{{if .Message}}
+<div class="message">{{.Message}}</div>
+{{end}}
+
+<h1>Plugin Management</h1>
+
+{{range .Plugins}}
+<div class="card">
+    <h2>{{.Name}}</h2>
+    <form action="/api/plugins/config" method="post">
+        <input type="hidden" name="pluginName" value="{{.Name}}">
+        {{range .GetConfigFields}}
+        <div style="margin-bottom: 1rem;">
+            <label
+                style="display: block; color: #a0a0a0; margin-bottom: 0.5rem; text-transform: uppercase; font-size: 0.8rem;">{{.Description}}</label>
+            {{if eq .Type "textarea"}}
+            <textarea name="{{.Name}}" rows="5">{{.Value}}</textarea>
+            {{else}}
+            <input type="{{.Type}}" name="{{.Name}}" value="{{.Value}}">
+            {{end}}
+        </div>
+        {{end}}
+        <button type="submit" class="btn">Save Configuration</button>
+    </form>
+</div>
+{{end}}
+{{end}}

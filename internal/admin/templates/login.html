@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ASTRACAT DNS - Login</title>
+    <style>
+        body {
+            background-color: #0d0d0d;
+            color: #e0e0e0;
+            font-family: 'Inter', sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+
+        .login-card {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            padding: 2rem;
+            width: 100%;
+            max-width: 400px;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+        }
+
+        h2 {
+            text-align: center;
+            color: #fff;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            margin-bottom: 2rem;
+        }
+
+        input {
+            background: #000;
+            border: 1px solid #333;
+            color: #fff;
+            width: 100%;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            box-sizing: border-box;
+        }
+
+        input:focus {
+            border-color: #fff;
+            outline: none;
+        }
+
+        button {
+            width: 100%;
+            padding: 1rem;
+            background: #fff;
+            color: #000;
+            border: none;
+            font-weight: bold;
+            text-transform: uppercase;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+
+        button:hover {
+            opacity: 0.9;
+        }
+
+        .error {
+            color: #e74c3c;
+            text-align: center;
+            margin-top: 1rem;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="login-card">
+        <h2>Astracat DNS</h2>
+        <form method="post">
+            <input type="text" name="username" placeholder="USERNAME" required>
+            <input type="password" name="password" placeholder="PASSWORD" required>
+            <button type="submit">Access System</button>
+        </form>
+        {{if .Error}}
+        <p class="error">{{.Error}}</p>
+        {{end}}
+    </div>
+</body>
+
+</html>

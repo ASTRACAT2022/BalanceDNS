@@ -1,0 +1,18 @@
+# Исключить каталоги Git
+.git
+
+# Исключить артефакты сборки
+astracat-dns
+dns-resolver
+dns-resolver_unix
+
+# Исключить файлы логов
+*.log
+
+# Исключить специфичные для IDE файлы
+.idea/
+.vscode/
+
+# Исключить файлы Docker
+Dockerfile
+.dockerignore

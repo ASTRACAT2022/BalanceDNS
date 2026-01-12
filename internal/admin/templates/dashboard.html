@@ -1,0 +1,284 @@
+{{define "title"}}Dashboard - ASTRACAT DNS{{end}}
+
+{{define "content"}}
+{{if .Message}}
+<div class="message">{{.Message}}</div>
+{{end}}
+
+<h1>System Status</h1>
+
+<div class="stats-grid">
+    <div class="stat-item">
+        <div class="value" id="qps">0.00</div>
+        <div class="label">QPS</div>
+    </div>
+    <div class="stat-item">
+        <div class="value" id="total-queries">0</div>
+        <div class="label">Total Queries</div>
+    </div>
+    <div class="stat-item">
+        <div class="value" id="blocked-domains">0</div>
+        <div class="label">Blocked</div>
+    </div>
+    <div class="stat-item">
+        <div class="value" id="cache-hit-rate">0%</div>
+        <div class="label">Cache Hit Rate</div>
+    </div>
+</div>
+
+<div
+    style="display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 1.5rem; margin-top: 1.5rem;">
+    <div class="card">
+        <h3>Traffic Analysis</h3>
+        <div style="height: 300px;">
+            <canvas id="qpsChart"></canvas>
+        </div>
+    </div>
+
+    <div class="card">
+        <h3>System Resources</h3>
+        <div style="margin-bottom: 1rem;">
+            <div style="display: flex; justify-content: space-between;">
+                <span>CPU Usage</span>
+                <span id="cpu-usage">0%</span>
+            </div>
+            <div style="background: #333; height: 4px; margin-top: 0.5rem;">
+                <div id="cpu-bar" style="background: #fff; height: 100%; width: 0%;"></div>
+            </div>
+        </div>
+        <div style="margin-bottom: 1rem;">
+            <div style="display: flex; justify-content: space-between;">
+                <span>Memory Usage</span>
+                <span id="memory-usage">0%</span>
+            </div>
+            <div style="background: #333; height: 4px; margin-top: 0.5rem;">
+                <div id="memory-bar" style="background: #fff; height: 100%; width: 0%;"></div>
+            </div>
+        </div>
+        <div>
+            <div style="display: flex; justify-content: space-between;">
+                <span>Goroutines</span>
+                <span id="goroutines">0</span>
+            </div>
+        </div>
+        <div style="margin-top: 2rem;">
+            <div style="display: flex; justify-content: space-between;">
+                <span>Cache Hits (RAM/Disk)</span>
+                <span id="cache-hits">0</span>
+            </div>
+            <div style="display: flex; justify-content: space-between;">
+                <span>Cache Misses</span>
+                <span id="cache-misses">0</span>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 1.5rem;">
+    <div class="card">
+        <h3>Top NXDOMAIN</h3>
+        <table id="top-nx-domains">
+            <thead>
+                <tr>
+                    <th>Domain</th>
+                    <th>Count</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </div>
+    <div class="card">
+        <h3>Top Latency</h3>
+        <table id="top-latency-domains">
+            <thead>
+                <tr>
+                    <th>Domain</th>
+                    <th>Latency (ms)</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </div>
+</div>
+
+<div class="card" style="margin-top: 1.5rem;">
+    <h3>Quick Actions</h3>
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1.5rem;">
+        <div>
+            <h4>Manage Blocklists</h4>
+            <form action="/adblock/add" method="post">
+                <input type="url" name="url" placeholder="https://example.com/blocklist.txt" required>
+                <button class="btn" type="submit">Add Blocklist</button>
+                <button class="btn" type="button" onclick="document.getElementById('reload-form').submit()">Reload
+                    All</button>
+            </form>
+            <form id="reload-form" action="/adblock/reload" method="post" style="display:none;"></form>
+
+            <h4 style="margin-top: 1rem;">Active Blocklists</h4>
+            <ul id="blocklist-list" style="list-style: none; padding: 0;">
+                {{range .Blocklists}}
+                <li
+                    style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #333; padding: 0.5rem 0;">
+                    <span style="font-size: 0.8rem; word-break: break-all;">{{.}}</span>
+                    <form action="/adblock/remove" method="post" style="margin:0;">
+                        <input type="hidden" name="url" value="{{.}}">
+                        <button type="submit" class="btn btn-danger"
+                            style="padding: 0.25rem 0.5rem; font-size: 0.7rem;">Remove</button>
+                    </form>
+                </li>
+                {{end}}
+            </ul>
+        </div>
+
+        <div>
+            <h4>Hosts File</h4>
+            <div style="display: flex; gap: 0.5rem; margin-bottom: 0.5rem;">
+                <button class="btn" onclick="reloadHosts()" type="button" style="flex: 1;">Force Update (Live)</button>
+            </div>
+            <form action="/hosts/update" method="post">
+                <textarea id="hosts-content" name="content" rows="10" placeholder="# Loading hosts file..."></textarea>
+                <button class="btn" type="submit" style="width: 100%;">Save Changes Manually</button>
+            </form>
+        </div>
+
+        <div>
+            <h4>Admin</h4>
+            <form action="/change-password" method="post">
+                <input type="password" name="new_password" placeholder="New Password (min 8 chars)" minlength="8"
+                    required>
+                <button class="btn" type="submit">Change Password</button>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script>
+    // Start Hosts Loading
+    fetch('/api/hosts/content')
+        .then(res => res.text())
+        .then(text => document.getElementById('hosts-content').value = text);
+
+    // Chart Config
+    const ctx = document.getElementById('qpsChart').getContext('2d');
+    const qpsChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [{
+                label: 'QPS',
+                data: [],
+                borderColor: '#ffffff',
+                backgroundColor: 'rgba(255, 255, 255, 0.1)',
+                borderWidth: 2,
+                tension: 0.4,
+                fill: true,
+                pointRadius: 0
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: { grid: { color: '#333' }, ticks: { color: '#888' } },
+                y: { grid: { color: '#333' }, ticks: { color: '#888' }, beginAtZero: true }
+            },
+            plugins: {
+                legend: { display: false }
+            },
+            animation: false
+        }
+    });
+
+    // Metrics Loop
+    function updateMetrics() {
+        fetch('/api/metrics')
+            .then(res => {
+                if (res.status === 401) {
+                    window.location.href = '/login';
+                    throw new Error('Unauthorized');
+                }
+                if (!res.ok) {
+                    throw new Error('Network response was not ok');
+                }
+                return res.json();
+            })
+            .then(data => {
+                // Update stats
+                document.getElementById('qps').innerText = safeFixed(data.qps, 2);
+                document.getElementById('total-queries').innerText = (data.total_queries || 0).toLocaleString();
+                document.getElementById('blocked-domains').innerText = (data.blocked_domains || 0).toLocaleString();
+                document.getElementById('cache-hit-rate').innerText = safeFixed(data.cache_hit_rate, 1) + "%";
+
+                document.getElementById('cpu-usage').innerText = safeFixed(data.cpu_usage, 1) + "%";
+                document.getElementById('cpu-bar').style.width = Math.min(data.cpu_usage || 0, 100) + "%";
+
+                document.getElementById('memory-usage').innerText = safeFixed(data.memory_usage, 1) + "%";
+                document.getElementById('memory-bar').style.width = Math.min(data.memory_usage || 0, 100) + "%";
+
+                document.getElementById('goroutines').innerText = data.goroutines || 0;
+                document.getElementById('cache-hits').innerText = (data.cache_hits || 0).toLocaleString();
+                document.getElementById('cache-misses').innerText = (data.cache_misses || 0).toLocaleString();
+
+                // Update Charts
+                const now = new Date().toLocaleTimeString();
+                qpsChart.data.labels.push(now);
+                qpsChart.data.datasets[0].data.push(data.qps || 0);
+                if (qpsChart.data.labels.length > 30) {
+                    qpsChart.data.labels.shift();
+                    qpsChart.data.datasets[0].data.shift();
+                }
+                qpsChart.update();
+
+                // Update Tables
+                updateTable('top-nx-domains', data.top_nx_domains, 'domain', 'count');
+                updateTable('top-latency-domains', data.top_latency_domains, 'domain', 'avg_latency');
+            })
+            .catch(err => console.error("Metrics update failed:", err));
+    }
+
+    function safeFixed(val, digits) {
+        return (typeof val === 'number') ? val.toFixed(digits) : "0.00";
+    }
+
+    function updateTable(id, data, keyCol, valCol) {
+        const tbody = document.querySelector(`#${id} tbody`);
+        tbody.innerHTML = '';
+        if (!data) return;
+        data.forEach(item => {
+            const tr = document.createElement('tr');
+            let val = item[valCol];
+            if (typeof val === 'number' && valCol === 'avg_latency') val = val.toFixed(2);
+            tr.innerHTML = `<td>${item[keyCol]}</td><td>${val}</td>`;
+            tbody.appendChild(tr);
+        });
+    }
+
+    function reloadHosts() {
+        const btn = event.target;
+        const originalText = btn.innerText;
+        btn.innerText = "Updating...";
+        btn.disabled = true;
+
+        fetch('/api/hosts/reload', { method: 'POST' })
+            .then(res => {
+                if (res.ok) {
+                    alert('Hosts updated successfully from source!');
+                    // Refresh content
+                    fetch('/api/hosts/content')
+                        .then(res => res.text())
+                        .then(text => document.getElementById('hosts-content').value = text);
+                } else {
+                    alert('Failed to update hosts');
+                }
+            })
+            .catch(err => alert('Error: ' + err))
+            .finally(() => {
+                btn.innerText = originalText;
+                btn.disabled = false;
+            });
+    }
+
+    setInterval(updateMetrics, 2000);
+    updateMetrics();
+</script>
+{{end}}
