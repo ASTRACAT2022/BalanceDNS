@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: astracat-config
+  namespace: default
+data:
+  config.yaml: |
+    # AstracatDNS Configuration
+    listen_addr: "0.0.0.0:53"
+    metrics_addr: "0.0.0.0:9090"
+    admin_addr: "0.0.0.0:8080"
+
+    # TLS Settings (DoT / DoH)
+    dot_addr: "0.0.0.0:853"
+    doh_addr: "0.0.0.0:443"
+    
+    # We mount secrets to /app/cert
+    cert_file: "cert/fullchain.pem"
+    key_file: "cert/privkey.pem"
+
+    # Performance
+    max_workers: 10
+    cache_size: 10000
+    cache_path: "cache/dns.db"
+    cache_min_ttl: 60s
+    cache_max_ttl: 1h
+    stale_while_revalidate: 1m
+    resolver_type: "knot"
+
+    # Plugins
+    hosts_enabled: true
+    hosts_path: "hosts"
+    adblock_enabled: true
+    adblock_list_urls:
+      - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"

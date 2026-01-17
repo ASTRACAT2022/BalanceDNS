@@ -27,11 +27,13 @@ ENV GOMAXPROCS=1
 # Получение корневого ключа для валидации DNSSEC
 RUN mkdir -p /etc/unbound && unbound-anchor -a /etc/unbound/root.key
 
-# Копирование скомпилированного бинарного файла из этапа сборки
-COPY --from=builder /dns-resolver /dns-resolver
+# Создание директории для кэша и конфигов
+RUN mkdir -p /app/cache
 
-# Создание директории для кэша
-RUN mkdir -p /tmp/dns_cache.lmdb
+# Копирование скомпилированного бинарного файла из этапа сборки
+COPY --from=builder /dns-resolver /app/dns-resolver
+
+WORKDIR /app
 
 # Открытие порта DNS (UDP и TCP) и порта метрик (TCP)
 EXPOSE 53/udp
@@ -39,4 +41,4 @@ EXPOSE 53/tcp
 EXPOSE 9090/tcp
 
 # Установка точки входа для контейнера
-ENTRYPOINT ["/dns-resolver"]
+ENTRYPOINT ["/app/dns-resolver"]
