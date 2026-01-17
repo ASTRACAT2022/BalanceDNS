@@ -23,8 +23,8 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: astracat-dns
-          image: ghcr.io/astracat2022/astracatdns:latest
-          imagePullPolicy: Always
+          image: astracat-dns:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 53
               protocol: UDP
@@ -37,12 +37,6 @@ spec:
             - containerPort: 9090
               protocol: TCP
           volumeMounts:
-            - name: config-volume
-              mountPath: /app/config.yaml
-              subPath: config.yaml
-            - name: cert-volume
-              mountPath: /app/cert
-              readOnly: true
             - name: cache-volume
               mountPath: /app/cache
           resources:
@@ -53,12 +47,5 @@ spec:
               cpu: "500m"
               memory: "512Mi"
       volumes:
-        - name: config-volume
-          configMap:
-            name: astracat-config
-        - name: cert-volume
-          secret:
-            secretName: astracat-tls
-            optional: true # Don't crash if secret missing, but TLS won't work
         - name: cache-volume
           emptyDir: {}

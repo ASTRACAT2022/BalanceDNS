@@ -1,0 +1,19 @@
+stages:
+  - build
+
+variables:
+  DOCKER_IMAGE: "astracat-dns"
+  TAG: "latest"
+
+build:
+  stage: build
+  image: docker:20.10.16
+  services:
+    - docker:20.10.16-dind
+  script:
+    - docker build -t $DOCKER_IMAGE:$TAG .
+    # Note: In a real environment, you would push this image to a registry.
+    # - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    # - docker push $DOCKER_IMAGE:$TAG
+  tags:
+    - docker

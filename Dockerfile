@@ -34,6 +34,13 @@ RUN mkdir -p /app/cache
 # Копирование скомпилированного бинарного файла из этапа сборки
 COPY --from=builder /dns-resolver /app/dns-resolver
 
+# Копирование конфигурации и сертификатов (чтобы образ был самодостаточным)
+# WARNING: Baking secrets (certificates) into the image is a security risk.
+# This is done per specific user request for a self-contained artifact.
+COPY config.yaml /app/config.yaml
+COPY hosts /app/hosts
+COPY cert /app/cert
+
 WORKDIR /app
 
 # Открытие порта DNS (UDP и TCP) и порта метрик (TCP)
