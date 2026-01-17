@@ -34,9 +34,8 @@ type ResolverInterface interface {
 // NewResolver creates a new resolver instance based on the specified type.
 func NewResolver(resolverType ResolverType, cfg *config.Config, c *cache.Cache, m *metrics.Metrics) (ResolverInterface, error) {
 	switch resolverType {
-	case ResolverTypeUnbound:
-		log.Println("Creating Unbound resolver")
-		return NewUnboundResolver(cfg, c, m), nil
+	//	log.Println("Creating Unbound resolver")
+	//	return NewUnboundResolver(cfg, c, m), nil
 	case ResolverTypeDnslib:
 		log.Println("Creating Dnslib resolver")
 		return NewDnslibResolver(cfg, c, m), nil

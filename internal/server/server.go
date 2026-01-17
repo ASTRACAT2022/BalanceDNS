@@ -14,6 +14,7 @@ import (
 	"dns-resolver/internal/plugins"
 	"dns-resolver/internal/pool"
 	"dns-resolver/internal/resolver"
+	"dns-resolver/internal/tlsutil"
 
 	"github.com/cloudflare/odoh-go"
 	"github.com/miekg/dns"
@@ -98,18 +99,24 @@ func (s *Server) ListenAndServe() {
 	go s.startListener("udp")
 	go s.startListener("tcp")
 
-	// Start DoT if certs are provided
-	if s.config.CertFile != "" && s.config.KeyFile != "" {
-		go s.startListener("tcp-tls")
-	} else if s.config.DoTAddr != "" {
-		log.Println("DoT address configured but no cert/key provided. Skipping DoT.")
-	}
+	// Resolve Certificates (Configured or Self-Signed)
+	certFile, keyFile, err := tlsutil.EnsureCerts(s.config.CertFile, s.config.KeyFile)
+	if err != nil {
+		log.Printf("Failed to resolve or generate certificates: %v. DoT/DoH/ODoH will be disabled.", err)
+	} else {
+		// Update config with resolved paths to be used by listeners
+		s.config.CertFile = certFile
+		s.config.KeyFile = keyFile
 
-	// Start DoH/ODoH if certs are provided
-	if s.config.CertFile != "" && s.config.KeyFile != "" {
-		go s.startDoHListener()
-	} else if s.config.DoHAddr != "" {
-		log.Println("DoH address configured but no cert/key provided. Skipping DoH.")
+		// Start DoT
+		if s.config.DoTAddr != "" {
+			go s.startListener("tcp-tls")
+		}
+
+		// Start DoH/ODoH
+		if s.config.DoHAddr != "" {
+			go s.startDoHListener()
+		}
 	}
 
 	log.Printf("ASTRACAT DNS Resolver is running on %s", s.config.ListenAddr)

@@ -4,9 +4,17 @@
 # Ignore compiled binaries
 astracat-dns
 dns-resolver
+dns-resolver-linux
 
 # Ignore sensitive files
 cookies.txt
+certs/
+cert/
+*.key
+*.crt
+*.pem
 
-# Ignore temporary files
-server.log
+# Ignore cache
+cache/
+*.db
+

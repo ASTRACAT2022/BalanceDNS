@@ -24,17 +24,19 @@ admin_addr: "0.0.0.0:8080"
 
 # Address for DNS over TLS (DoT)
 # Default: 0.0.0.0:853
+# Address for DNS over TLS (DoT)
+# Default: 0.0.0.0:853
 dot_addr: "0.0.0.0:853"
 
 # Address for DNS over HTTPS (DoH) and Oblivious DoH (ODoH)
 # Default: 0.0.0.0:443
 doh_addr: "0.0.0.0:443"
 
-# Path to the SSL Certificate file (fullchain.pem)
-cert_file: "/etc/letsencrypt/live/dot.dns.astracat.ru/fullchain.pem"
+# Path to the SSL Certificate file (fullchain.pem or self-signed)
+cert_file: "cert/fullchain.pem"
 
-# Path to the SSL Private Key file (privkey.pem)
-key_file: "/etc/letsencrypt/live/dot.dns.astracat.ru/privkey.pem"
+# Path to the SSL Private Key file (privkey.pem or self-signed)
+key_file: "cert/privkey.pem"
 
 # ------------------------------------------------------------------------------
 # Performance & Cache
