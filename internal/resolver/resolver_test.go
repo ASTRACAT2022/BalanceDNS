@@ -6,6 +6,7 @@ import (
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/metrics"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -20,8 +21,9 @@ func TestResolver_Resolve(t *testing.T) {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(dir)
+	dbPath := filepath.Join(dir, "cache.db")
 	m := metrics.NewMetrics("")
-	c := cache.NewCache(cache.DefaultCacheSize, cache.DefaultShards, dir, m)
+	c := cache.NewCache(cache.DefaultCacheSize, cache.DefaultShards, dbPath, m)
 	defer c.Close()
 	r, err := NewResolver(ResolverTypeDnslib, cfg, c, m)
 	if err != nil {
@@ -74,8 +76,9 @@ func TestResolver_Resolve_DNSSEC(t *testing.T) {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(dir)
+	dbPath := filepath.Join(dir, "cache.db")
 	m := metrics.NewMetrics("")
-	c := cache.NewCache(cache.DefaultCacheSize, cache.DefaultShards, dir, m)
+	c := cache.NewCache(cache.DefaultCacheSize, cache.DefaultShards, dbPath, m)
 	defer c.Close()
 	r, err := NewResolver(ResolverTypeDnslib, cfg, c, m)
 	if err != nil {

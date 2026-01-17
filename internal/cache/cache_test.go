@@ -3,6 +3,7 @@ package cache
 import (
 	"dns-resolver/internal/metrics"
 	"os"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -17,9 +18,10 @@ func newTestCache(t *testing.T) (*Cache, func()) {
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
+	dbPath := filepath.Join(dir, "cache.db")
 
 	m := metrics.NewMetrics("")
-	cache := NewCache(128, 1, dir, m)
+	cache := NewCache(128, 1, dbPath, m)
 
 	cleanup := func() {
 		cache.Close()
@@ -99,6 +101,7 @@ func TestCachePersistence(t *testing.T) {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(dir)
+	dbPath := filepath.Join(dir, "cache.db")
 
 	q := dns.Question{Name: "persistent.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	key := Key(q)
@@ -106,12 +109,12 @@ func TestCachePersistence(t *testing.T) {
 
 	m := metrics.NewMetrics("")
 	// Create the first cache, add an item, and close it to persist the data.
-	c1 := NewCache(128, 1, dir, m)
+	c1 := NewCache(128, 1, dbPath, m)
 	c1.Set(key, msg, 0)
 	c1.Close()
 
 	// Create a new cache from the same DB path to load the data.
-	c2 := NewCache(128, 1, dir, m)
+	c2 := NewCache(128, 1, dbPath, m)
 	defer c2.Close()
 
 	// Verify the item is present in the new cache.
@@ -133,6 +136,7 @@ func TestCachePersistenceExpiration(t *testing.T) {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(dir)
+	dbPath := filepath.Join(dir, "cache.db")
 
 	q := dns.Question{Name: "expired-persistent.com.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
 	key := Key(q)
@@ -140,7 +144,7 @@ func TestCachePersistenceExpiration(t *testing.T) {
 
 	m := metrics.NewMetrics("")
 	// Create the first cache, add an item, and close it.
-	c1 := NewCache(128, 1, dir, m)
+	c1 := NewCache(128, 1, dbPath, m)
 	c1.Set(key, msg, 0)
 	c1.Close()
 
@@ -148,7 +152,7 @@ func TestCachePersistenceExpiration(t *testing.T) {
 	time.Sleep(1100 * time.Millisecond)
 
 	// Create a new cache from the same DB path.
-	c2 := NewCache(128, 1, dir, m)
+	c2 := NewCache(128, 1, dbPath, m)
 	defer c2.Close()
 
 	// The expired item should not be loaded.
@@ -204,8 +208,9 @@ func BenchmarkCacheSet(b *testing.B) {
 		b.Fatalf("Failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(dir)
+	dbPath := filepath.Join(dir, "cache.db")
 
-	c := NewCache(100000, 256, dir, m)
+	c := NewCache(100000, 256, dbPath, m)
 	defer c.Close()
 
 	msg := createTestMsg("example.com.", 3600, "1.2.3.4")
@@ -224,8 +229,9 @@ func BenchmarkCacheGet(b *testing.B) {
 		b.Fatalf("Failed to create temp dir: %v", err)
 	}
 	defer os.RemoveAll(dir)
+	dbPath := filepath.Join(dir, "cache.db")
 
-	c := NewCache(100000, 256, dir, m)
+	c := NewCache(100000, 256, dbPath, m)
 	defer c.Close()
 
 	msg := createTestMsg("example.com.", 3600, "1.2.3.4")
