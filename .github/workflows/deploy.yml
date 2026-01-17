@@ -10,58 +10,54 @@ env:
 
 jobs:
   test:
+    name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-go@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.21'
-      - name: Test
+
+      - name: Run tests
         run: go test ./...
 
-  build-and-push:
+  build:
+    name: Build & Push Image
     needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v3
-      
-      - name: Log in to the Container registry
-        uses: docker/login-action@v2
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v4
+      - name: Build and push image
+        uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
 
   deploy:
-    needs: build-and-push
+    name: Deploy to K3s
+    needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      
-      - name: Deploy to K3s via SSH
-        uses: appleboy/ssh-action@v1.0.0
-        with:
-          host: ${{ secrets.SSH_HOST }}
-          username: ${{ secrets.SSH_USER }}
-          key: ${{ secrets.SSH_KEY }}
-          script: |
-            # Ensure kubernetes dir exists
-            mkdir -p ~/astracat-k8s
-            
-            # We will create/update the files directly from content or sync them?
-            # Easier to just cat content if we want single file, but since we have a repo checkout here,
-            # we can scp the kubernetes folder.
-            
+      - uses: actions/checkout@v4
+
+      - name: Prepare manifests
+        run: |
+          sed -i "s|__IMAGE_TAG__|${{ github.sha }}|g" kubernetes/deployment.yaml
+
       - name: Copy manifests to server
         uses: appleboy/scp-action@v0.1.4
         with:
@@ -70,8 +66,8 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           source: "kubernetes/*"
           target: "~/astracat-k8s"
-          
-      - name: Apply Manifests
+
+      - name: Apply manifests
         uses: appleboy/ssh-action@v1.0.0
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -79,9 +75,5 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           script: |
             cd ~/astracat-k8s
-            # Apply ConfigMap and Deployment
-            kubectl apply -f kubernetes/configmap.yaml
-            kubectl apply -f kubernetes/deployment.yaml
-            
-            # Force restart to pull new image
-            kubectl rollout restart deployment/astracat-dns
+            kubectl apply -f .
+            kubectl rollout status deployment/astracat-dns --timeout=120s
