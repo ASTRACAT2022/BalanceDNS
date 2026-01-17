@@ -24,9 +24,9 @@ RUN apk add --no-cache unbound ca-certificates lmdb-dev
 # Установка переменной окружения для ограничения использования CPU
 ENV GOMAXPROCS=1
 
-# Получение корневого ключа для валидации DNSSEC
+# Получение корневого ключа для валидации DNSSEC (берем из пакета dnssec-root)
 RUN mkdir -p /etc/unbound && \
-    wget https://www.iana.org/dnssec/files/root.key -O /etc/unbound/root.key
+    cp /usr/share/dnssec-root/root.key /etc/unbound/root.key
 
 # Создание директории для кэша и конфигов
 RUN mkdir -p /app/cache
