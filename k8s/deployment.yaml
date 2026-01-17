@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: astracat-dns
+  labels:
+    app: astracat-dns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: astracat-dns
+  template:
+    metadata:
+      labels:
+        app: astracat-dns
+    spec:
+      containers:
+      - name: astracat-dns
+        image: astracat-dns:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 53
+          protocol: UDP
+        - containerPort: 53
+          protocol: TCP
+        - containerPort: 853
+          protocol: TCP
+        - containerPort: 443
+          protocol: TCP
+        - containerPort: 8080
+          protocol: TCP
+        - containerPort: 9090
+          protocol: TCP
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+        - name: config-volume
+          mountPath: /app/hosts
+          subPath: hosts
+        - name: cert-volume
+          mountPath: /app/cert
+          readOnly: true
+        - name: cache-volume
+          mountPath: /tmp
+        resources:
+          limits:
+            memory: "512Mi"
+            cpu: "1000m"
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+        securityContext:
+          capabilities:
+            add: ["NET_BIND_SERVICE"]
+      volumes:
+      - name: config-volume
+        configMap:
+          name: astracat-config
+      - name: cert-volume
+        secret:
+          secretName: astracat-certs
+          optional: true
+      - name: cache-volume
+        emptyDir: {}

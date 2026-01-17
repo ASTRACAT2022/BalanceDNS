@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: astracat-dns
+  labels:
+    app: astracat-dns
+spec:
+  selector:
+    app: astracat-dns
+  type: LoadBalancer
+  ports:
+  - name: dns-udp
+    port: 53
+    targetPort: 53
+    protocol: UDP
+  - name: dns-tcp
+    port: 53
+    targetPort: 53
+    protocol: TCP
+  - name: dot
+    port: 853
+    targetPort: 853
+    protocol: TCP
+  - name: doh
+    port: 443
+    targetPort: 443
+    protocol: TCP
+  - name: admin
+    port: 8080
+    targetPort: 8080
+    protocol: TCP
+  - name: metrics
+    port: 9090
+    targetPort: 9090
+    protocol: TCP
