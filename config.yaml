@@ -72,3 +72,4 @@ adblock_enabled: true
 adblock_list_urls:
   - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
   # Add more lists here
+root_anchor_path: "/etc/unbound/root.key"

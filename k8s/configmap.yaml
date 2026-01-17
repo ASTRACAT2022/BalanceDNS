@@ -1,0 +1,342 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: astracat-config
+  namespace: default
+data:
+  config.yaml: |
+    # AstracatDNS Configuration
+
+    # ------------------------------------------------------------------------------
+    # Network Settings
+    # ------------------------------------------------------------------------------
+    # The address and port to listen for standard DNS (UDP/TCP) queries.
+    # The address and port to listen for standard DNS (UDP/TCP) queries.
+    # Default: 0.0.0.0:53 (Standard DNS port)
+    listen_addr: "0.0.0.0:53"
+
+    # The address and port for the Prometheus metrics server.
+    # Default: 0.0.0.0:9090
+    metrics_addr: "0.0.0.0:9090"
+
+    # The address and port for the Admin Panel.
+    # Default: 0.0.0.0:8080
+    admin_addr: "0.0.0.0:8080"
+
+    # ------------------------------------------------------------------------------
+    # TLS Settings (DoT / DoH / ODoH)
+    # ------------------------------------------------------------------------------
+    # To enable DoT/DoH, you MUST provide valid paths to your SSL certificate and key.
+    # If these are empty, DoT/DoH/ODoH will be disabled.
+
+    # Address for DNS over TLS (DoT)
+    # Default: 0.0.0.0:853
+    dot_addr: "0.0.0.0:853"
+
+    # Address for DNS over HTTPS (DoH) and Oblivious DoH (ODoH)
+    # Default: 0.0.0.0:443
+    doh_addr: "0.0.0.0:443"
+
+    # Path to the SSL Certificate file (fullchain.pem)
+    cert_file: "/etc/letsencrypt/live/dot.dns.astracat.ru/fullchain.pem"
+
+    # Path to the SSL Private Key file (privkey.pem)
+    key_file: "/etc/letsencrypt/live/dot.dns.astracat.ru/privkey.pem"
+
+    # ------------------------------------------------------------------------------
+    # Performance & Cache
+    # ------------------------------------------------------------------------------
+    # Number of worker goroutines for handling requests.
+    max_workers: 10
+
+    # In-memory cache size (number of items).
+    cache_size: 10000
+
+    # Path to the persistent BoltDB cache file.
+    # This allows the cache to survive restarts.
+    cache_path: "cache/dns.db"
+
+    # Cache TTL settings (in seconds/duration)
+    cache_min_ttl: 60s
+    cache_max_ttl: 1h
+
+    # Stale-While-Revalidate: How long to serve expired items while fetching fresh ones in the background.
+    stale_while_revalidate: 1m
+
+    # Resolving Strategy: "knot" (uses dnslib) or "unbound" (if implemented)
+    resolver_type: "knot"
+
+    # ------------------------------------------------------------------------------
+    # Plugins
+    # ------------------------------------------------------------------------------
+
+    # Hosts Plugin: Allows overriding domains via a local hosts file.
+    hosts_enabled: true
+    hosts_path: "hosts"
+
+    # AdBlock Plugin: Blocks domains matching the provided lists.
+    adblock_enabled: true
+    adblock_list_urls:
+      - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+      # Add more lists here
+    root_anchor_path: "/etc/unbound/root.key"
+  hosts: |
+
+    144.31.14.104 tracker.openbittorrent.com
+    144.31.14.104 ntc.party
+    144.31.14.104 controlplane.tailscale.com
+    144.31.14.104 game.clashroyaleapp.com
+    144.31.14.104 gamea.clashofclans.com
+    144.31.14.104 game.brawlstarsgame.com
+    144.31.14.104 game.squadbustersgame.com
+    144.31.14.104 game.mocogame.com
+    144.31.14.104 d.rutor.info
+    144.31.14.104 instagram.com
+    144.31.14.104 www.instagram.com
+    144.31.14.104 b.i.instagram.com
+    144.31.14.104 z-p42-chat-e2ee-ig.facebook.com
+    144.31.14.104 help.instagram.com
+
+    144.31.14.104 chatgpt.com
+    144.31.14.104 ab.chatgpt.com
+    144.31.14.104 auth.openai.com
+    144.31.14.104 auth0.openai.com
+    144.31.14.104 platform.openai.com
+    144.31.14.104 cdn.oaistatic.com
+    144.31.14.104 files.oaiusercontent.com
+    144.31.14.104 cdn.auth0.com
+    144.31.14.104 tcr9i.chat.openai.com
+    144.31.14.104 webrtc.chatgpt.com
+    144.31.14.104 android.chat.openai.com
+    144.31.14.104 api.openai.com
+    144.31.14.104 operator.chatgpt.com
+    144.31.14.104 sora.chatgpt.com
+    144.31.14.104 sora.com
+    144.31.14.104 videos.openai.com
+    144.31.14.104 ios.chat.openai.com
+
+
+
+    144.31.14.104 copilot.microsoft.com
+    144.31.14.104 sydney.bing.com
+    144.31.14.104 edgeservices.bing.com
+    144.31.14.104 rewards.bing.com
+    144.31.14.104 xsts.auth.xboxlive.com
+    144.31.14.104 xgpuwebf2p.gssv-play-prod.xboxlive.com
+    144.31.14.104 xgpuweb.gssv-play-prod.xboxlive.com
+
+    144.31.14.104 api.spotify.com
+    144.31.14.104 login5.spotify.com
+    144.31.14.104 encore.scdn.co
+    144.31.14.104 gew1-spclient.spotify.com
+    144.31.14.104 spclient.wg.spotify.com
+    144.31.14.104 api-partner.spotify.com
+    144.31.14.104 aet.spotify.com
+    144.31.14.104 www.spotify.com
+    144.31.14.104 accounts.spotify.com
+    144.31.14.104 open.spotify.com
+    144.31.14.104 accounts.scdn.co
+    144.31.14.104 open-exp.spotifycdn.com
+    144.31.14.104 www-growth.scdn.co
+
+    144.31.14.104 api.github.com
+    144.31.14.104 api.individual.githubcopilot.com
+    144.31.14.104 proxy.individual.githubcopilot.com
+
+    144.31.14.104 datalore.jetbrains.com
+    144.31.14.104 plugins.jetbrains.com
+    144.31.14.104 download.jetbrains.com
+    144.31.14.104 api.jetbrains.ai
+    144.31.14.104 account.jetbrains.com
+
+    # ElevenLabs
+    144.31.14.104 elevenlabs.io
+    144.31.14.104 api.us.elevenlabs.io
+    144.31.14.104 elevenreader.io
+    144.31.14.104 api.elevenlabs.io
+    144.31.14.104 help.elevenlabs.io
+
+    # Grok
+    144.31.14.104 grok.com
+    144.31.14.104 accounts.x.ai
+    144.31.14.104 assets.grok.com
+
+    # Tidal
+    144.31.14.104 api.tidal.com
+    144.31.14.104 listen.tidal.com
+    144.31.14.104 login.tidal.com
+    144.31.14.104 auth.tidal.com
+    144.31.14.104 link.tidal.com
+    144.31.14.104 dd.tidal.com
+    144.31.14.104 resources.tidal.com
+    144.31.14.104 images.tidal.com
+    144.31.14.104 fsu.fa.tidal.com
+    144.31.14.104 geolocation.onetrust.com
+    144.31.14.104 api.squareup.com
+    144.31.14.104 api-global.squareup.com
+
+    # Supercell
+    144.31.14.104 cdn.id.supercell.com
+    144.31.14.104 security.id.supercell.com
+    144.31.14.104 accounts.supercell.com
+    144.31.14.104 game-assets.clashroyaleapp.com
+    144.31.14.104 game-assets.clashofclans.com
+    144.31.14.104 clashofclans.inbox.supercell.com
+    144.31.14.104 game-assets.brawlstarsgame.com
+    144.31.14.104 store.supercell.com
+
+    # DeepL
+    144.31.14.104 deepl.com
+    144.31.14.104 www.deepl.com
+    144.31.14.104 www2.deepl.com
+    144.31.14.104 login-wall.deepl.com
+    144.31.14.104 w.deepl.com
+    144.31.14.104 s.deepl.com
+    144.31.14.104 dict.deepl.com
+    144.31.14.104 ita-free.www.deepl.com
+    144.31.14.104 write-free.www.deepl.com
+    144.31.14.104 experimentation.deepl.com
+    144.31.14.104 experimentation-grpc.deepl.com
+    144.31.14.104 ita-free.app.deepl.com
+    144.31.14.104 shield.deepl.com
+    144.31.14.104 ott.deepl.com
+    144.31.14.104 api-free.deepl.com
+    144.31.14.104 backend.deepl.com
+    144.31.14.104 clearance.deepl.com
+    144.31.14.104 errortracking.deepl.com
+    144.31.14.104 auth.deepl.com
+    144.31.14.104 oneshot-free.www.deepl.com
+    144.31.14.104 checkout.www.deepl.com
+    144.31.14.104 gtm.deepl.com
+
+    # Weather.com
+    144.31.14.104 weather.com
+    144.31.14.104 upsx.weather.com
+
+    # Fitbit
+    144.31.14.104 api.fitbit.com
+    144.31.14.104 fitbit-pa.googleapis.com
+    144.31.14.104 fitbitvestibuleshim-pa.googleapis.com
+    144.31.14.104 fitbit.google.com
+
+    # Claude
+    144.31.14.104 claude.ai
+    144.31.14.104 console.anthropic.com
+    144.31.14.104 api.anthropic.com
+
+    # Trae.ai
+    144.31.14.104 trae-api-sg.mchost.guru
+    144.31.14.104 api.trae.ai
+    144.31.14.104 api-sg-central.trae.ai
+    144.31.14.104 api16-normal-alisg.mchost.guru
+
+    # Linear.app
+    144.31.14.104 linear.app
+    144.31.14.104 client-api.linear.app
+    144.31.14.104 static.linear.app
+    144.31.14.104 constellation.linear.app
+    144.31.14.104 uploads.linear.app
+    144.31.14.104 public.linear.app
+    144.31.14.104 s.linear.app
+
+    # Windsurf
+    144.31.14.104 windsurf.com
+    144.31.14.104 codeium.com
+    144.31.14.104 server.codeium.com
+    144.31.14.104 web-backend.codeium.com
+    144.31.14.104 unleash.codeium.com
+    144.31.14.104 inference.codeium.com
+    144.31.14.104 windsurf-stable.codeium.com
+    144.31.14.104 windsurf-telemetry.codeium.com
+    144.31.14.104 marketplace.windsurf.com
+
+    # Twitch
+    144.31.14.104 usher.ttvnw.net
+    144.31.14.104 gql.twitch.tv
+
+
+    # Manus
+    144.31.14.104 manus.im
+    144.31.14.104 api.manus.im
+
+    # Notion
+    144.31.14.104 www.notion.so
+    144.31.14.104 calendar.notion.so
+
+    # Canva
+    144.31.14.104 content-management-files.canva.com
+    144.31.14.104 static.canva.com
+
+    # Intel
+    144.31.14.104 www.intel.com
+
+    # Dell
+    144.31.14.104 www.dell.com
+
+    # TikTok
+    144.31.14.104 www.tiktok.com
+
+    # Archive.org
+    144.31.14.104 web.archive.org
+
+    # NVIDIA
+    144.31.14.104 developer.nvidia.com
+
+    # Parsec
+    144.31.14.104 builds.parsec.app
+
+    # Tria.ge
+    144.31.14.104 tria.ge
+
+    # Qwant
+    144.31.14.104 www.qwant.com
+
+    # guidedhacking.com
+    144.31.14.104 guidedhacking.com
+
+    # Framer
+    144.31.14.104 framer.com
+
+    # Autodesk
+    144.31.14.104 accounts.autodesk.com
+    144.31.14.104 www.autodesk.com
+
+    # Pump.fun
+    144.31.14.104 pump.fun
+    144.31.14.104 frontend-api-v3.pump.fun
+    144.31.14.104 images.pump.fun
+    144.31.14.104 swap-api.pump.fun
+
+    # Truth Social
+    144.31.14.104 truthsocial.com
+    144.31.14.104 static-assets-1.truthsocial.com
+
+    # Elgato
+    144.31.14.104 www.elgato.com
+
+    # Imgur
+    144.31.14.104 api.imgur.com
+
+    # Broadcom
+    144.31.14.104 profile.broadcom.com
+    # Temporarily geohide
+    45.155.204.190 gemini.google.com
+    45.155.204.190 aistudio.google.com
+    45.155.204.190 generativelanguage.googleapis.com
+    45.155.204.190 aitestkitchen.withgoogle.com
+    45.155.204.190 aisandbox-pa.googleapis.com
+    45.155.204.190 webchannel-alkalimakersuite-pa.clients6.google.com
+    45.155.204.190alkalimakersuite-pa.clients6.google.com
+    45.155.204.190 assistant-s3-pa.googleapis.com
+    45.155.204.190proactivebackend-pa.googleapis.com
+    45.155.204.190 robinfrontend-pa.googleapis.com
+    45.155.204.190 o.pki.goog
+    45.155.204.190 labs.google
+    45.155.204.190 notebooklm.google.com
+    45.155.204.190 jules.google.com
+    45.155.204.190 stitch.withgoogle.com
+
+    # Сust
+    185.112.59.109 astranet.xyz
+    82.202.230.55  www.film.ru
+    82.202.230.56  www.film.ru

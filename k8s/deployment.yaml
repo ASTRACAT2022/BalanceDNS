@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: astracat-dns
+  namespace: default
+  labels:
+    app: astracat-dns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: astracat-dns
+  template:
+    metadata:
+      labels:
+        app: astracat-dns
+    spec:
+      containers:
+      - name: dns-resolver
+        image: astracat-dns:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 53
+          protocol: UDP
+        - containerPort: 53
+          protocol: TCP
+        - containerPort: 9090
+          protocol: TCP
+        - containerPort: 8080
+          protocol: TCP
+        - containerPort: 443
+          protocol: TCP
+        - containerPort: 853
+          protocol: TCP
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+        - name: hosts-volume
+          mountPath: /app/hosts
+          subPath: hosts
+        - name: cache-volume
+          mountPath: /app/cache
+      volumes:
+      - name: config-volume
+        configMap:
+          name: astracat-config
+          items:
+          - key: config.yaml
+            path: config.yaml
+      - name: hosts-volume
+        configMap:
+          name: astracat-config
+          items:
+          - key: hosts
+            path: hosts
+      - name: cache-volume
+        emptyDir: {}
