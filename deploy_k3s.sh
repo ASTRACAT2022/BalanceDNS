@@ -6,17 +6,25 @@ GREEN='\033[0;32m'
 NC='\033[0m' # No Color
 
 echo -e "${GREEN}Starting AstracatDNS deployment for K3s...${NC}"
-pwd
-ls -F
+
+# Ensure absolute path usage
+BASE_DIR=$(pwd)
+CERT_DIR="$BASE_DIR/cert"
+
+echo "Working directory: $BASE_DIR"
 
 # 1. Ensure Certificates Exist
-if [ -d "cert" ] && [ -f "cert/privkey.pem" ] && [ -f "cert/fullchain.pem" ]; then
-    echo -e "${GREEN}Using existing certificates from cert/ directory.${NC}"
+if [ -d "$CERT_DIR" ] && [ -f "$CERT_DIR/privkey.pem" ] && [ -f "$CERT_DIR/fullchain.pem" ]; then
+    echo -e "${GREEN}Using existing certificates from $CERT_DIR directory.${NC}"
 else
-    echo "Certificates not found (checked cert/, cert/privkey.pem, cert/fullchain.pem). Generating self-signed certificates for testing..."
-    mkdir -p cert || echo "Failed to create cert directory"
-    ls -ld cert
-    openssl req -x509 -newkey rsa:4096 -keyout cert/privkey.pem -out cert/fullchain.pem -days 365 -nodes -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
+    echo "Certificates not found. Checking specifics:"
+    [ -d "$CERT_DIR" ] || echo "Directory $CERT_DIR missing"
+    [ -f "$CERT_DIR/privkey.pem" ] || echo "File $CERT_DIR/privkey.pem missing"
+    [ -f "$CERT_DIR/fullchain.pem" ] || echo "File $CERT_DIR/fullchain.pem missing"
+
+    echo "Generating self-signed certificates for testing..."
+    mkdir -p "$CERT_DIR"
+    openssl req -x509 -newkey rsa:4096 -keyout "$CERT_DIR/privkey.pem" -out "$CERT_DIR/fullchain.pem" -days 365 -nodes -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
 fi
 
 # 2. Build Docker Image (Self-contained)
