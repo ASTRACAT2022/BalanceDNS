@@ -5,6 +5,7 @@
 astracat-dns
 dns-resolver
 dns-resolver-linux
+astracat-ops
 
 # Ignore sensitive files
 cookies.txt
@@ -17,4 +18,3 @@ cert/
 # Ignore cache
 cache/
 *.db
-

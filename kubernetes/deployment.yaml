@@ -21,6 +21,8 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        astracat-dns: "true"
       containers:
         - name: astracat-dns
           image: astracat-dns:latest
