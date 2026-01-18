@@ -6,13 +6,16 @@ GREEN='\033[0;32m'
 NC='\033[0m' # No Color
 
 echo -e "${GREEN}Starting AstracatDNS deployment for K3s...${NC}"
+pwd
+ls -F
 
 # 1. Ensure Certificates Exist
 if [ -d "cert" ] && [ -f "cert/privkey.pem" ] && [ -f "cert/fullchain.pem" ]; then
     echo -e "${GREEN}Using existing certificates from cert/ directory.${NC}"
 else
-    echo "Certificates not found. Generating self-signed certificates for testing..."
-    mkdir -p cert
+    echo "Certificates not found (checked cert/, cert/privkey.pem, cert/fullchain.pem). Generating self-signed certificates for testing..."
+    mkdir -p cert || echo "Failed to create cert directory"
+    ls -ld cert
     openssl req -x509 -newkey rsa:4096 -keyout cert/privkey.pem -out cert/fullchain.pem -days 365 -nodes -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
 fi
 
