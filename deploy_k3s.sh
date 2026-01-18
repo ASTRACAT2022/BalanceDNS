@@ -8,8 +8,10 @@ NC='\033[0m' # No Color
 echo -e "${GREEN}Starting AstracatDNS deployment for K3s...${NC}"
 
 # 1. Ensure Certificates Exist
-if [ ! -d "cert" ] || [ ! -f "cert/privkey.pem" ] || [ ! -f "cert/fullchain.pem" ]; then
-    echo "Certificates not found. Generating self-signed certificates..."
+if [ -d "cert" ] && [ -f "cert/privkey.pem" ] && [ -f "cert/fullchain.pem" ]; then
+    echo -e "${GREEN}Using existing certificates from cert/ directory.${NC}"
+else
+    echo "Certificates not found. Generating self-signed certificates for testing..."
     mkdir -p cert
     openssl req -x509 -newkey rsa:4096 -keyout cert/privkey.pem -out cert/fullchain.pem -days 365 -nodes -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
 fi
@@ -25,6 +27,8 @@ IMAGE_TAR="astracat-dns.tar"
 docker save -o $IMAGE_TAR astracat-dns:latest
 sudo k3s ctr images import $IMAGE_TAR
 rm $IMAGE_TAR
+
+echo -e "${GREEN}NOTE: Image imported to local K3s node only. For multi-node clusters, ensure image distribution.${NC}"
 
 # 4. Deploy to Kubernetes
 echo -e "${GREEN}Applying Kubernetes manifests...${NC}"
