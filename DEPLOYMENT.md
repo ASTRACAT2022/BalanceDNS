@@ -82,7 +82,36 @@ docker run -d \
    docker build -t astracat-dns .
    ```
 
-2. **Run:**
    ```bash
    docker run -d --name dns -p 5053:53/udp -p 5053:53/tcp astracat-dns
    ```
+
+---
+
+## ☁️ Pushing to Docker Hub
+
+### Manual Method
+1. **Login to Docker Hub:**
+   ```bash
+   docker login
+   ```
+
+2. **Tag your image:**
+   Replace `your-username` with your Docker Hub username.
+   ```bash
+   docker tag astracat-dns your-username/astracat-dns:latest
+   ```
+
+3. **Push:**
+   ```bash
+   docker push your-username/astracat-dns:latest
+   ```
+
+### Automated Method (GitHub Actions)
+This repository includes a GitHub Action to automatically publish to Docker Hub on release.
+
+1. Go to your GitHub Repository **Settings** -> **Secrets and variables** -> **Actions**.
+2. Create two repository secrets:
+   - `DOCKERHUB_USERNAME`: Your Docker Hub username.
+   - `DOCKERHUB_TOKEN`: Your Docker Hub Access Token.
+3. Every time you push a tag (e.g., `v1.0.0`) or push to `main` (if configured), the image will be pushed to Docker Hub.
