@@ -139,6 +139,8 @@ MIT
 
 ## 🚀 Установка
 
+> Подробное руководство по развертыванию (Local, SSH, Docker, Certificates) см. в [DEPLOYMENT.md](DEPLOYMENT.md).
+
 Установить **ASTRACAT DNS Resolver** очень просто:  
 
 ```bash
