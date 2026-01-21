@@ -35,17 +35,33 @@ func New(filePath string, hostsURL string, updateInterval time.Duration) *HostsP
 		updateInterval: updateInterval,
 	}
 
-	// Initial load
-	if err := p.UpdateHosts(); err != nil {
-		log.Printf("Failed to load hosts on startup: %v", err)
+	// Try to load from local file first (fast path)
+	if err := p.loadFromFile(); err != nil {
+		log.Printf("HostsPlugin: No local cache found or failed to load: %v", err)
 	}
 
 	// Start background updater if URL is provided
+	// Do the first network update asynchronously to avoid blocking startup
 	if hostsURL != "" && updateInterval > 0 {
-		go p.updateLoop()
+		go func() {
+			log.Println("HostsPlugin: Starting initial background update...")
+			if err := p.UpdateHosts(); err != nil {
+				log.Printf("Failed to update hosts from %s: %v", p.hostsURL, err)
+			}
+			p.updateLoop()
+		}()
 	}
 
 	return p
+}
+
+// loadFromFile loads hosts exclusively from the local file without network.
+func (p *HostsPlugin) loadFromFile() error {
+	content, err := os.ReadFile(p.filePath)
+	if err != nil {
+		return err
+	}
+	return p.parseAndLoad(content)
 }
 
 // Name returns the name of the plugin.
@@ -55,6 +71,7 @@ func (p *HostsPlugin) Name() string {
 
 func (p *HostsPlugin) updateLoop() {
 	ticker := time.NewTicker(p.updateInterval)
+	defer ticker.Stop()
 	for range ticker.C {
 		if err := p.UpdateHosts(); err != nil {
 			log.Printf("Failed to update hosts from %s: %v", p.hostsURL, err)
