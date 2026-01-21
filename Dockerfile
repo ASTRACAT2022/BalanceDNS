@@ -25,7 +25,8 @@ RUN apk add --no-cache unbound ca-certificates lmdb-dev
 ENV GOMAXPROCS=1
 
 # Получение корневого ключа для валидации DNSSEC
-RUN mkdir -p /etc/unbound && unbound-anchor -a /etc/unbound/root.key
+# Получение корневого ключа для валидации DNSSEC
+RUN mkdir -p /etc/unbound && wget -O /etc/unbound/root.key https://www.internic.net/domain/named.root.key
 
 # Копирование скомпилированного бинарного файла из этапа сборки
 COPY --from=builder /dns-resolver /dns-resolver
