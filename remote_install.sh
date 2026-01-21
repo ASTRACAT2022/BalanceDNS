@@ -92,6 +92,19 @@ if [ ! -f $BINARY_NAME ]; then
 fi
 echo 'Build complete.'
 
+# 4.1 Setup Certificates
+echo "Checking for custom certificates..."
+if [ -f "internal/config/myceeert/fullchain.pem" ] && [ -f "internal/config/myceeert/privkey.pem" ]; then
+    echo "Found custom certificates in internal/config/myceeert. Installing..."
+    cp "internal/config/myceeert/fullchain.pem" "cert.pem"
+    cp "internal/config/myceeert/privkey.pem" "key.pem"
+    chmod 644 cert.pem
+    chmod 600 key.pem
+    echo "Certificates installed."
+else
+    echo "No custom certificates found in internal/config/myceeert. Will rely on auto-generated self-signed certs."
+fi
+
 # 5. Stop Services & Cleanup
 echo "Stopping existing services..."
 # Stop Astracat Control Plane
