@@ -47,6 +47,37 @@ func main() {
 		log.Println("config.yaml not found, using default configuration.")
 	}
 
+	// 1.1 Handle Certificate Content from Env Vars
+	// This supports "Upload image to git and accept certs as text" request.
+	if cfg.CertContent != "" && cfg.KeyContent != "" {
+		log.Println("Detected SSL certificates in environment variables. Writing to files...")
+		// Use configured paths or defaults
+		certPath := cfg.CertFile
+		if certPath == "" {
+			certPath = "cert.pem"
+		}
+		keyPath := cfg.KeyFile
+		if keyPath == "" {
+			keyPath = "key.pem"
+		}
+
+		if err := os.WriteFile(certPath, []byte(cfg.CertContent), 0644); err != nil {
+			log.Printf("Error writing cert file from env: %v", err)
+		} else {
+			cfg.CertFile = certPath
+			log.Printf("Wrote certificate to %s", certPath)
+		}
+
+		if err := os.WriteFile(keyPath, []byte(cfg.KeyContent), 0600); err != nil {
+			log.Printf("Error writing key file from env: %v", err)
+		} else {
+			cfg.KeyFile = keyPath
+			log.Printf("Wrote private key to %s", keyPath)
+		}
+	} else {
+		log.Println("No certificate content in environment variables.")
+	}
+
 	// 2. Initialize Unbound Resolver
 	log.Println("Initializing Unbound Resolver...")
 	resolver, err := unbound.NewResolver()

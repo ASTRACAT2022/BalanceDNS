@@ -20,8 +20,11 @@ type Config struct {
 	DoTAddr string `yaml:"dot_addr"`
 	// DoHAddr removed
 	ODoHAddr string `yaml:"odoh_addr"`
-	CertFile string `yaml:"cert_file"`
-	KeyFile  string `yaml:"key_file"`
+	CertFile string `yaml:"cert_file"` // File path
+	KeyFile  string `yaml:"key_file"`  // File path
+	// Allow loading from Environment Variables as content (base64 or raw string)
+	CertContent string `yaml:"-"`
+	KeyContent  string `yaml:"-"`
 
 	MaxWorkers           int           `yaml:"max_workers"`
 	CacheSize            int           `yaml:"cache_size"`
@@ -85,6 +88,8 @@ func NewConfig() *Config {
 		ODoHAddr:             "", // Disabled by default
 		CertFile:             "",
 		KeyFile:              "",
+		CertContent:          os.Getenv("SSL_CERT_CONTENT"),
+		KeyContent:           os.Getenv("SSL_KEY_CONTENT"),
 		RootAnchorPath:       "/opt/homebrew/etc/unbound/root.key", // Default macos path for homebrew unbound
 	}
 }
