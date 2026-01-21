@@ -1,5 +1,5 @@
 # Этап 1: Сборка приложения Go
-FROM golang:1.23.2-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
 # Установка зависимостей для сборки
 RUN apk add --no-cache build-base gcc unbound-dev lmdb-dev
