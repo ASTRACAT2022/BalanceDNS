@@ -47,7 +47,10 @@ func main() {
 		log.Println("config.yaml not found, using default configuration.")
 	}
 
-	// 1.1 Handle Certificate Content from Env Vars
+	// 2. Override configuration with Environment Variables
+	cfg.LoadFromEnv()
+
+	// 3. Handle Certificate Content from Env Vars
 	// This supports "Upload image to git and accept certs as text" request.
 	if cfg.CertContent != "" && cfg.KeyContent != "" {
 		log.Println("Detected SSL certificates in environment variables. Writing to files...")
@@ -78,7 +81,7 @@ func main() {
 		log.Println("No certificate content in environment variables.")
 	}
 
-	// 2. Initialize Unbound Resolver
+	// 4. Initialize Unbound Resolver
 	log.Println("Initializing Unbound Resolver...")
 	resolver, err := unbound.NewResolver()
 	if err != nil {
@@ -87,11 +90,11 @@ func main() {
 	// No defer Close() here because we want it to run until exit.
 	// We could handle it in signal handling, but OS cleanup is fine for now or explicit close later.
 
-	// 3. Initialize Metrics
+	// 5. Initialize Metrics
 	m := metrics.NewMetrics(cfg.MetricsStoragePath)
 	go m.StartMetricsServer(cfg.MetricsAddr)
 
-	// 4. Initialize Plugin Manager & Plugins
+	// 6. Initialize Plugin Manager & Plugins
 	pm := plugins.NewPluginManager()
 
 	adBlockPlugin := adblock.New(cfg.AdblockListURLs, 24*time.Hour)
@@ -100,7 +103,7 @@ func main() {
 	hostsPlugin := hosts.New(cfg.HostsPath, cfg.HostsURL, cfg.HostsUpdateInterval)
 	pm.Register(hostsPlugin)
 
-	// 5. Setup TLS and Start DoH Server
+	// 7. Setup TLS and Start DoH Server
 
 	// Determine Listen Address
 	proxyAddr := cfg.ListenAddr
@@ -134,7 +137,7 @@ func main() {
 		defer hybridCache.Close()
 	}
 
-	// 6. Start Go DNS Proxy
+	// 8. Start Go DNS Proxy
 	log.Printf("DEBUG: Initializing DNS Proxy on %s using Embedded Unbound", proxyAddr)
 	// Pass 'resolver' and 'hybridCache'
 	dnsProxy := dnsproxy.NewProxy(proxyAddr, resolver, pm, m, hybridCache)
@@ -144,7 +147,7 @@ func main() {
 		}
 	}()
 
-	// 7. Initialize Admin Server
+	// 9. Initialize Admin Server
 	if cfg.AdminAddr != "" {
 		adminServer := admin.New(cfg.AdminAddr, m, resolver, hostsPlugin, adBlockPlugin, pm)
 		go adminServer.Start()
@@ -152,7 +155,7 @@ func main() {
 
 	log.Println("ASTRACAT Control Plane is running (Embedded Unbound)")
 
-	// 8. Graceful shutdown
+	// 10. Graceful shutdown
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
 	<-sig

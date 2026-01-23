@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -88,9 +89,78 @@ func NewConfig() *Config {
 		ODoHAddr:             "", // Disabled by default
 		CertFile:             "",
 		KeyFile:              "",
-		CertContent:          os.Getenv("SSL_CERT_CONTENT"),
-		KeyContent:           os.Getenv("SSL_KEY_CONTENT"),
+		CertContent:          "",
+		KeyContent:           "",
 		RootAnchorPath:       "/opt/homebrew/etc/unbound/root.key", // Default macos path for homebrew unbound
+	}
+}
+
+// LoadFromEnv loads configuration from environment variables, overriding existing values.
+func (c *Config) LoadFromEnv() {
+	if v := os.Getenv("LISTEN_ADDR"); v != "" {
+		c.ListenAddr = v
+	}
+	if v := os.Getenv("METRICS_ADDR"); v != "" {
+		c.MetricsAddr = v
+	}
+	if v := os.Getenv("ADMIN_ADDR"); v != "" {
+		c.AdminAddr = v
+	}
+	if v := os.Getenv("DOH_ADDR"); v != "" {
+		c.ODoHAddr = v // Map DOH_ADDR to ODoHAddr as it seems to be the active one
+	}
+	if v := os.Getenv("ODOH_ADDR"); v != "" {
+		c.ODoHAddr = v
+	}
+	if v := os.Getenv("DOT_ADDR"); v != "" {
+		c.DoTAddr = v
+	}
+	if v := os.Getenv("SSL_CERT_CONTENT"); v != "" {
+		c.CertContent = v
+	}
+	if v := os.Getenv("SSL_KEY_CONTENT"); v != "" {
+		c.KeyContent = v
+	}
+	if v := os.Getenv("ROOT_ANCHOR_PATH"); v != "" {
+		c.RootAnchorPath = v
+	}
+	if v := os.Getenv("METRICS_STORAGE_PATH"); v != "" {
+		c.MetricsStoragePath = v
+	}
+	if v := os.Getenv("CACHE_PATH"); v != "" {
+		c.CachePath = v
+	}
+	if v := os.Getenv("RESOLVER_TYPE"); v != "" {
+		c.ResolverType = v
+	}
+
+	// Integers
+	if v := os.Getenv("MAX_WORKERS"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.MaxWorkers = i
+		}
+	}
+	if v := os.Getenv("CACHE_SIZE"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.CacheSize = i
+		}
+	}
+	if v := os.Getenv("CACHE_RAM_SIZE"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.CacheRAMSize = i
+		}
+	}
+
+	// Bools
+	if v := os.Getenv("ADBLOCK_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.AdblockEnabled = b
+		}
+	}
+	if v := os.Getenv("HOSTS_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.HostsEnabled = b
+		}
 	}
 }
 
