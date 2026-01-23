@@ -3,8 +3,8 @@ version: '3.8'
 services:
   astracat-dns:
     # Use the image from Docker Hub (once pushed) or build locally
-    # image: astracat2022/astracat-dns:latest
-    build: .
+    image: astracat2022/astracat-dns:latest
+    # build: .
     container_name: astracat-dns
     ports:
       - "53:53/udp"
