@@ -104,7 +104,7 @@ func NewConfig() *Config {
 		KeyFile:              "",
 		CertContent:          "",
 		KeyContent:           "",
-		RootAnchorPath:       "/opt/homebrew/etc/unbound/root.key", // Default macos path for homebrew unbound
+		RootAnchorPath:       "/var/lib/unbound/root.key",
 		AcmeEnabled:          false,
 		AcmeCacheDir:         "certs-cache",
 		ClusterRole:          "standalone",
