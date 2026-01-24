@@ -14,8 +14,7 @@ import (
 // Server represents a DNS-over-TLS (DoT) server.
 type Server struct {
 	Addr           string
-	CertFile       string
-	KeyFile        string
+	TLSConfig      *tls.Config
 	UpstreamTarget string // e.g. "127.0.0.1:53"
 	Client         *dns.Client
 	PM             *plugins.PluginManager
@@ -23,11 +22,10 @@ type Server struct {
 }
 
 // NewServer creates a new DoT server.
-func NewServer(addr, certFile, keyFile, upstream string, pm *plugins.PluginManager, m *metrics.Metrics) *Server {
+func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.PluginManager, m *metrics.Metrics) *Server {
 	return &Server{
 		Addr:           addr,
-		CertFile:       certFile,
-		KeyFile:        keyFile,
+		TLSConfig:      tlsConfig,
 		UpstreamTarget: upstream,
 		PM:             pm,
 		Metrics:        m,
@@ -42,20 +40,10 @@ func NewServer(addr, certFile, keyFile, upstream string, pm *plugins.PluginManag
 func (s *Server) Start() error {
 	log.Printf("Starting DoT Server on %s (Upstream: %s)", s.Addr, s.UpstreamTarget)
 
-	cert, err := tls.LoadX509KeyPair(s.CertFile, s.KeyFile)
-	if err != nil {
-		return err
-	}
-
-	tlsConfig := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-	}
-
 	srv := &dns.Server{
 		Addr:      s.Addr,
 		Net:       "tcp-tls",
-		TLSConfig: tlsConfig,
+		TLSConfig: s.TLSConfig,
 		Handler:   dns.HandlerFunc(s.handleRequest),
 	}
 

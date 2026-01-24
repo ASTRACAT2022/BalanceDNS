@@ -1,6 +1,7 @@
 package odoh
 
 import (
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -20,8 +21,7 @@ import (
 // Server represents an Oblivious DNS-over-HTTPS server.
 type Server struct {
 	Addr           string
-	CertFile       string // TLS Cert
-	KeyFile        string // TLS Key
+	TLSConfig      *tls.Config
 	UpstreamTarget string
 	Client         *dns.Client
 	PM             *plugins.PluginManager
@@ -32,7 +32,7 @@ type Server struct {
 }
 
 // NewServer creates a new ODoH server.
-func NewServer(addr, certFile, keyFile, upstream string, pm *plugins.PluginManager, m *metrics.Metrics) (*Server, error) {
+func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.PluginManager, m *metrics.Metrics) (*Server, error) {
 	// Generate a key pair for ODoH (HPKE)
 	// Using default suite (P256 or similar depending on library default)
 	kp, err := odoh.CreateDefaultKeyPair()
@@ -42,8 +42,7 @@ func NewServer(addr, certFile, keyFile, upstream string, pm *plugins.PluginManag
 
 	return &Server{
 		Addr:           addr,
-		CertFile:       certFile,
-		KeyFile:        keyFile,
+		TLSConfig:      tlsConfig,
 		UpstreamTarget: upstream,
 		PM:             pm,
 		Metrics:        m,
@@ -62,8 +61,9 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/odohconfigs", s.handleODoHConfigs)
 
 	server := &http.Server{
-		Addr:    s.Addr,
-		Handler: mux,
+		Addr:      s.Addr,
+		Handler:   mux,
+		TLSConfig: s.TLSConfig,
 	}
 
 	// Enable HTTP/2
@@ -78,7 +78,14 @@ func (s *Server) Start() error {
 	packedConfigs := configs.Marshal()
 	log.Printf("ODoH Configs (Base64Url): %s", hex.EncodeToString(packedConfigs))
 
-	if err := server.ListenAndServeTLS(s.CertFile, s.KeyFile); err != nil && err != http.ErrServerClosed {
+	// Create TLS listener using our config
+	ln, err := net.Listen("tcp", s.Addr)
+	if err != nil {
+		return err
+	}
+
+	tlsListener := tls.NewListener(ln, s.TLSConfig)
+	if err := server.Serve(tlsListener); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil
