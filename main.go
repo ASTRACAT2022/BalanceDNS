@@ -88,7 +88,7 @@ func main() {
 
 	// 4. Initialize Unbound Resolver
 	log.Println("Initializing Unbound Resolver...")
-	resolver, err := unbound.NewResolver()
+	resolver, err := unbound.NewResolver(cfg.RootAnchorPath)
 	if err != nil {
 		log.Fatalf("Failed to initialize Unbound: %v", err)
 	}

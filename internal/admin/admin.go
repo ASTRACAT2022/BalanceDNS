@@ -372,7 +372,7 @@ func (s *Server) handleControlReload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.resolver != nil {
-		if err := s.resolver.Reload(); err != nil {
+		if err := s.resolver.Reload(s.rootAnchorPath()); err != nil {
 			log.Printf("Reload failed: %v", err)
 			http.Error(w, "Failed to reload: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -390,7 +390,7 @@ func (s *Server) handleControlCacheClear(w http.ResponseWriter, r *http.Request)
 	}
 
 	if s.resolver != nil {
-		if err := s.resolver.ClearCache(); err != nil {
+		if err := s.resolver.ClearCache(s.rootAnchorPath()); err != nil {
 			log.Printf("Cache clear failed: %v", err)
 			http.Error(w, "Failed to clear cache: "+err.Error(), http.StatusInternalServerError)
 			return
@@ -399,4 +399,11 @@ func (s *Server) handleControlCacheClear(w http.ResponseWriter, r *http.Request)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "Cache cleared"})
+}
+
+func (s *Server) rootAnchorPath() string {
+	if s.baseConfig != nil {
+		return s.baseConfig.RootAnchorPath
+	}
+	return ""
 }

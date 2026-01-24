@@ -94,6 +94,9 @@ stale_while_revalidate: 1m
 # Resolving Strategy: "knot" (uses dnslib) or "unbound" (if implemented)
 resolver_type: "knot"
 
+# Path to the DNSSEC root trust anchor for Unbound.
+root_anchor_path: "/var/lib/unbound/root.key"
+
 # ------------------------------------------------------------------------------
 # Plugins
 # ------------------------------------------------------------------------------

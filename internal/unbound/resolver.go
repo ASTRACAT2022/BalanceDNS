@@ -15,7 +15,10 @@ type Resolver struct {
 }
 
 // NewResolver creates and initializes a new Unbound resolver.
-func NewResolver() (*Resolver, error) {
+func NewResolver(rootAnchorPath string) (*Resolver, error) {
+	if rootAnchorPath == "" {
+		rootAnchorPath = "/var/lib/unbound/root.key"
+	}
 	u := unbound.New()
 
 	// Apply User Configuration
@@ -29,7 +32,7 @@ func NewResolver() (*Resolver, error) {
 		"harden-glue":            "yes",
 		"harden-dnssec-stripped": "yes",
 		"use-caps-for-id":        "no",
-		"auto-trust-anchor-file": "/var/lib/unbound/root.key",
+		"auto-trust-anchor-file": rootAnchorPath,
 		"val-clean-additional":   "yes",
 		"edns-buffer-size":       "1232",
 		"so-rcvbuf":              "1m",
@@ -153,7 +156,10 @@ func (r *Resolver) Close() {
 }
 
 // Reload re-initializes the Unbound resolver.
-func (r *Resolver) Reload() error {
+func (r *Resolver) Reload(rootAnchorPath string) error {
+	if rootAnchorPath == "" {
+		rootAnchorPath = "/var/lib/unbound/root.key"
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -174,7 +180,7 @@ func (r *Resolver) Reload() error {
 		"harden-glue":            "yes",
 		"harden-dnssec-stripped": "yes",
 		"use-caps-for-id":        "no",
-		"auto-trust-anchor-file": "/var/lib/unbound/root.key",
+		"auto-trust-anchor-file": rootAnchorPath,
 		"val-clean-additional":   "yes",
 		"edns-buffer-size":       "1232",
 		"so-rcvbuf":              "1m",
@@ -211,6 +217,6 @@ func (r *Resolver) Reload() error {
 }
 
 // ClearCache clears the cache by recreating the instance (simplest method for embedded libunbound).
-func (r *Resolver) ClearCache() error {
-	return r.Reload()
+func (r *Resolver) ClearCache(rootAnchorPath string) error {
+	return r.Reload(rootAnchorPath)
 }
