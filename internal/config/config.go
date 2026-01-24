@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -58,6 +59,12 @@ type Config struct {
 
 	// Unbound settings
 	RootAnchorPath string `yaml:"root_anchor_path"`
+
+	// ACME / Let's Encrypt settings
+	AcmeEnabled  bool     `yaml:"acme_enabled"`
+	AcmeEmail    string   `yaml:"acme_email"`
+	AcmeDomains  []string `yaml:"acme_domains"`
+	AcmeCacheDir string   `yaml:"acme_cache_dir"`
 }
 
 // NewConfig returns a new Config with default values.
@@ -92,11 +99,29 @@ func NewConfig() *Config {
 		CertContent:          "",
 		KeyContent:           "",
 		RootAnchorPath:       "/opt/homebrew/etc/unbound/root.key", // Default macos path for homebrew unbound
+		AcmeEnabled:          false,
+		AcmeCacheDir:         "certs-cache",
 	}
 }
 
 // LoadFromEnv loads configuration from environment variables, overriding existing values.
 func (c *Config) LoadFromEnv() {
+	if v := os.Getenv("ACME_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.AcmeEnabled = b
+		}
+	}
+	if v := os.Getenv("ACME_EMAIL"); v != "" {
+		c.AcmeEmail = v
+	}
+	if v := os.Getenv("ACME_DOMAINS"); v != "" {
+		// Comma separated list
+		c.AcmeDomains = strings.Split(v, ",")
+	}
+	if v := os.Getenv("ACME_CACHE_DIR"); v != "" {
+		c.AcmeCacheDir = v
+	}
+
 	if v := os.Getenv("LISTEN_ADDR"); v != "" {
 		c.ListenAddr = v
 	}

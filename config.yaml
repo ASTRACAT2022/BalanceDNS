@@ -36,6 +36,22 @@ cert_file: "./cert.pem"
 # Path to the SSL Private Key file (privkey.pem)
 key_file: "./key.pem"
 
+# ACME / Let's Encrypt Configuration
+# ------------------------------------------------------------------------------
+# Set to true to enable automatic certificate generation via Let's Encrypt.
+acme_enabled: false
+
+# Email address for Let's Encrypt registration (required if enabled).
+acme_email: ""
+
+# List of domains to obtain certificates for.
+acme_domains: []
+
+# Directory to store ACME certificates.
+# IMPORTANT: For multi-node (cluster) deployments, this directory MUST be a
+# shared volume (e.g., NFS, PVC ReadWriteMany) accessible by all nodes.
+acme_cache_dir: "certs-cache"
+
 # ------------------------------------------------------------------------------
 # Performance & Cache
 # ------------------------------------------------------------------------------

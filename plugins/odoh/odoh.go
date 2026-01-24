@@ -1,19 +1,20 @@
 package odoh
 
 import (
+	"crypto/tls"
 	"log"
 
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/odoh"
 	"dns-resolver/internal/plugins"
-	"dns-resolver/internal/tlsutil"
 )
 
 // Config holds configuration for the ODoH plugin.
 type Config struct {
 	ODoHAddr     string
-	CertFile     string
-	KeyFile      string
+	CertFile     string      // Deprecated: use TLSConfig
+	KeyFile      string      // Deprecated: use TLSConfig
+	TLSConfig    *tls.Config // New field for pre-configured TLS
 	DNSProxyAddr string
 }
 
@@ -39,25 +40,9 @@ func (p *Plugin) Start() {
 		return
 	}
 
-	cert := p.config.CertFile
-	if cert == "" {
-		cert = "cert.pem"
-	}
-	key := p.config.KeyFile
-	if key == "" {
-		key = "key.pem"
-	}
-
-	// 1. Ensure Certificates exist (Self-Signed if missing)
-	log.Printf("[ODoH Plugin] Checking TLS certificates (%s, %s)...", cert, key)
-	hosts := []string{"astracat.dns", "localhost", "127.0.0.1", "::1"}
-	if err := tlsutil.EnsureCertificate(cert, key, hosts); err != nil {
-		log.Printf("[ODoH Plugin] Warning: Failed to generate/ensure certificates: %v. HTTPS/TLS might fail.", err)
-	}
-
 	// 2. Start ODoH Server
 	log.Printf("[ODoH Plugin] Starting ODoH Server on %s...", p.config.ODoHAddr)
-	srv, err := odoh.NewServer(p.config.ODoHAddr, cert, key, p.config.DNSProxyAddr, p.pm, p.m)
+	srv, err := odoh.NewServer(p.config.ODoHAddr, p.config.TLSConfig, p.config.DNSProxyAddr, p.pm, p.m)
 	if err != nil {
 		log.Printf("[ODoH Plugin] Failed to initialize server: %v", err)
 		return

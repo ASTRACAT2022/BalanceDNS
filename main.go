@@ -12,6 +12,7 @@ import (
 	"dns-resolver/internal/dnsproxy"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
+	"dns-resolver/internal/tlsutil"
 	"dns-resolver/internal/unbound"
 	"dns-resolver/plugins/adblock"
 	"dns-resolver/plugins/hosts"
@@ -118,11 +119,21 @@ func main() {
 	// 5. Start DoH/DoT Service Plugin (Manages Certs & Servers)
 	// dohPlugin reference removed.
 
+	// 5.0.0 Setup TLS Manager (ACME or Static)
+	tlsManager := tlsutil.NewTLSManager(cfg)
+	tlsManager.StartHTTPChallengeServer()
+
+	tlsConfig, err := tlsManager.GetTLSConfig()
+	if err != nil {
+		log.Printf("Warning: Failed to obtain TLS config: %v. Secure endpoints may fail.", err)
+	}
+
 	// 5.0.1 Start ODoH Service Plugin
 	odohConfig := odoh.Config{
 		ODoHAddr:     cfg.ODoHAddr,
 		CertFile:     cfg.CertFile,
 		KeyFile:      cfg.KeyFile,
+		TLSConfig:    tlsConfig,
 		DNSProxyAddr: dnsProxyAddr,
 	}
 	odohPlugin := odoh.New(odohConfig, pm, m)
