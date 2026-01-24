@@ -11,6 +11,7 @@ import (
 	"os"
 	"time"
 
+	"dns-resolver/internal/cluster"
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
@@ -39,10 +40,12 @@ type Server struct {
 	sessionToken  string
 	sessionExpiry time.Time
 	configPath    string // Path to config file
+	clusterToken  string
+	baseConfig    *config.Config
 }
 
 // New creates a new admin server.
-func New(addr string, m *metrics.Metrics, r *unbound.Resolver, h *hosts.HostsPlugin, ab *adblock.AdBlockPlugin, pm *plugins.PluginManager) *Server {
+func New(cfg *config.Config, m *metrics.Metrics, r *unbound.Resolver, h *hosts.HostsPlugin, ab *adblock.AdBlockPlugin, pm *plugins.PluginManager) *Server {
 	// In a real application, load this from config
 	username := "astracat"
 	password := "astracat"
@@ -52,7 +55,7 @@ func New(addr string, m *metrics.Metrics, r *unbound.Resolver, h *hosts.HostsPlu
 	}
 
 	return &Server{
-		addr:         addr,
+		addr:         cfg.AdminAddr,
 		metrics:      m,
 		resolver:     r,
 		hosts:        h,
@@ -61,6 +64,8 @@ func New(addr string, m *metrics.Metrics, r *unbound.Resolver, h *hosts.HostsPlu
 		username:     username,
 		passwordHash: hash,
 		configPath:   "config.yaml", // Default config path
+		clusterToken: cfg.ClusterToken,
+		baseConfig:   cfg,
 	}
 }
 
@@ -79,6 +84,7 @@ func (s *Server) Start() {
 	mux.Handle("/api/metrics", s.authMiddleware(http.HandlerFunc(s.handleApiMetrics)))
 	mux.Handle("/api/control/reload", s.authMiddleware(http.HandlerFunc(s.handleControlReload)))
 	mux.Handle("/api/control/cache/clear", s.authMiddleware(http.HandlerFunc(s.handleControlCacheClear)))
+	mux.Handle("/api/cluster/sync", http.HandlerFunc(s.handleClusterSync))
 	// Add other API routes here
 
 	// SPA Catch-all (Protected)
@@ -88,6 +94,62 @@ func (s *Server) Start() {
 	log.Printf("Starting admin server on %s", s.addr)
 	if err := http.ListenAndServe(s.addr, mux); err != nil {
 		log.Fatalf("Failed to start admin server: %v", err)
+	}
+}
+
+func (s *Server) handleClusterSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Only GET method is allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.clusterToken != "" {
+		if r.Header.Get("X-Cluster-Token") != s.clusterToken {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	cfg := config.NewConfig()
+	if data, err := os.ReadFile(s.configPath); err == nil {
+		if err := yaml.Unmarshal(data, cfg); err != nil {
+			http.Error(w, "Failed to load config", http.StatusInternalServerError)
+			return
+		}
+	} else if s.baseConfig != nil {
+		cfg = s.baseConfig
+	}
+
+	if cfg.ClusterRole != "" && cfg.ClusterRole != "admin" {
+		http.Error(w, "Cluster sync is only available on admin nodes", http.StatusNotFound)
+		return
+	}
+
+	certPath, keyPath, err := cluster.EnsureAdminCertificates(cfg)
+	if err != nil {
+		log.Printf("Failed to ensure cluster certs: %v", err)
+	}
+
+	var certData, keyData []byte
+	if certPath != "" && keyPath != "" {
+		certData, _ = os.ReadFile(certPath)
+		keyData, _ = os.ReadFile(keyPath)
+	}
+
+	configBytes, err := yaml.Marshal(cfg)
+	if err != nil {
+		http.Error(w, "Failed to encode config", http.StatusInternalServerError)
+		return
+	}
+
+	payload := map[string]string{
+		"config_yaml": string(configBytes),
+		"cert_pem":    string(certData),
+		"key_pem":     string(keyData),
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		log.Printf("Error encoding cluster payload: %v", err)
 	}
 }
 
