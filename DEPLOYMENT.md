@@ -142,6 +142,69 @@ The admin node will expose a sync endpoint at:
    docker run -d --name dns -p 5053:53/udp -p 5053:53/tcp astracat-dns
    ```
 
+### 🧩 Docker Compose (docker-compose.yml) — пример для Docker YML
+
+Ниже пример сервиса в формате `docker-compose.yml`, который использует все основные порты и переменные окружения.  
+Вы можете вставить блок в свой `services:` и запустить через `docker compose up -d`.
+
+```yaml
+services:
+  astracat-dns:
+    build: .
+    image: astracat/astracat-dns
+    container_name: astracat-dns
+
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "443:443/tcp"
+      - "853:853/tcp"
+      - "9090:9090/tcp"
+      - "8080:8080/tcp"
+
+    environment:
+      LISTEN_ADDR: 0.0.0.0:53
+      METRICS_ADDR: 0.0.0.0:9090
+      ADMIN_ADDR: 0.0.0.0:8080
+      DOH_ADDR: 0.0.0.0:443
+      DOT_ADDR: 0.0.0.0:853
+
+      CACHE_SIZE: "1024"
+      CACHE_RAM_SIZE: "50"
+      MAX_WORKERS: "10"
+      GOMAXPROCS: "1"
+
+      ADBLOCK_ENABLED: "true"
+      HOSTS_ENABLED: "true"
+
+      # ===== SSL CERTIFICATE (FULLCHAIN) =====
+      SSL_CERT_CONTENT: |
+        -----BEGIN CERTIFICATE-----
+        ...ваш fullchain.pem...
+        -----END CERTIFICATE-----
+        -----BEGIN CERTIFICATE-----
+        ...промежуточный сертификат (если есть)...
+        -----END CERTIFICATE-----
+
+      # ===== SSL PRIVATE KEY =====
+      SSL_KEY_CONTENT: |
+        -----BEGIN PRIVATE KEY-----
+        ...ваш privkey.pem...
+        -----END PRIVATE KEY-----
+
+    restart: always
+```
+
+**Запуск:**
+```bash
+docker compose up -d
+```
+
+**Примечания:**
+- `SSL_CERT_CONTENT` и `SSL_KEY_CONTENT` должны содержать полный текст сертификатов.  
+- При запуске контейнера содержимое будет записано в `cert.pem` и `key.pem`.  
+- Если вам не нужен DoH/DoT, можно удалить соответствующие порты и переменные (`DOH_ADDR`, `DOT_ADDR`).
+
 ---
 
 ## ☁️ Pushing to Docker Hub

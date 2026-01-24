@@ -77,32 +77,11 @@ func main() {
 	}
 
 	// 3. Handle Certificate Content from Env Vars
-	// This supports "Upload image to git and accept certs as text" request.
-	if cfg.CertContent != "" && cfg.KeyContent != "" {
-		log.Println("Detected SSL certificates in environment variables. Writing to files...")
-		// Use configured paths or defaults
-		certPath := cfg.CertFile
-		if certPath == "" {
-			certPath = "cert.pem"
-		}
-		keyPath := cfg.KeyFile
-		if keyPath == "" {
-			keyPath = "key.pem"
-		}
-
-		if err := os.WriteFile(certPath, []byte(cfg.CertContent), 0644); err != nil {
-			log.Printf("Error writing cert file from env: %v", err)
-		} else {
-			cfg.CertFile = certPath
-			log.Printf("Wrote certificate to %s", certPath)
-		}
-
-		if err := os.WriteFile(keyPath, []byte(cfg.KeyContent), 0600); err != nil {
-			log.Printf("Error writing key file from env: %v", err)
-		} else {
-			cfg.KeyFile = keyPath
-			log.Printf("Wrote private key to %s", keyPath)
-		}
+	wroteCerts, err := cfg.WriteCertFilesFromEnv()
+	if err != nil {
+		log.Printf("Failed to write certificates from env: %v", err)
+	} else if wroteCerts {
+		log.Printf("Wrote SSL certificates to %s and %s", cfg.CertFile, cfg.KeyFile)
 	} else {
 		log.Println("No certificate content in environment variables.")
 	}
