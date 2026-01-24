@@ -8,6 +8,7 @@ import (
 
 	"dns-resolver/internal/admin"
 	"dns-resolver/internal/cache"
+	"dns-resolver/internal/cluster"
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/dnsproxy"
 	"dns-resolver/internal/metrics"
@@ -50,6 +51,30 @@ func main() {
 
 	// 2. Override configuration with Environment Variables
 	cfg.LoadFromEnv()
+
+	// 2.1 Cluster sync for nodes
+	if cfg.ClusterRole == "node" && cfg.ClusterAdminURL != "" {
+		cfg.AdminAddr = ""
+		cfg.AcmeEnabled = false
+		syncedCfg, err := cluster.SyncFromAdmin(cfg, "config.yaml")
+		if err != nil {
+			log.Printf("Cluster sync failed: %v", err)
+		} else {
+			cfg = syncedCfg
+		}
+
+		if cfg.ClusterSyncInterval > 0 {
+			go func(interval time.Duration) {
+				ticker := time.NewTicker(interval)
+				defer ticker.Stop()
+				for range ticker.C {
+					if _, err := cluster.SyncFromAdmin(cfg, "config.yaml"); err != nil {
+						log.Printf("Cluster periodic sync failed: %v", err)
+					}
+				}
+			}(cfg.ClusterSyncInterval)
+		}
+	}
 
 	// 3. Handle Certificate Content from Env Vars
 	// This supports "Upload image to git and accept certs as text" request.
@@ -160,7 +185,7 @@ func main() {
 
 	// 9. Initialize Admin Server
 	if cfg.AdminAddr != "" {
-		adminServer := admin.New(cfg.AdminAddr, m, resolver, hostsPlugin, adBlockPlugin, pm)
+		adminServer := admin.New(cfg, m, resolver, hostsPlugin, adBlockPlugin, pm)
 		go adminServer.Start()
 	}
 
