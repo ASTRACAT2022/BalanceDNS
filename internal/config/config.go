@@ -65,6 +65,12 @@ type Config struct {
 	AcmeEmail    string   `yaml:"acme_email"`
 	AcmeDomains  []string `yaml:"acme_domains"`
 	AcmeCacheDir string   `yaml:"acme_cache_dir"`
+
+	// Cluster settings
+	ClusterRole         string        `yaml:"cluster_role"`          // "standalone", "admin", or "node"
+	ClusterAdminURL     string        `yaml:"cluster_admin_url"`     // Base URL to admin server (e.g. http://10.0.0.1:8080)
+	ClusterToken        string        `yaml:"cluster_token"`         // Shared secret for node/admin sync
+	ClusterSyncInterval time.Duration `yaml:"cluster_sync_interval"` // How often nodes refresh config/certs
 }
 
 // NewConfig returns a new Config with default values.
@@ -101,6 +107,10 @@ func NewConfig() *Config {
 		RootAnchorPath:       "/opt/homebrew/etc/unbound/root.key", // Default macos path for homebrew unbound
 		AcmeEnabled:          false,
 		AcmeCacheDir:         "certs-cache",
+		ClusterRole:          "standalone",
+		ClusterAdminURL:      "",
+		ClusterToken:         "",
+		ClusterSyncInterval:  30 * time.Second,
 	}
 }
 
@@ -120,6 +130,20 @@ func (c *Config) LoadFromEnv() {
 	}
 	if v := os.Getenv("ACME_CACHE_DIR"); v != "" {
 		c.AcmeCacheDir = v
+	}
+	if v := os.Getenv("CLUSTER_ROLE"); v != "" {
+		c.ClusterRole = v
+	}
+	if v := os.Getenv("CLUSTER_ADMIN_URL"); v != "" {
+		c.ClusterAdminURL = v
+	}
+	if v := os.Getenv("CLUSTER_TOKEN"); v != "" {
+		c.ClusterToken = v
+	}
+	if v := os.Getenv("CLUSTER_SYNC_INTERVAL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.ClusterSyncInterval = d
+		}
 	}
 
 	if v := os.Getenv("LISTEN_ADDR"); v != "" {
