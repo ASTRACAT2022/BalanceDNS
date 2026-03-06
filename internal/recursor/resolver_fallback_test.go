@@ -39,3 +39,36 @@ func TestFallbackResolveTimeoutBounds(t *testing.T) {
 		})
 	}
 }
+
+func TestCanUseFallback(t *testing.T) {
+	tests := []struct {
+		name string
+		opts Options
+		want bool
+	}{
+		{
+			name: "strict dnssec disables fallback",
+			opts: Options{ValidateDNSSEC: true, DNSSECFailClosed: true},
+			want: false,
+		},
+		{
+			name: "dnssec validate but fail-open allows fallback",
+			opts: Options{ValidateDNSSEC: true, DNSSECFailClosed: false},
+			want: true,
+		},
+		{
+			name: "dnssec disabled allows fallback",
+			opts: Options{ValidateDNSSEC: false, DNSSECFailClosed: true},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &Resolver{opts: tt.opts}
+			if got := r.canUseFallback(); got != tt.want {
+				t.Fatalf("canUseFallback()=%v want=%v", got, tt.want)
+			}
+		})
+	}
+}

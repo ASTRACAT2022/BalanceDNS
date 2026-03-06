@@ -136,6 +136,9 @@ func (r *Resolver) Resolve(question dns.Question) (*dns.Msg, error) {
 		resp, err := r.resolveIterative(ctx, q, r.rootServers, 0, guard)
 		usedFallback := false
 		if err != nil {
+			if !r.canUseFallback() {
+				return nil, err
+			}
 			fbCtx, fbCancel := context.WithTimeout(context.Background(), fallbackResolveTimeout(r.opts))
 			fallbackResp, fbErr := r.resolveWithFallbackDNSR(fbCtx, q)
 			fbCancel()
@@ -961,6 +964,11 @@ func withDefaultOptions(opts Options) Options {
 		opts.CacheMaxTTL = 30 * time.Minute
 	}
 	return opts
+}
+
+func (r *Resolver) canUseFallback() bool {
+	// In strict DNSSEC mode do not return unvalidated fallback answers.
+	return !(r.opts.ValidateDNSSEC && r.opts.DNSSECFailClosed)
 }
 
 func fallbackResolveTimeout(opts Options) time.Duration {
