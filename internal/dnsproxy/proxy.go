@@ -109,7 +109,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 				m.MsgHdr.Response = true
 				m.Rcode = dns.RcodeServerFailure
 			}
-			_ = w.WriteMsg(m)
+			_ = p.writeResponse(transport, w, r, m)
 		}
 
 		if p.Metrics != nil {
@@ -133,7 +133,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 				m.MsgHdr.Response = true
 				m.Rcode = dns.RcodeRefused
 			}
-			_ = w.WriteMsg(m)
+			_ = p.writeResponse(transport, w, r, m)
 			return
 		}
 		defer release()
@@ -153,7 +153,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 			m.MsgHdr.Response = true
 			m.Rcode = dns.RcodeFormatError
 		}
-		_ = w.WriteMsg(m)
+		_ = p.writeResponse(transport, w, r, m)
 		return
 	}
 
@@ -165,7 +165,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		}
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeFormatError)
-		_ = w.WriteMsg(m)
+		_ = p.writeResponse(transport, w, r, m)
 		return
 	}
 
@@ -178,7 +178,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		}
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeFormatError)
-		_ = w.WriteMsg(m)
+		_ = p.writeResponse(transport, w, r, m)
 		return
 	}
 
@@ -190,7 +190,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		}
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeRefused)
-		_ = w.WriteMsg(m)
+		_ = p.writeResponse(transport, w, r, m)
 		return
 	}
 
@@ -213,7 +213,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 				}
 				p.Metrics.RecordResponseCode(dns.RcodeToString[msg.Rcode])
 			}
-			_ = w.WriteMsg(msg)
+			_ = p.writeResponse(transport, w, r, msg)
 			return
 		}
 	}
@@ -242,7 +242,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 			m := new(dns.Msg)
 			m.SetRcode(r, dns.RcodeNameError)
 			rcodeText = dns.RcodeToString[dns.RcodeNameError]
-			_ = w.WriteMsg(m)
+			_ = p.writeResponse(transport, w, r, m)
 			return
 		case cache.ActionRewrite:
 			m := new(dns.Msg)
@@ -252,7 +252,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 				m.Answer = []dns.RR{rr}
 			}
 			rcodeText = dns.RcodeToString[m.Rcode]
-			_ = w.WriteMsg(m)
+			_ = p.writeResponse(transport, w, r, m)
 			return
 		case cache.ActionPass:
 		}
@@ -289,7 +289,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		rcodeText = dns.RcodeToString[dns.RcodeServerFailure]
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeServerFailure)
-		_ = w.WriteMsg(m)
+		_ = p.writeResponse(transport, w, r, m)
 		return
 	}
 
@@ -303,7 +303,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		}
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeServerFailure)
-		_ = w.WriteMsg(m)
+		_ = p.writeResponse(transport, w, r, m)
 		return
 	}
 	outcome = "resolved"
@@ -319,8 +319,52 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		}
 	}
 
-	resp.Id = r.Id
-	_ = w.WriteMsg(resp)
+	_ = p.writeResponse(transport, w, r, resp)
+}
+
+func (p *Proxy) writeResponse(transport string, w dns.ResponseWriter, req *dns.Msg, resp *dns.Msg) error {
+	if w == nil {
+		return nil
+	}
+	msg := finalizeResponse(transport, req, resp)
+	return w.WriteMsg(msg)
+}
+
+func finalizeResponse(transport string, req *dns.Msg, resp *dns.Msg) *dns.Msg {
+	if resp == nil {
+		resp = new(dns.Msg)
+		if req != nil {
+			resp.SetRcode(req, dns.RcodeServerFailure)
+		} else {
+			resp.MsgHdr.Response = true
+			resp.Rcode = dns.RcodeServerFailure
+		}
+	}
+
+	out := resp.Copy()
+	out.MsgHdr.Response = true
+	out.RecursionAvailable = true
+	out.Authoritative = false
+
+	if req != nil {
+		out.Id = req.Id
+		out.Opcode = req.Opcode
+		out.RecursionDesired = req.RecursionDesired
+		out.CheckingDisabled = req.CheckingDisabled
+		out.Question = append([]dns.Question(nil), req.Question...)
+	}
+
+	if transport == "udp" {
+		maxSize := 512
+		if req != nil {
+			if opt := req.IsEdns0(); opt != nil && opt.UDPSize() >= 512 {
+				maxSize = int(opt.UDPSize())
+			}
+		}
+		out.Truncate(maxSize)
+	}
+
+	return out
 }
 
 func extractClientIP(w dns.ResponseWriter) string {
