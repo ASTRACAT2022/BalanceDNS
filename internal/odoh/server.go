@@ -1,6 +1,7 @@
 package odoh
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -58,7 +59,7 @@ func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.
 		KeyPair:        kp,
 		Client: &dns.Client{
 			Net:     "udp",
-			Timeout: 2 * time.Second,
+			Timeout: 3 * time.Second,
 			UDPSize: 1232,
 		},
 	}, nil
@@ -158,7 +159,7 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respMsg, resolveOutcome, err := s.resolveDNSMessage(reqMsg)
+	respMsg, resolveOutcome, err := s.resolveDNSMessage(r.Context(), reqMsg)
 	if err != nil {
 		log.Printf("DoH Upstream Error: %v", err)
 		outcome = resolveOutcome
@@ -263,7 +264,7 @@ func (s *Server) handleODoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respMsg, resolveOutcome, err := s.resolveDNSMessage(reqMsg)
+	respMsg, resolveOutcome, err := s.resolveDNSMessage(r.Context(), reqMsg)
 	if err != nil {
 		log.Printf("ODoH Upstream Error: %v", err)
 		outcome = resolveOutcome
@@ -342,7 +343,7 @@ func normalizeContentType(contentType string) string {
 	return contentType
 }
 
-func (s *Server) resolveDNSMessage(reqMsg *dns.Msg) (*dns.Msg, string, error) {
+func (s *Server) resolveDNSMessage(ctx context.Context, reqMsg *dns.Msg) (*dns.Msg, string, error) {
 	if len(reqMsg.Question) == 0 {
 		return nil, "malformed_dns", errors.New("dns message has no question")
 	}
@@ -377,7 +378,7 @@ func (s *Server) resolveDNSMessage(reqMsg *dns.Msg) (*dns.Msg, string, error) {
 	ensureEDNS(reqMsg)
 
 	startTime := time.Now()
-	respMsg, err := s.exchangeUpstream(reqMsg)
+	respMsg, err := s.exchangeUpstream(ctx, reqMsg)
 	if err != nil {
 		if s.Metrics != nil {
 			s.Metrics.IncrementUnboundErrors()
@@ -392,30 +393,45 @@ func (s *Server) resolveDNSMessage(reqMsg *dns.Msg) (*dns.Msg, string, error) {
 	return respMsg, "resolved", nil
 }
 
-func (s *Server) exchangeUpstream(reqMsg *dns.Msg) (*dns.Msg, error) {
+func (s *Server) exchangeUpstream(ctx context.Context, reqMsg *dns.Msg) (*dns.Msg, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	udpClient := s.Client
 	if udpClient == nil {
-		udpClient = &dns.Client{Net: "udp", Timeout: 2 * time.Second, UDPSize: 1232}
+		udpClient = &dns.Client{Net: "udp", Timeout: 3 * time.Second, UDPSize: 1232}
 	}
 
-	respMsg, _, err := udpClient.Exchange(reqMsg.Copy(), s.UpstreamTarget)
-	if err == nil {
-		if respMsg != nil && respMsg.Truncated {
-			return s.exchangeUpstreamTCP(reqMsg)
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		respMsg, _, err := udpClient.ExchangeContext(ctx, reqMsg.Copy(), s.UpstreamTarget)
+		if err == nil {
+			if respMsg != nil && respMsg.Truncated {
+				return s.exchangeUpstreamTCP(ctx, reqMsg)
+			}
+			return respMsg, nil
 		}
-		return respMsg, nil
+		lastErr = err
+		if !isRetriableUpstreamError(err) {
+			break
+		}
 	}
 
-	// Some large answers fail in UDP unpack path; fallback to TCP.
-	if shouldFallbackTCPOnUpstreamError(err) {
-		return s.exchangeUpstreamTCP(reqMsg)
+	// Fallback to TCP for truncation/overflow and for transient UDP timeouts.
+	if shouldFallbackTCPOnUpstreamError(lastErr) || isRetriableUpstreamError(lastErr) {
+		return s.exchangeUpstreamTCP(ctx, reqMsg)
 	}
-	return nil, err
+	return nil, lastErr
 }
 
-func (s *Server) exchangeUpstreamTCP(reqMsg *dns.Msg) (*dns.Msg, error) {
-	tcpClient := &dns.Client{Net: "tcp", Timeout: 3 * time.Second}
-	respMsg, _, err := tcpClient.Exchange(reqMsg.Copy(), s.UpstreamTarget)
+func (s *Server) exchangeUpstreamTCP(ctx context.Context, reqMsg *dns.Msg) (*dns.Msg, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	tcpClient := &dns.Client{Net: "tcp", Timeout: 4 * time.Second}
+	respMsg, _, err := tcpClient.ExchangeContext(ctx, reqMsg.Copy(), s.UpstreamTarget)
 	if err != nil {
 		return nil, err
 	}
@@ -435,10 +451,28 @@ func shouldFallbackTCPOnUpstreamError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if nerr, ok := err.(net.Error); ok {
+		if nerr.Timeout() || nerr.Temporary() {
+			return true
+		}
+	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "buffer size too small") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "temporary") ||
 		strings.Contains(msg, "overflow") ||
 		strings.Contains(msg, "truncated")
+}
+
+func isRetriableUpstreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if nerr, ok := err.(net.Error); ok {
+		return nerr.Timeout() || nerr.Temporary()
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") || strings.Contains(msg, "temporary")
 }
 
 func (s *Server) recordResponseCodeMetrics(qName string, rcode int) {
