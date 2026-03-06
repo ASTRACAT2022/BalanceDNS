@@ -7,6 +7,7 @@ INSTALL_DIR="/opt/astracatdns"
 BINARY_NAME="dns-resolver"
 ROOT_ANCHOR="/var/lib/unbound/root.key"
 DEPLOY_HELPER="/usr/local/bin/astracat-deploy"
+TLS_FIX_HELPER="/usr/local/bin/astracat-fix-tls"
 STATE_DIR="/etc/astracatdns"
 SOURCE_FILE="${STATE_DIR}/source_dir"
 GO_BIN=""
@@ -43,6 +44,7 @@ install_deps() {
       ca-certificates \
       curl \
       wget \
+      openssl \
       tar \
       rsync \
       build-essential \
@@ -59,6 +61,7 @@ install_deps() {
       ca-certificates \
       curl \
       wget \
+      openssl \
       tar \
       rsync \
       gcc \
@@ -258,12 +261,31 @@ cd "\${INSTALL_DIR}"
 "\${GO_BIN}" clean -cache
 CGO_ENABLED=1 "\${GO_BIN}" build -a -o "\${INSTALL_DIR}/\${BINARY_NAME}" .
 
+if command -v astracat-fix-tls >/dev/null 2>&1; then
+  log "Repairing TLS cert/key config automatically"
+  astracat-fix-tls --no-restart --quiet || log "TLS auto-fix skipped (continuing deployment)"
+fi
+
 log "Restarting \${SERVICE_NAME}"
 systemctl restart "\${SERVICE_NAME}"
 systemctl --no-pager --full status "\${SERVICE_NAME}" || true
 journalctl -u "\${SERVICE_NAME}" -n 20 --no-pager || true
 EOF
   chmod 0755 "${DEPLOY_HELPER}"
+}
+
+install_tls_fix_helper() {
+  local src="${INSTALL_DIR}/scripts/astracat-fix-tls.sh"
+  if [[ ! -f "${src}" ]]; then
+    src="${PROJECT_DIR}/scripts/astracat-fix-tls.sh"
+  fi
+  if [[ ! -f "${src}" ]]; then
+    warn "TLS helper script not found, skipping: ${src}"
+    return
+  fi
+
+  log "Installing TLS auto-fix helper at ${TLS_FIX_HELPER}"
+  install -m 0755 "${src}" "${TLS_FIX_HELPER}"
 }
 
 start_service() {
@@ -284,10 +306,12 @@ main() {
   build_binary
   ensure_root_anchor
   write_service
+  install_tls_fix_helper
   install_deploy_helper
   start_service
   log "Done. Service '${SERVICE_NAME}' is installed."
   log "Use 'sudo astracat-deploy' for safe updates and restarts."
+  log "Use 'sudo astracat-fix-tls' to auto-repair TLS cert/key and restart."
 }
 
 main "$@"

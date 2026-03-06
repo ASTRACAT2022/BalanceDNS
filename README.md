@@ -67,3 +67,17 @@ Set `admin_addr`, `admin_username`, and `admin_password` in `config.yaml`.
 - Deployment guide: `DEPLOYMENT.md`
 - User manual: `docs/user_manual.md`
 - Admin manual: `docs/admin_manual.md`
+
+## TLS Auto-Fix (No Manual Paths)
+
+If DoH/DoT are disabled because `cert_file` and `key_file` do not match, run:
+
+```bash
+sudo astracat-fix-tls
+```
+
+What it does automatically:
+- finds a valid matching cert/key pair (prefers Let's Encrypt `live/*`)
+- copies it to `/opt/astracatdns/certs/`
+- updates `config.yaml` (`cert_file`, `key_file`, `acme_enabled: false`)
+- restarts `astracat-dns` and prints TLS startup logs
