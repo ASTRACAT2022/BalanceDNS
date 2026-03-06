@@ -117,6 +117,7 @@ type Config struct {
 	UnboundKeyCacheSize   string `yaml:"unbound_key_cache_size"`
 	UnboundPrefetch       bool   `yaml:"unbound_prefetch"`
 	UnboundServeExpired   bool   `yaml:"unbound_serve_expired"`
+	UnboundDisableCache   bool   `yaml:"unbound_disable_cache"`
 
 	// Built-in recursor settings
 	RecursorRootServers  []string      `yaml:"recursor_root_servers"`
@@ -211,6 +212,7 @@ func NewConfig() *Config {
 		UnboundKeyCacheSize:   "64m",
 		UnboundPrefetch:       true,
 		UnboundServeExpired:   true,
+		UnboundDisableCache:   false,
 		RecursorRootServers:   []string{},
 		RecursorCacheEntries:  200000,
 		RecursorCacheMinTTL:   5 * time.Second,
@@ -497,6 +499,11 @@ func (c *Config) LoadFromEnv() {
 	if v := os.Getenv("UNBOUND_SERVE_EXPIRED"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.UnboundServeExpired = b
+		}
+	}
+	if v := os.Getenv("UNBOUND_DISABLE_CACHE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.UnboundDisableCache = b
 		}
 	}
 }

@@ -61,7 +61,7 @@ func newRuntimeResolver(cfg *config.Config) (runtimeResolver, error) {
 			return nil, err
 		}
 		log.Printf(
-			"Unbound recursion configured: workers=%d query-timeout=%s resolve-timeout=%s root-anchor=%s msg-cache=%s rrset-cache=%s key-cache=%s prefetch=%v serve-expired=%v",
+			"Unbound recursion configured: workers=%d query-timeout=%s resolve-timeout=%s root-anchor=%s msg-cache=%s rrset-cache=%s key-cache=%s prefetch=%v serve-expired=%v disable-cache=%v",
 			r.WorkerCount(),
 			cfg.UpstreamTimeout,
 			cfg.RequestTimeout,
@@ -71,6 +71,7 @@ func newRuntimeResolver(cfg *config.Config) (runtimeResolver, error) {
 			cfg.UnboundKeyCacheSize,
 			cfg.UnboundPrefetch,
 			cfg.UnboundServeExpired,
+			cfg.UnboundDisableCache,
 		)
 		return r, nil
 	default:

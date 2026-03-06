@@ -16,5 +16,6 @@ func newUnboundResolver(cfg *config.Config) (runtimeResolver, error) {
 		KeyCacheSize:   cfg.UnboundKeyCacheSize,
 		Prefetch:       cfg.UnboundPrefetch,
 		ServeExpired:   cfg.UnboundServeExpired,
+		DisableCache:   cfg.UnboundDisableCache,
 	})
 }

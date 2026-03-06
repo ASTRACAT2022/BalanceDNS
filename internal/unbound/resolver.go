@@ -24,6 +24,7 @@ type Options struct {
 	KeyCacheSize   string
 	Prefetch       bool
 	ServeExpired   bool
+	DisableCache   bool
 }
 
 // Resolver wraps a pool of Unbound instances for parallel recursive resolution.
@@ -222,6 +223,22 @@ func responseFromResult(question dns.Question, result *ub.Result) (*dns.Msg, err
 }
 
 func configureUnbound(u *ub.Unbound, opts Options) error {
+	msgCacheSize := opts.MsgCacheSize
+	rrsetCacheSize := opts.RRsetCacheSize
+	keyCacheSize := opts.KeyCacheSize
+	prefetch := opts.Prefetch
+	serveExpired := opts.ServeExpired
+	cacheMaxTTL := "86400"
+	if opts.DisableCache {
+		// Disable Unbound internal caches; AstracatDNS policy/cache layers remain active.
+		msgCacheSize = "0"
+		rrsetCacheSize = "0"
+		keyCacheSize = "0"
+		prefetch = false
+		serveExpired = false
+		cacheMaxTTL = "0"
+	}
+
 	entries := []struct {
 		name     string
 		value    string
@@ -244,18 +261,18 @@ func configureUnbound(u *ub.Unbound, opts Options) error {
 		{"edns-buffer-size", "1232", false},
 		{"so-rcvbuf", "4m", false},
 		{"so-sndbuf", "4m", false},
-		{"msg-cache-size", opts.MsgCacheSize, false},
-		{"rrset-cache-size", opts.RRsetCacheSize, false},
-		{"key-cache-size", opts.KeyCacheSize, false},
-		{"prefetch", boolToYesNo(opts.Prefetch), false},
-		{"prefetch-key", boolToYesNo(opts.Prefetch), false},
-		{"serve-expired", boolToYesNo(opts.ServeExpired), false},
+		{"msg-cache-size", msgCacheSize, false},
+		{"rrset-cache-size", rrsetCacheSize, false},
+		{"key-cache-size", keyCacheSize, false},
+		{"prefetch", boolToYesNo(prefetch), false},
+		{"prefetch-key", boolToYesNo(prefetch), false},
+		{"serve-expired", boolToYesNo(serveExpired), false},
 		{"serve-expired-ttl", "86400", false},
 		{"serve-expired-reply-ttl", "30", false},
 		{"aggressive-nsec", "yes", false},
 		{"minimal-responses", "yes", false},
 		{"cache-min-ttl", "0", false},
-		{"cache-max-ttl", "86400", false},
+		{"cache-max-ttl", cacheMaxTTL, false},
 	}
 
 	for _, e := range entries {

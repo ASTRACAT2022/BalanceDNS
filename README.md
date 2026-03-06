@@ -42,6 +42,7 @@ Important sections:
 - Resolver backend: `resolver_type` (`recursor`/`knot`/`unbound`)
 - Recursor and DNSSEC: `recursor_*`, `dnssec_*`
 - Unbound tuning: `root_anchor_path`, `unbound_*`
+  - Set `unbound_disable_cache: true` to disable Unbound's internal caches when using `resolver_type: "unbound"`
 - Security: `attack_protection_enabled`, `drop_any_queries`, rate limits
 - Policy engine: `policy_*`
 - Plugins: `hosts_*`, `adblock_*`, `dnsdist_compat_*`

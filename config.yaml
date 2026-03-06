@@ -90,6 +90,7 @@ unbound_rrset_cache_size: "128m"
 unbound_key_cache_size: "64m"
 unbound_prefetch: true
 unbound_serve_expired: true
+unbound_disable_cache: false
 
 # Built-in recursor tuning
 # Empty list means built-in defaults (root hints in code).
