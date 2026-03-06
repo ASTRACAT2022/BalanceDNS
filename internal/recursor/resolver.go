@@ -293,7 +293,7 @@ func (r *Resolver) resolveIterative(ctx context.Context, q dns.Question, servers
 				return resp, nil
 			}
 
-			if hasAnswerForQuestion(resp, q) {
+			if hasDirectAnswerForQuestion(resp, q) {
 				if shouldCacheResponse(resp, q) {
 					r.setCached(q, resp)
 				}
@@ -301,23 +301,25 @@ func (r *Resolver) resolveIterative(ctx context.Context, q dns.Question, servers
 				return resp, nil
 			}
 
-			if cnameTarget, ok := findCNAMETarget(resp, q.Name); ok && q.Qtype != dns.TypeCNAME {
-				targetQ := q
-				targetQ.Name = cnameTarget
-				targetResp, err := r.resolveIterative(ctx, targetQ, r.rootServers, depth+1, guard)
-				if err != nil {
-					if shouldCacheResponse(resp, q) {
-						r.setCached(q, resp)
+			if q.Qtype != dns.TypeCNAME && q.Qtype != dns.TypeDNAME && q.Qtype != dns.TypeANY {
+				if aliasTarget, ok := findAliasTarget(resp, q.Name); ok {
+					targetQ := q
+					targetQ.Name = aliasTarget
+					targetResp, err := r.resolveIterative(ctx, targetQ, r.rootServers, depth+1, guard)
+					if err != nil {
+						if shouldCacheResponse(resp, q) {
+							r.setCached(q, resp)
+						}
+						batchCancel()
+						return resp, nil
+					}
+					merged := mergeCNAMEChain(resp, targetResp)
+					if shouldCacheResponse(merged, q) {
+						r.setCached(q, merged)
 					}
 					batchCancel()
-					return resp, nil
+					return merged, nil
 				}
-				merged := mergeCNAMEChain(resp, targetResp)
-				if shouldCacheResponse(merged, q) {
-					r.setCached(q, merged)
-				}
-				batchCancel()
-				return merged, nil
 			}
 
 			if isAuthoritativeNoData(resp) {
@@ -680,7 +682,25 @@ func hasAnswerForQuestion(resp *dns.Msg, q dns.Question) bool {
 	return false
 }
 
-func findCNAMETarget(resp *dns.Msg, name string) (string, bool) {
+func hasDirectAnswerForQuestion(resp *dns.Msg, q dns.Question) bool {
+	if len(resp.Answer) == 0 {
+		return false
+	}
+	for _, rr := range resp.Answer {
+		h := rr.Header()
+		if h == nil || !strings.EqualFold(h.Name, q.Name) {
+			continue
+		}
+		if q.Qtype == dns.TypeANY || h.Rrtype == q.Qtype {
+			return true
+		}
+	}
+	return false
+}
+
+func findAliasTarget(resp *dns.Msg, name string) (string, bool) {
+	name = dns.Fqdn(name)
+
 	for _, rr := range resp.Answer {
 		cname, ok := rr.(*dns.CNAME)
 		if !ok {
@@ -690,6 +710,38 @@ func findCNAMETarget(resp *dns.Msg, name string) (string, bool) {
 			return dns.Fqdn(cname.Target), true
 		}
 	}
+
+	var (
+		bestOwner  string
+		bestTarget string
+	)
+	for _, rr := range resp.Answer {
+		dname, ok := rr.(*dns.DNAME)
+		if !ok {
+			continue
+		}
+		owner := dns.Fqdn(dname.Hdr.Name)
+		if !dns.IsSubDomain(owner, name) || strings.EqualFold(owner, name) {
+			continue
+		}
+		if len(owner) <= len(bestOwner) {
+			continue
+		}
+		bestOwner = owner
+		bestTarget = dns.Fqdn(dname.Target)
+	}
+	if bestOwner == "" || bestTarget == "" {
+		return "", false
+	}
+
+	lowerName := strings.ToLower(name)
+	lowerOwner := strings.ToLower(bestOwner)
+	if !strings.HasSuffix(lowerName, lowerOwner) {
+		return "", false
+	}
+	prefix := name[:len(name)-len(bestOwner)]
+	return dns.Fqdn(prefix + bestTarget), true
+
 	return "", false
 }
 
