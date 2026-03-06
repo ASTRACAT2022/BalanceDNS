@@ -136,7 +136,9 @@ func (r *Resolver) Resolve(question dns.Question) (*dns.Msg, error) {
 		resp, err := r.resolveIterative(ctx, q, r.rootServers, 0, guard)
 		usedFallback := false
 		if err != nil {
-			fallbackResp, fbErr := r.resolveWithFallbackDNSR(ctx, q)
+			fbCtx, fbCancel := context.WithTimeout(context.Background(), fallbackResolveTimeout(r.opts))
+			fallbackResp, fbErr := r.resolveWithFallbackDNSR(fbCtx, q)
+			fbCancel()
 			if fbErr != nil {
 				return nil, err
 			}
@@ -959,6 +961,17 @@ func withDefaultOptions(opts Options) Options {
 		opts.CacheMaxTTL = 30 * time.Minute
 	}
 	return opts
+}
+
+func fallbackResolveTimeout(opts Options) time.Duration {
+	timeout := opts.QueryTimeout * 2
+	if timeout < 2*time.Second {
+		timeout = 2 * time.Second
+	}
+	if timeout > 10*time.Second {
+		timeout = 10 * time.Second
+	}
+	return timeout
 }
 
 func sanitizeServers(servers []string) []string {

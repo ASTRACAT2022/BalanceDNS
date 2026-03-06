@@ -1,8 +1,11 @@
 package dot
 
 import (
+	"context"
 	"crypto/tls"
 	"log"
+	"net"
+	"strings"
 	"time"
 
 	"dns-resolver/internal/metrics"
@@ -30,8 +33,9 @@ func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.
 		PM:             pm,
 		Metrics:        m,
 		Client: &dns.Client{
-			Net:     "tcp", // Upstream usually TCP for reliability, or UDP if local
-			Timeout: 2 * time.Second,
+			Net:     "udp",
+			Timeout: 3 * time.Second,
+			UDPSize: 1232,
 		},
 	}
 }
@@ -108,7 +112,10 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 	// We'll trust the client config (default TCP).
 
 	resolveStart := time.Now()
-	resp, _, err := s.Client.Exchange(r, s.UpstreamTarget)
+	upstreamCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := s.exchangeUpstream(upstreamCtx, r)
 	if err != nil {
 		log.Printf("DoT Upstream Error: %v", err)
 		outcome = "resolver_error"
@@ -135,4 +142,75 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 	}
 
 	_ = w.WriteMsg(resp)
+}
+
+func (s *Server) exchangeUpstream(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	udpClient := s.Client
+	if udpClient == nil {
+		udpClient = &dns.Client{Net: "udp", Timeout: 3 * time.Second, UDPSize: 1232}
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		resp, _, err := udpClient.ExchangeContext(ctx, req.Copy(), s.UpstreamTarget)
+		if err == nil {
+			if resp != nil && resp.Truncated {
+				return s.exchangeUpstreamTCP(ctx, req)
+			}
+			return resp, nil
+		}
+		lastErr = err
+		if !isRetriableUpstreamError(err) {
+			break
+		}
+	}
+
+	if shouldFallbackTCPOnUpstreamError(lastErr) || isRetriableUpstreamError(lastErr) {
+		return s.exchangeUpstreamTCP(ctx, req)
+	}
+	return nil, lastErr
+}
+
+func (s *Server) exchangeUpstreamTCP(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	tcpClient := &dns.Client{Net: "tcp", Timeout: 4 * time.Second}
+	resp, _, err := tcpClient.ExchangeContext(ctx, req.Copy(), s.UpstreamTarget)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func isRetriableUpstreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if nerr, ok := err.(net.Error); ok {
+		return nerr.Timeout() || nerr.Temporary()
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") || strings.Contains(msg, "temporary")
+}
+
+func shouldFallbackTCPOnUpstreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if nerr, ok := err.(net.Error); ok {
+		if nerr.Timeout() || nerr.Temporary() {
+			return true
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "buffer size too small") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "temporary") ||
+		strings.Contains(msg, "overflow") ||
+		strings.Contains(msg, "truncated")
 }
