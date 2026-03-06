@@ -40,8 +40,8 @@ func (p *Plugin) Start() {
 		return
 	}
 
-	// 2. Start ODoH Server
-	log.Printf("[ODoH Plugin] Starting ODoH Server on %s...", p.config.ODoHAddr)
+	// 2. Start DoH/ODoH server
+	log.Printf("[ODoH Plugin] Starting DoH/ODoH server on %s...", p.config.ODoHAddr)
 	srv, err := odoh.NewServer(p.config.ODoHAddr, p.config.TLSConfig, p.config.DNSProxyAddr, p.pm, p.m)
 	if err != nil {
 		log.Printf("[ODoH Plugin] Failed to initialize server: %v", err)

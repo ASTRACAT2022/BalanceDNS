@@ -2,12 +2,15 @@ package odoh
 
 import (
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"dns-resolver/internal/metrics"
@@ -17,6 +20,8 @@ import (
 	"github.com/miekg/dns"
 	"golang.org/x/net/http2"
 )
+
+var errUnsupportedDoHMediaType = errors.New("unsupported DoH media type")
 
 // Server represents an Oblivious DNS-over-HTTPS server.
 type Server struct {
@@ -54,10 +59,10 @@ func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.
 	}, nil
 }
 
-// Start starts the ODoH server.
+// Start starts the combined DoH/ODoH server.
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/dns-query", s.handleODoH)
+	mux.HandleFunc("/dns-query", s.handleDNSQuery)
 	mux.HandleFunc("/odohconfigs", s.handleODoHConfigs)
 
 	server := &http.Server{
@@ -75,7 +80,7 @@ func (s *Server) Start() error {
 		return fmt.Errorf("failed to configure http2: %v", err)
 	}
 
-	log.Printf("Starting ODoH Server on %s (Upstream: %s)", s.Addr, s.UpstreamTarget)
+	log.Printf("Starting DoH/ODoH Server on %s (Upstream: %s)", s.Addr, s.UpstreamTarget)
 
 	// Print the public key config
 	configs := odoh.CreateObliviousDoHConfigs([]odoh.ObliviousDoHConfig{s.KeyPair.Config})
@@ -95,6 +100,16 @@ func (s *Server) Start() error {
 	return nil
 }
 
+func (s *Server) handleDNSQuery(w http.ResponseWriter, r *http.Request) {
+	// ODoH request uses application/oblivious-dns-message over POST.
+	if r.Method == http.MethodPost && isODoHContentType(r.Header.Get("Content-Type")) {
+		s.handleODoH(w, r)
+		return
+	}
+	// Everything else on /dns-query is treated as standard DoH.
+	s.handleDoH(w, r)
+}
+
 func (s *Server) handleODoHConfigs(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -107,6 +122,53 @@ func (s *Server) handleODoHConfigs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/oblivious-dns-message")
 	w.WriteHeader(http.StatusOK)
 	w.Write(packedConfigs)
+}
+
+func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
+	requestStart := time.Now()
+	outcome := "resolved"
+	rcodeText := "UNKNOWN"
+
+	if s.Metrics != nil {
+		s.Metrics.IncrementInflightRequests()
+		defer s.Metrics.DecrementInflightRequests()
+		defer s.Metrics.RecordRequestOutcome("doh", outcome, rcodeText, time.Since(requestStart))
+	}
+
+	reqMsg, err := parseDoHRequest(r)
+	if err != nil {
+		outcome = "malformed_http"
+		if s.Metrics != nil {
+			s.Metrics.RecordMalformedRequest("doh")
+		}
+		if errors.Is(err, errUnsupportedDoHMediaType) {
+			http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
+			return
+		}
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	respMsg, resolveOutcome, err := s.resolveDNSMessage(reqMsg)
+	if err != nil {
+		log.Printf("DoH Upstream Error: %v", err)
+		outcome = resolveOutcome
+		rcodeText = dns.RcodeToString[dns.RcodeServerFailure]
+		http.Error(w, "DNS Upstream Error", http.StatusBadGateway)
+		return
+	}
+
+	outcome = resolveOutcome
+	rcodeText = dns.RcodeToString[respMsg.Rcode]
+	wire, err := respMsg.Pack()
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/dns-message")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(wire)
 }
 
 func (s *Server) handleODoH(w http.ResponseWriter, r *http.Request) {
@@ -129,7 +191,7 @@ func (s *Server) handleODoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Header.Get("Content-Type") != "application/oblivious-dns-message" {
+	if !isODoHContentType(r.Header.Get("Content-Type")) {
 		outcome = "malformed_http"
 		if s.Metrics != nil {
 			s.Metrics.RecordMalformedRequest("odoh")
@@ -191,63 +253,142 @@ func (s *Server) handleODoH(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Malformed DNS message", http.StatusBadRequest)
 		return
 	}
-	rcodeText = dns.RcodeToString[dns.RcodeSuccess]
 
-	// --- Existing Logic (Metrics, Plugins, Resolution) ---
+	respMsg, resolveOutcome, err := s.resolveDNSMessage(reqMsg)
+	if err != nil {
+		log.Printf("ODoH Upstream Error: %v", err)
+		outcome = resolveOutcome
+		rcodeText = dns.RcodeToString[dns.RcodeServerFailure]
+		http.Error(w, "DNS Upstream Error", http.StatusBadGateway)
+		return
+	}
 
-	// Record request stats
+	outcome = resolveOutcome
+	rcodeText = dns.RcodeToString[respMsg.Rcode]
+	s.sendEncryptedResponse(w, responseContext, respMsg)
+}
+
+func parseDoHRequest(r *http.Request) (*dns.Msg, error) {
+	switch r.Method {
+	case http.MethodGet:
+		return parseDoHGETRequest(r)
+	case http.MethodPost:
+		return parseDoHPOSTRequest(r)
+	default:
+		return nil, fmt.Errorf("method not allowed: %s", r.Method)
+	}
+}
+
+func parseDoHGETRequest(r *http.Request) (*dns.Msg, error) {
+	wireParam := r.URL.Query().Get("dns")
+	if wireParam == "" {
+		return nil, errors.New("missing dns query parameter")
+	}
+	wire, err := base64.RawURLEncoding.DecodeString(wireParam)
+	if err != nil {
+		// Some clients include padding; accept it as well.
+		wire, err = base64.URLEncoding.DecodeString(wireParam)
+		if err != nil {
+			return nil, fmt.Errorf("invalid dns query parameter: %w", err)
+		}
+	}
+	return unpackDNSMessage(wire)
+}
+
+func parseDoHPOSTRequest(r *http.Request) (*dns.Msg, error) {
+	contentType := normalizeContentType(r.Header.Get("Content-Type"))
+	if contentType != "" && contentType != "application/dns-message" {
+		return nil, errUnsupportedDoHMediaType
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read body: %w", err)
+	}
+	return unpackDNSMessage(body)
+}
+
+func unpackDNSMessage(wire []byte) (*dns.Msg, error) {
+	msg := new(dns.Msg)
+	if err := msg.Unpack(wire); err != nil {
+		return nil, fmt.Errorf("failed to unpack DNS message: %w", err)
+	}
+	if len(msg.Question) == 0 {
+		return nil, errors.New("dns message has no question")
+	}
+	return msg, nil
+}
+
+func isODoHContentType(contentType string) bool {
+	return normalizeContentType(contentType) == "application/oblivious-dns-message"
+}
+
+func normalizeContentType(contentType string) string {
+	contentType = strings.ToLower(strings.TrimSpace(contentType))
+	if contentType == "" {
+		return ""
+	}
+	if idx := strings.Index(contentType, ";"); idx >= 0 {
+		contentType = strings.TrimSpace(contentType[:idx])
+	}
+	return contentType
+}
+
+func (s *Server) resolveDNSMessage(reqMsg *dns.Msg) (*dns.Msg, string, error) {
+	if len(reqMsg.Question) == 0 {
+		return nil, "malformed_dns", errors.New("dns message has no question")
+	}
+
+	question := reqMsg.Question[0]
 	if s.Metrics != nil {
-		qName := reqMsg.Question[0].Name
-		qType := dns.TypeToString[reqMsg.Question[0].Qtype]
+		qName := question.Name
+		qType := dns.TypeToString[question.Qtype]
 		s.Metrics.IncrementQueries(qName)
 		s.Metrics.RecordQueryType(qType)
 	}
 
 	dummyWriter := &DumbResponseWriter{}
-
-	// Execute Plugins
 	if s.PM != nil {
 		ctx := &plugins.PluginContext{
-			ResponseWriter: dummyWriter, // This won't work perfectly if plugin writes to writer directly and stops.
+			ResponseWriter: dummyWriter,
 			Metrics:        s.Metrics,
 		}
 		if handled := s.PM.ExecutePlugins(ctx, dummyWriter, reqMsg); handled {
 			if dummyWriter.Msg != nil {
-				outcome = "plugin_handled"
-				rcodeText = dns.RcodeToString[dummyWriter.Msg.Rcode]
-				s.sendEncryptedResponse(w, responseContext, dummyWriter.Msg)
-				return
+				s.recordResponseCodeMetrics(question.Name, dummyWriter.Msg.Rcode)
+				return dummyWriter.Msg, "plugin_handled", nil
 			}
+			// HTTP-based DNS transport cannot silently drop; synthesize REFUSED.
+			refused := new(dns.Msg)
+			refused.SetRcode(reqMsg, dns.RcodeRefused)
+			s.recordResponseCodeMetrics(question.Name, refused.Rcode)
+			return refused, "plugin_dropped", nil
 		}
 	}
 
 	startTime := time.Now()
-	// Forward to Upstream
 	respMsg, _, err := s.Client.Exchange(reqMsg, s.UpstreamTarget)
 	if err != nil {
-		log.Printf("ODoH Upstream Error: %v", err)
-		outcome = "resolver_error"
-		rcodeText = dns.RcodeToString[dns.RcodeServerFailure]
 		if s.Metrics != nil {
 			s.Metrics.IncrementUnboundErrors()
 		}
-		http.Error(w, "DNS Upstream Error", http.StatusBadGateway)
+		return nil, "resolver_error", err
+	}
+
+	if s.Metrics != nil {
+		s.Metrics.RecordLatency(question.Name, time.Since(startTime))
+	}
+	s.recordResponseCodeMetrics(question.Name, respMsg.Rcode)
+	return respMsg, "resolved", nil
+}
+
+func (s *Server) recordResponseCodeMetrics(qName string, rcode int) {
+	if s.Metrics == nil {
 		return
 	}
-	rcodeText = dns.RcodeToString[respMsg.Rcode]
-
-	// Record response stats
-	if s.Metrics != nil {
-		latency := time.Since(startTime)
-		qName := reqMsg.Question[0].Name
-		s.Metrics.RecordLatency(qName, latency)
-		s.Metrics.RecordResponseCode(dns.RcodeToString[respMsg.Rcode])
-		if respMsg.Rcode == dns.RcodeNameError {
-			s.Metrics.RecordNXDOMAIN(qName)
-		}
+	s.Metrics.RecordResponseCode(dns.RcodeToString[rcode])
+	if rcode == dns.RcodeNameError {
+		s.Metrics.RecordNXDOMAIN(qName)
 	}
-
-	s.sendEncryptedResponse(w, responseContext, respMsg)
 }
 
 func (s *Server) sendEncryptedResponse(w http.ResponseWriter, ctx odoh.ResponseContext, answer *dns.Msg) {
