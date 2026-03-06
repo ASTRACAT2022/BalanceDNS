@@ -39,6 +39,10 @@ func (p *Plugin) Start() {
 	if p.config.ODoHAddr == "" {
 		return
 	}
+	if p.config.TLSConfig == nil {
+		log.Printf("[ODoH Plugin] DoH/ODoH disabled: tls config unavailable (odoh_addr=%s)", p.config.ODoHAddr)
+		return
+	}
 
 	// 2. Start DoH/ODoH server
 	log.Printf("[ODoH Plugin] Starting DoH/ODoH server on %s...", p.config.ODoHAddr)

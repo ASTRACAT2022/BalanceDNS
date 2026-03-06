@@ -38,6 +38,10 @@ type Server struct {
 
 // NewServer creates a new ODoH server.
 func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.PluginManager, m *metrics.Metrics) (*Server, error) {
+	if tlsConfig == nil {
+		return nil, fmt.Errorf("tls config is nil")
+	}
+
 	// Generate a key pair for ODoH (HPKE)
 	// Using default suite (P256 or similar depending on library default)
 	kp, err := odoh.CreateDefaultKeyPair()
@@ -61,6 +65,10 @@ func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.
 
 // Start starts the combined DoH/ODoH server.
 func (s *Server) Start() error {
+	if s.TLSConfig == nil {
+		return fmt.Errorf("tls config is nil")
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/dns-query", s.handleDNSQuery)
 	mux.HandleFunc("/odohconfigs", s.handleODoHConfigs)
