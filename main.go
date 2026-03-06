@@ -12,6 +12,7 @@ import (
 	"dns-resolver/internal/cache"
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/dnsproxy"
+	"dns-resolver/internal/dot"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
 	"dns-resolver/internal/recursor"
@@ -168,7 +169,21 @@ func main() {
 		log.Printf("Warning: Failed to obtain TLS config: %v. Secure endpoints may fail.", err)
 	}
 
-	// 5.0.1 Start ODoH Service Plugin
+	// 5.0.1 Start DoT service
+	if cfg.DoTAddr != "" {
+		if tlsConfig == nil {
+			log.Printf("DoT disabled: tls config unavailable (dot_addr=%s)", cfg.DoTAddr)
+		} else {
+			dotServer := dot.NewServer(cfg.DoTAddr, tlsConfig, dnsProxyAddr, pm, m)
+			go func() {
+				if err := dotServer.Start(); err != nil {
+					log.Printf("DoT Server Error: %v", err)
+				}
+			}()
+		}
+	}
+
+	// 5.0.2 Start ODoH/DoH service plugin
 	odohConfig := odoh.Config{
 		ODoHAddr:     cfg.ODoHAddr,
 		CertFile:     cfg.CertFile,
