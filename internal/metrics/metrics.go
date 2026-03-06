@@ -86,6 +86,7 @@ type Metrics struct {
 	TopQueriedDomains sync.Map // map[string]*counterValue
 	QueryTypes        sync.Map // map[string]*counterValue
 	ResponseCodes     sync.Map // map[string]*counterValue
+	TransportRequests sync.Map // map[string]*counterValue
 
 	qpsBits         atomic.Uint64
 	cpuUsageBits    atomic.Uint64
@@ -103,10 +104,18 @@ var (
 		Name: "dns_resolver_qps",
 		Help: "Queries per second",
 	})
+	promQPSByTransport = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "dns_resolver_qps_by_transport",
+		Help: "Requests per second grouped by transport (udp/tcp/dot/doh/odoh)",
+	}, []string{"transport"})
 	promTotalQueries = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "dns_resolver_total_queries",
 		Help: "Total number of DNS queries",
 	})
+	promRequestsByTransportTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "dns_resolver_requests_by_transport_total",
+		Help: "Total DNS requests grouped by transport",
+	}, []string{"transport"})
 	promDNSRequestsInflight = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "dns_resolver_requests_inflight",
 		Help: "Current number of in-flight DNS requests",
@@ -151,6 +160,10 @@ var (
 	promGoroutineCount = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "dns_resolver_goroutine_count",
 		Help: "Current number of goroutines",
+	})
+	promUptimeSeconds = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "dns_resolver_uptime_seconds",
+		Help: "Process uptime in seconds",
 	})
 	promNetworkSent = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "dns_resolver_network_sent_bytes",
@@ -374,6 +387,7 @@ func (m *Metrics) qpsCalculator() {
 	defer ticker.Stop()
 
 	lastQueryCount := m.TotalQueries.Load()
+	lastTransportCounts := map[string]int64{}
 	counter := 0
 	for range ticker.C {
 		currentQueries := m.TotalQueries.Load()
@@ -385,6 +399,7 @@ func (m *Metrics) qpsCalculator() {
 
 		storeFloat64(&m.qpsBits, qps)
 		promQPS.Set(qps)
+		lastTransportCounts = m.updateTransportQPS(lastTransportCounts)
 
 		counter++
 		if counter%30 == 0 {
@@ -417,6 +432,7 @@ func (m *Metrics) systemMetricsCollector() {
 		gCount := runtime.NumGoroutine()
 		m.goroutines.Store(int64(gCount))
 		promGoroutineCount.Set(float64(gCount))
+		promUptimeSeconds.Set(time.Since(m.startTime).Seconds())
 
 		netIO, err := net.IOCounters(false)
 		if err == nil && len(netIO) > 0 {
@@ -456,6 +472,8 @@ func (m *Metrics) RecordRequestOutcome(transport, outcome, rcode string, duratio
 		rcode = "UNKNOWN"
 	}
 
+	incrementCounterMap(&m.TransportRequests, transport)
+	promRequestsByTransportTotal.WithLabelValues(transport).Inc()
 	promDNSRequestsTotal.WithLabelValues(transport, outcome).Inc()
 	promDNSRequestDuration.WithLabelValues(transport, rcode).Observe(duration.Seconds())
 }
@@ -717,4 +735,41 @@ func storeFloat64(target *atomic.Uint64, v float64) {
 
 func loadFloat64(target *atomic.Uint64) float64 {
 	return math.Float64frombits(target.Load())
+}
+
+func snapshotCounterMap(store *sync.Map) map[string]int64 {
+	out := make(map[string]int64)
+	store.Range(func(key, value interface{}) bool {
+		k, ok := key.(string)
+		if !ok {
+			return true
+		}
+		counter, ok := value.(*counterValue)
+		if !ok {
+			return true
+		}
+		out[k] = counter.value.Load()
+		return true
+	})
+	return out
+}
+
+func (m *Metrics) updateTransportQPS(lastCounts map[string]int64) map[string]int64 {
+	current := snapshotCounterMap(&m.TransportRequests)
+
+	for transport, currentCount := range current {
+		prev := lastCounts[transport]
+		delta := currentCount - prev
+		if delta < 0 {
+			delta = 0
+		}
+		promQPSByTransport.WithLabelValues(transport).Set(float64(delta))
+	}
+	for transport := range lastCounts {
+		if _, ok := current[transport]; !ok {
+			promQPSByTransport.WithLabelValues(transport).Set(0)
+		}
+	}
+
+	return current
 }
