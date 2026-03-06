@@ -39,6 +39,18 @@ func TestHasDirectAnswerForQuestion_CNAMEQuery(t *testing.T) {
 	}
 }
 
+func TestHasDirectAnswerForQuestion_ANY(t *testing.T) {
+	resp := &dns.Msg{
+		Answer: []dns.RR{
+			mustRR(t, "www.example.org. 60 IN CNAME target.example.org."),
+		},
+	}
+	q := dns.Question{Name: "www.example.org.", Qtype: dns.TypeANY, Qclass: dns.ClassINET}
+	if !hasDirectAnswerForQuestion(resp, q) {
+		t.Fatalf("expected direct answer for ANY query")
+	}
+}
+
 func TestFindAliasTarget_CNAME(t *testing.T) {
 	resp := &dns.Msg{
 		Answer: []dns.RR{
@@ -48,6 +60,21 @@ func TestFindAliasTarget_CNAME(t *testing.T) {
 	target, ok := findAliasTarget(resp, "www.example.org.")
 	if !ok {
 		t.Fatalf("expected CNAME alias target")
+	}
+	if target != "target.example.org." {
+		t.Fatalf("unexpected target: got %q", target)
+	}
+}
+
+func TestFindAliasTarget_CaseInsensitiveName(t *testing.T) {
+	resp := &dns.Msg{
+		Answer: []dns.RR{
+			mustRR(t, "WWW.Example.ORG. 60 IN CNAME target.example.org."),
+		},
+	}
+	target, ok := findAliasTarget(resp, "www.example.org.")
+	if !ok {
+		t.Fatalf("expected case-insensitive CNAME alias target")
 	}
 	if target != "target.example.org." {
 		t.Fatalf("unexpected target: got %q", target)
@@ -82,5 +109,16 @@ func TestFindAliasTarget_DNAMEUsesLongestSuffix(t *testing.T) {
 	}
 	if target != "x.b.example.com." {
 		t.Fatalf("unexpected target: got %q", target)
+	}
+}
+
+func TestFindAliasTarget_DNAMEExactOwnerNoSynthesis(t *testing.T) {
+	resp := &dns.Msg{
+		Answer: []dns.RR{
+			mustRR(t, "example.org. 300 IN DNAME example.net."),
+		},
+	}
+	if _, ok := findAliasTarget(resp, "example.org."); ok {
+		t.Fatalf("did not expect synthesized target for exact DNAME owner")
 	}
 }
