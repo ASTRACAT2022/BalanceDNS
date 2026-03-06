@@ -239,8 +239,30 @@ func (r *Resolver) resolveIterative(ctx context.Context, q dns.Question, servers
 		if end > len(ordered) {
 			end = len(ordered)
 		}
-		results := r.queryServersBatch(ctx, ordered[i:end], query)
-		for _, result := range results {
+		batch := ordered[i:end]
+		batchCtx, batchCancel := context.WithCancel(ctx)
+		resultsCh := make(chan serverQueryResult, len(batch))
+
+		for _, server := range batch {
+			server := server
+			go func() {
+				resp, err := r.exchange(batchCtx, server, query)
+				select {
+				case resultsCh <- serverQueryResult{server: server, resp: resp, err: err}:
+				case <-batchCtx.Done():
+				}
+			}()
+		}
+
+		for j := 0; j < len(batch); j++ {
+			var result serverQueryResult
+			select {
+			case <-ctx.Done():
+				batchCancel()
+				return nil, ctx.Err()
+			case result = <-resultsCh:
+			}
+
 			if result.err != nil {
 				lastErr = result.err
 				continue
@@ -267,6 +289,7 @@ func (r *Resolver) resolveIterative(ctx context.Context, q dns.Question, servers
 				if shouldCacheResponse(resp, q) {
 					r.setCached(q, resp)
 				}
+				batchCancel()
 				return resp, nil
 			}
 
@@ -274,6 +297,7 @@ func (r *Resolver) resolveIterative(ctx context.Context, q dns.Question, servers
 				if shouldCacheResponse(resp, q) {
 					r.setCached(q, resp)
 				}
+				batchCancel()
 				return resp, nil
 			}
 
@@ -285,12 +309,14 @@ func (r *Resolver) resolveIterative(ctx context.Context, q dns.Question, servers
 					if shouldCacheResponse(resp, q) {
 						r.setCached(q, resp)
 					}
+					batchCancel()
 					return resp, nil
 				}
 				merged := mergeCNAMEChain(resp, targetResp)
 				if shouldCacheResponse(merged, q) {
 					r.setCached(q, merged)
 				}
+				batchCancel()
 				return merged, nil
 			}
 
@@ -298,10 +324,12 @@ func (r *Resolver) resolveIterative(ctx context.Context, q dns.Question, servers
 				if shouldCacheResponse(resp, q) {
 					r.setCached(q, resp)
 				}
+				batchCancel()
 				return resp, nil
 			}
 
 			if glue := extractGlueIPs(resp); len(glue) > 0 {
+				batchCancel()
 				return r.resolveIterative(ctx, q, glue, depth+1, guard)
 			}
 
@@ -309,10 +337,12 @@ func (r *Resolver) resolveIterative(ctx context.Context, q dns.Question, servers
 			if len(nsNames) > 0 {
 				nextIPs := r.resolveNSHostIPs(ctx, nsNames, depth+1, guard)
 				if len(nextIPs) > 0 {
+					batchCancel()
 					return r.resolveIterative(ctx, q, nextIPs, depth+1, guard)
 				}
 			}
 		}
+		batchCancel()
 	}
 
 	if lastResp != nil {
@@ -397,35 +427,6 @@ func (r *Resolver) orderServers(servers []string) []string {
 	ordered = append(ordered, clean[start:]...)
 	ordered = append(ordered, clean[:start]...)
 	return ordered
-}
-
-func (r *Resolver) queryServersBatch(ctx context.Context, servers []string, query *dns.Msg) []serverQueryResult {
-	if len(servers) == 0 {
-		return nil
-	}
-
-	resultsCh := make(chan serverQueryResult, len(servers))
-	for _, server := range servers {
-		server := server
-		go func() {
-			resp, err := r.exchange(ctx, server, query)
-			select {
-			case resultsCh <- serverQueryResult{server: server, resp: resp, err: err}:
-			case <-ctx.Done():
-			}
-		}()
-	}
-
-	results := make([]serverQueryResult, 0, len(servers))
-	for i := 0; i < len(servers); i++ {
-		select {
-		case <-ctx.Done():
-			return results
-		case res := <-resultsCh:
-			results = append(results, res)
-		}
-	}
-	return results
 }
 
 func (r *Resolver) exchange(ctx context.Context, server string, query *dns.Msg) (*dns.Msg, error) {
