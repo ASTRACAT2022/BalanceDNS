@@ -5,7 +5,7 @@ This is a high-performance recursive DNS resolver built with Go, optimized for p
 ## Key Optimizations
 
 ### Performance Improvements
-- **Go Native DNS Resolver**: Switched from libunbound to pure Go DNS implementation for better performance and fewer dependencies
+- **Selectable Resolver Backend**: Choose built-in Go recursor or `miekg/unbound` (`resolver_type`)
 - **Memory Optimization**: Implemented request/response object pooling to reduce GC pressure
 - **Connection Reuse**: Optimized UDP/TCP connection handling with proper reuse
 - **Sharded Cache**: Improved cache with better concurrency and reduced lock contention

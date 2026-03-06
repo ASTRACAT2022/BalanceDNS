@@ -74,7 +74,9 @@ cache_max_ttl: 1h
 # Stale-While-Revalidate: How long to serve expired items while fetching fresh ones in the background.
 stale_while_revalidate: 1m
 
-# Resolving Strategy (legacy, currently ignored by embedded recursor path)
+# Resolving backend:
+# - "recursor" or "knot": built-in Go recursor (default)
+# - "unbound": miekg/unbound backend (requires binary built with: CGO_ENABLED=1 and -tags unbound)
 resolver_type: "knot"
 
 # Path to the DNSSEC root trust anchor for Unbound.

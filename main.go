@@ -15,7 +15,6 @@ import (
 	"dns-resolver/internal/dot"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
-	"dns-resolver/internal/recursor"
 	"dns-resolver/internal/tlsutil"
 	"dns-resolver/plugins/adblock"
 	"dns-resolver/plugins/dnsdistcompat"
@@ -67,35 +66,10 @@ func main() {
 	}
 
 	// 4. Initialize built-in recursive resolver
-	log.Println("Initializing built-in recursive resolver...")
-	resolver, err := recursor.NewResolverWithOptions(recursor.Options{
-		WorkerCount:      cfg.ResolverWorkers,
-		QueryTimeout:     cfg.UpstreamTimeout,
-		ResolveTimeout:   cfg.RequestTimeout,
-		RootServers:      cfg.RecursorRootServers,
-		CacheEntries:     cfg.RecursorCacheEntries,
-		CacheMinTTL:      cfg.RecursorCacheMinTTL,
-		CacheMaxTTL:      cfg.RecursorCacheMaxTTL,
-		ValidateDNSSEC:   cfg.DNSSECValidate,
-		DNSSECFailClosed: cfg.DNSSECFailClosed,
-		DNSSECTrustDS:    cfg.DNSSECTrustAnchors,
-	})
+	resolver, err := newRuntimeResolver(cfg)
 	if err != nil {
-		log.Fatalf("Failed to initialize recursive resolver: %v", err)
+		log.Fatalf("Failed to initialize resolver backend: %v", err)
 	}
-	log.Printf(
-		"Built-in recursion configured: workers=%d query-timeout=%s resolve-timeout=%s cache-entries=%d cache-min-ttl=%s cache-max-ttl=%s dnssec-validate=%v dnssec-fail-closed=%v",
-		resolver.WorkerCount(),
-		cfg.UpstreamTimeout,
-		cfg.RequestTimeout,
-		cfg.RecursorCacheEntries,
-		cfg.RecursorCacheMinTTL,
-		cfg.RecursorCacheMaxTTL,
-		cfg.DNSSECValidate,
-		cfg.DNSSECFailClosed,
-	)
-	// No defer Close() here because we want it to run until exit.
-	// We could handle it in signal handling, but OS cleanup is fine for now or explicit close later.
 
 	// 5. Initialize Metrics
 	m := metrics.NewMetrics(cfg.MetricsStoragePath)

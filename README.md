@@ -5,6 +5,7 @@ ASTRACAT DNS is a recursive DNS resolver written in Go with DNSSEC validation, p
 ## Key Capabilities
 
 - Built-in recursive resolver (no external forwarder required)
+- Optional `miekg/unbound` backend via `resolver_type: "unbound"`
 - DNSSEC validation (`AD` on validated answers)
 - UDP/TCP DNS listener
 - ODoH endpoint support
@@ -22,6 +23,14 @@ go build -o dns-resolver .
 
 By default, the resolver reads `config.yaml` from the working directory.
 
+To build with Unbound backend support:
+
+```bash
+CGO_ENABLED=1 go build -tags unbound -o dns-resolver .
+```
+
+`libunbound` headers/runtime must be installed on the system.
+
 ## Configuration
 
 Main config file: `config.yaml`
@@ -30,7 +39,9 @@ Important sections:
 
 - Listener and ports: `listen_addr`, `dot_addr`, `odoh_addr`
 - TLS/ACME: `cert_file`, `key_file`, `acme_*`
+- Resolver backend: `resolver_type` (`recursor`/`knot`/`unbound`)
 - Recursor and DNSSEC: `recursor_*`, `dnssec_*`
+- Unbound tuning: `root_anchor_path`, `unbound_*`
 - Security: `attack_protection_enabled`, `drop_any_queries`, rate limits
 - Policy engine: `policy_*`
 - Plugins: `hosts_*`, `adblock_*`, `dnsdist_compat_*`
