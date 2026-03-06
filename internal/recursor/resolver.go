@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -60,6 +61,12 @@ type Resolver struct {
 	fallback    *dnsr.Resolver
 	sf          singleflight.Group
 	trustedDS   []*dns.DS
+}
+
+type serverQueryResult struct {
+	server string
+	resp   *dns.Msg
+	err    error
 }
 
 // NewResolverWithOptions builds a recursive resolver with sane defaults.
@@ -227,75 +234,83 @@ func (r *Resolver) resolveIterative(ctx context.Context, q dns.Question, servers
 	var lastResp *dns.Msg
 	var lastErr error
 
-	for _, server := range ordered {
-		resp, err := r.exchange(ctx, server, query)
-		if err != nil {
-			lastErr = err
-			continue
+	for i := 0; i < len(ordered); i += 3 {
+		end := i + 3
+		if end > len(ordered) {
+			end = len(ordered)
 		}
-		if resp == nil {
-			continue
-		}
-		lastResp = resp
-
-		switch resp.Rcode {
-		case dns.RcodeSuccess, dns.RcodeNameError:
-			// handled below
-		default:
-			continue
-		}
-
-		if resp.Rcode == dns.RcodeNameError {
-			if !resp.Authoritative && !hasSOAInAuthority(resp) {
-				lastErr = errors.New("non-authoritative NXDOMAIN ignored")
+		results := r.queryServersBatch(ctx, ordered[i:end], query)
+		for _, result := range results {
+			if result.err != nil {
+				lastErr = result.err
 				continue
 			}
-			if shouldCacheResponse(resp, q) {
-				r.setCached(q, resp)
-			}
-			return resp, nil
-		}
 
-		if hasAnswerForQuestion(resp, q) {
-			if shouldCacheResponse(resp, q) {
-				r.setCached(q, resp)
+			resp := result.resp
+			if resp == nil {
+				continue
 			}
-			return resp, nil
-		}
+			lastResp = resp
 
-		if cnameTarget, ok := findCNAMETarget(resp, q.Name); ok && q.Qtype != dns.TypeCNAME {
-			targetQ := q
-			targetQ.Name = cnameTarget
-			targetResp, err := r.resolveIterative(ctx, targetQ, r.rootServers, depth+1, guard)
-			if err != nil {
+			switch resp.Rcode {
+			case dns.RcodeSuccess, dns.RcodeNameError:
+				// handled below
+			default:
+				continue
+			}
+
+			if resp.Rcode == dns.RcodeNameError {
+				if !resp.Authoritative && !hasSOAInAuthority(resp) {
+					lastErr = errors.New("non-authoritative NXDOMAIN ignored")
+					continue
+				}
 				if shouldCacheResponse(resp, q) {
 					r.setCached(q, resp)
 				}
 				return resp, nil
 			}
-			merged := mergeCNAMEChain(resp, targetResp)
-			if shouldCacheResponse(merged, q) {
-				r.setCached(q, merged)
+
+			if hasAnswerForQuestion(resp, q) {
+				if shouldCacheResponse(resp, q) {
+					r.setCached(q, resp)
+				}
+				return resp, nil
 			}
-			return merged, nil
-		}
 
-		if isAuthoritativeNoData(resp) {
-			if shouldCacheResponse(resp, q) {
-				r.setCached(q, resp)
+			if cnameTarget, ok := findCNAMETarget(resp, q.Name); ok && q.Qtype != dns.TypeCNAME {
+				targetQ := q
+				targetQ.Name = cnameTarget
+				targetResp, err := r.resolveIterative(ctx, targetQ, r.rootServers, depth+1, guard)
+				if err != nil {
+					if shouldCacheResponse(resp, q) {
+						r.setCached(q, resp)
+					}
+					return resp, nil
+				}
+				merged := mergeCNAMEChain(resp, targetResp)
+				if shouldCacheResponse(merged, q) {
+					r.setCached(q, merged)
+				}
+				return merged, nil
 			}
-			return resp, nil
-		}
 
-		if glue := extractGlueIPs(resp); len(glue) > 0 {
-			return r.resolveIterative(ctx, q, glue, depth+1, guard)
-		}
+			if isAuthoritativeNoData(resp) {
+				if shouldCacheResponse(resp, q) {
+					r.setCached(q, resp)
+				}
+				return resp, nil
+			}
 
-		nsNames := extractNSHostnames(resp)
-		if len(nsNames) > 0 {
-			nextIPs := r.resolveNSHostIPs(ctx, nsNames, depth+1, guard)
-			if len(nextIPs) > 0 {
-				return r.resolveIterative(ctx, q, nextIPs, depth+1, guard)
+			if glue := extractGlueIPs(resp); len(glue) > 0 {
+				return r.resolveIterative(ctx, q, glue, depth+1, guard)
+			}
+
+			nsNames := extractNSHostnames(resp)
+			if len(nsNames) > 0 {
+				nextIPs := r.resolveNSHostIPs(ctx, nsNames, depth+1, guard)
+				if len(nextIPs) > 0 {
+					return r.resolveIterative(ctx, q, nextIPs, depth+1, guard)
+				}
 			}
 		}
 	}
@@ -314,27 +329,54 @@ func (r *Resolver) resolveIterative(ctx context.Context, q dns.Question, servers
 
 func (r *Resolver) resolveNSHostIPs(ctx context.Context, nsNames []string, depth int, guard map[string]int) []string {
 	ips := make(map[string]struct{})
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+
 	for _, nsName := range nsNames {
 		if err := ctx.Err(); err != nil {
 			break
 		}
 
 		for _, qt := range []uint16{dns.TypeA, dns.TypeAAAA} {
-			q := dns.Question{Name: dns.Fqdn(nsName), Qtype: qt, Qclass: dns.ClassINET}
-			resp, err := r.resolveIterative(ctx, q, r.rootServers, depth+1, guard)
-			if err != nil || resp == nil {
-				continue
-			}
-			for _, rr := range resp.Answer {
-				switch v := rr.(type) {
-				case *dns.A:
-					ips[v.A.String()] = struct{}{}
-				case *dns.AAAA:
-					ips[v.AAAA.String()] = struct{}{}
+			nsName := nsName
+			qt := qt
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					return
 				}
-			}
+				defer func() { <-sem }()
+
+				q := dns.Question{Name: dns.Fqdn(nsName), Qtype: qt, Qclass: dns.ClassINET}
+				resp, err := r.resolveIterative(ctx, q, r.rootServers, depth+1, cloneGuardMap(guard))
+				if err != nil || resp == nil {
+					return
+				}
+				local := make([]string, 0, 2)
+				for _, rr := range resp.Answer {
+					switch v := rr.(type) {
+					case *dns.A:
+						local = append(local, v.A.String())
+					case *dns.AAAA:
+						local = append(local, v.AAAA.String())
+					}
+				}
+				if len(local) == 0 {
+					return
+				}
+				mu.Lock()
+				for _, ip := range local {
+					ips[ip] = struct{}{}
+				}
+				mu.Unlock()
+			}()
 		}
 	}
+	wg.Wait()
 
 	out := make([]string, 0, len(ips))
 	for ip := range ips {
@@ -355,6 +397,35 @@ func (r *Resolver) orderServers(servers []string) []string {
 	ordered = append(ordered, clean[start:]...)
 	ordered = append(ordered, clean[:start]...)
 	return ordered
+}
+
+func (r *Resolver) queryServersBatch(ctx context.Context, servers []string, query *dns.Msg) []serverQueryResult {
+	if len(servers) == 0 {
+		return nil
+	}
+
+	resultsCh := make(chan serverQueryResult, len(servers))
+	for _, server := range servers {
+		server := server
+		go func() {
+			resp, err := r.exchange(ctx, server, query)
+			select {
+			case resultsCh <- serverQueryResult{server: server, resp: resp, err: err}:
+			case <-ctx.Done():
+			}
+		}()
+	}
+
+	results := make([]serverQueryResult, 0, len(servers))
+	for i := 0; i < len(servers); i++ {
+		select {
+		case <-ctx.Done():
+			return results
+		case res := <-resultsCh:
+			results = append(results, res)
+		}
+	}
+	return results
 }
 
 func (r *Resolver) exchange(ctx context.Context, server string, query *dns.Msg) (*dns.Msg, error) {
@@ -419,6 +490,17 @@ func shouldFallbackToTCPOnError(err error) bool {
 	return strings.Contains(msg, "buffer size too small") ||
 		strings.Contains(msg, "overflow") ||
 		strings.Contains(msg, "truncated")
+}
+
+func cloneGuardMap(in map[string]int) map[string]int {
+	if len(in) == 0 {
+		return map[string]int{}
+	}
+	out := make(map[string]int, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func (r *Resolver) getCached(q dns.Question) (*dns.Msg, bool) {
