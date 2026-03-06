@@ -2,20 +2,22 @@ package main
 
 import (
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 
 	"dns-resolver/internal/admin"
 	"dns-resolver/internal/cache"
-	"dns-resolver/internal/cluster"
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/dnsproxy"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
+	"dns-resolver/internal/recursor"
 	"dns-resolver/internal/tlsutil"
-	"dns-resolver/internal/unbound"
 	"dns-resolver/plugins/adblock"
+	"dns-resolver/plugins/dnsdistcompat"
 	"dns-resolver/plugins/hosts"
 	"dns-resolver/plugins/odoh"
 
@@ -51,30 +53,7 @@ func main() {
 
 	// 2. Override configuration with Environment Variables
 	cfg.LoadFromEnv()
-
-	// 2.1 Cluster sync for nodes
-	if cfg.ClusterRole == "node" && cfg.ClusterAdminURL != "" {
-		cfg.AdminAddr = ""
-		cfg.AcmeEnabled = false
-		syncedCfg, err := cluster.SyncFromAdmin(cfg, "config.yaml")
-		if err != nil {
-			log.Printf("Cluster sync failed: %v", err)
-		} else {
-			cfg = syncedCfg
-		}
-
-		if cfg.ClusterSyncInterval > 0 {
-			go func(interval time.Duration) {
-				ticker := time.NewTicker(interval)
-				defer ticker.Stop()
-				for range ticker.C {
-					if _, err := cluster.SyncFromAdmin(cfg, "config.yaml"); err != nil {
-						log.Printf("Cluster periodic sync failed: %v", err)
-					}
-				}
-			}(cfg.ClusterSyncInterval)
-		}
-	}
+	cfg.Normalize()
 
 	// 3. Handle Certificate Content from Env Vars
 	wroteCerts, err := cfg.WriteCertFilesFromEnv()
@@ -86,27 +65,78 @@ func main() {
 		log.Println("No certificate content in environment variables.")
 	}
 
-	// 4. Initialize Unbound Resolver
-	log.Println("Initializing Unbound Resolver...")
-	resolver, err := unbound.NewResolver(cfg.RootAnchorPath)
+	// 4. Initialize built-in recursive resolver
+	log.Println("Initializing built-in recursive resolver...")
+	resolver, err := recursor.NewResolverWithOptions(recursor.Options{
+		WorkerCount:      cfg.ResolverWorkers,
+		QueryTimeout:     cfg.UpstreamTimeout,
+		ResolveTimeout:   cfg.RequestTimeout,
+		RootServers:      cfg.RecursorRootServers,
+		CacheEntries:     cfg.RecursorCacheEntries,
+		CacheMinTTL:      cfg.RecursorCacheMinTTL,
+		CacheMaxTTL:      cfg.RecursorCacheMaxTTL,
+		ValidateDNSSEC:   cfg.DNSSECValidate,
+		DNSSECFailClosed: cfg.DNSSECFailClosed,
+		DNSSECTrustDS:    cfg.DNSSECTrustAnchors,
+	})
 	if err != nil {
-		log.Fatalf("Failed to initialize Unbound: %v", err)
+		log.Fatalf("Failed to initialize recursive resolver: %v", err)
 	}
+	log.Printf(
+		"Built-in recursion configured: workers=%d query-timeout=%s resolve-timeout=%s cache-entries=%d cache-min-ttl=%s cache-max-ttl=%s dnssec-validate=%v dnssec-fail-closed=%v",
+		resolver.WorkerCount(),
+		cfg.UpstreamTimeout,
+		cfg.RequestTimeout,
+		cfg.RecursorCacheEntries,
+		cfg.RecursorCacheMinTTL,
+		cfg.RecursorCacheMaxTTL,
+		cfg.DNSSECValidate,
+		cfg.DNSSECFailClosed,
+	)
 	// No defer Close() here because we want it to run until exit.
 	// We could handle it in signal handling, but OS cleanup is fine for now or explicit close later.
 
 	// 5. Initialize Metrics
 	m := metrics.NewMetrics(cfg.MetricsStoragePath)
-	go m.StartMetricsServer(cfg.MetricsAddr)
+	if cfg.PrometheusEnabled {
+		go m.StartMetricsServer(cfg.MetricsAddr)
+	} else {
+		log.Println("Prometheus metrics server disabled by config.")
+	}
 
 	// 6. Initialize Plugin Manager & Plugins
 	pm := plugins.NewPluginManager()
 
-	adBlockPlugin := adblock.New(cfg.AdblockListURLs, 24*time.Hour)
-	pm.Register(adBlockPlugin)
+	if cfg.DNSDistCompatEnabled {
+		pm.Register(dnsdistcompat.New(dnsdistcompat.Config{
+			LogAll:             cfg.DNSDistCompatLogAll,
+			BannedIPsPath:      cfg.DNSDistCompatBannedIPsPath,
+			SNIProxyIPsPath:    cfg.DNSDistCompatSNIProxyIPsPath,
+			DomainsWithSubPath: cfg.DNSDistCompatDomainsWithSubPath,
+			CustomPath:         cfg.DNSDistCompatCustomPath,
+			DomainsPath:        cfg.DNSDistCompatDomainsPath,
+			HostsPath:          cfg.DNSDistCompatHostsPath,
+			GarbagePath:        cfg.DNSDistCompatGarbagePath,
+			DropSuffixes:       cfg.DNSDistCompatDropSuffixes,
+			LateDropSuffixes:   cfg.DNSDistCompatLateDropSuffixes,
+		}))
+	}
 
-	hostsPlugin := hosts.New(cfg.HostsPath, cfg.HostsURL, cfg.HostsUpdateInterval)
-	pm.Register(hostsPlugin)
+	var adBlockPlugin *adblock.AdBlockPlugin
+	if cfg.AdblockEnabled {
+		adBlockPlugin = adblock.New(cfg.AdblockListURLs, 24*time.Hour)
+		pm.Register(adBlockPlugin)
+	} else {
+		log.Println("Adblock plugin disabled by config.")
+	}
+
+	var hostsPlugin *hosts.HostsPlugin
+	if cfg.HostsEnabled {
+		hostsPlugin = hosts.New(cfg.HostsPath, cfg.HostsURL, cfg.HostsUpdateInterval)
+		pm.Register(hostsPlugin)
+	} else {
+		log.Println("Hosts plugin disabled by config.")
+	}
 
 	// 7. Setup TLS and Start DoH Server
 
@@ -116,9 +146,15 @@ func main() {
 		proxyAddr = "0.0.0.0:53"
 	}
 
-	// If bound to 0.0.0.0, we can reach it via 127.0.0.1:53 usually.
-	dnsProxyAddr := "127.0.0.1:53"
-	// (Assuming standard port or parsed from proxyAddr).
+	dnsProxyAddr := proxyAddr
+	if host, port, err := net.SplitHostPort(proxyAddr); err == nil {
+		switch host {
+		case "", "0.0.0.0", "::":
+			dnsProxyAddr = net.JoinHostPort("127.0.0.1", port)
+		default:
+			dnsProxyAddr = net.JoinHostPort(host, port)
+		}
+	}
 
 	// 5. Start DoH/DoT Service Plugin (Manages Certs & Servers)
 	// dohPlugin reference removed.
@@ -149,13 +185,14 @@ func main() {
 	if err != nil {
 		log.Printf("Warning: Failed to initialize hybrid cache: %v. Proceeding without cache.", err)
 	} else {
+		hybridCache.SetMetricsHooks(m)
 		defer hybridCache.Close()
 	}
 
 	// 8. Start Go DNS Proxy
-	log.Printf("DEBUG: Initializing DNS Proxy on %s using Embedded Unbound", proxyAddr)
-	// Pass 'resolver' and 'hybridCache'
-	dnsProxy := dnsproxy.NewProxy(proxyAddr, resolver, pm, m, hybridCache)
+	log.Printf("DEBUG: Initializing DNS Proxy on %s using embedded Go recursor", proxyAddr)
+	proxyOptions := buildProxyOptions(cfg)
+	dnsProxy := dnsproxy.NewProxyWithOptions(proxyAddr, resolver, pm, m, hybridCache, proxyOptions)
 	go func() {
 		if err := dnsProxy.Start(); err != nil {
 			log.Printf("DNS Proxy Error: %v", err)
@@ -164,20 +201,71 @@ func main() {
 
 	// 9. Initialize Admin Server
 	if cfg.AdminAddr != "" {
-		adminServer := admin.New(cfg, m, resolver, hostsPlugin, adBlockPlugin, pm)
-		go adminServer.Start()
+		if cfg.AdminUsername == "" || cfg.AdminPassword == "" {
+			log.Printf("Admin server disabled: set both admin_username and admin_password to enable %s", cfg.AdminAddr)
+		} else {
+			adminServer := admin.New(cfg, m, resolver, hostsPlugin, adBlockPlugin, pm)
+			go adminServer.Start()
+		}
 	}
 
-	log.Println("ASTRACAT Control Plane is running (Embedded Unbound)")
+	log.Println("ASTRACAT Control Plane is running (embedded Go recursor)")
 
 	// 10. Graceful shutdown
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
 	log.Println("Shutting down...")
 	resolver.Close()
 	if err := m.SaveHistoricalData(cfg.MetricsStoragePath); err != nil {
 		log.Printf("Failed to save metrics: %v", err)
 	}
-	os.Exit(0)
+}
+
+func buildProxyOptions(cfg *config.Config) dnsproxy.ProxyOptions {
+	opts := dnsproxy.DefaultProxyOptions()
+	opts.EnableAttackProtection = cfg.AttackProtectionEnabled
+	opts.MaxGlobalInflight = cfg.MaxGlobalInflight
+	opts.MaxQPSPerIP = cfg.MaxQPSPerIP
+	opts.RateLimitBurstPerIP = cfg.RateLimitBurstPerIP
+	opts.MaxConcurrentPerIP = cfg.MaxConcurrentPerIP
+	opts.MaxQuestionsPerRequest = cfg.MaxQuestionsPerRequest
+	opts.MaxQNameLength = cfg.MaxQNameLength
+	opts.DropANYQueries = cfg.DropANYQueries
+	if cfg.DNSDistCompatEnabled {
+		// dnsdist compat plugin implements silent DropAction() for ANY.
+		opts.DropANYQueries = false
+	}
+
+	opts.Policy.Enabled = cfg.PolicyEngineEnabled
+	opts.Policy.BlockedDomains = append([]string(nil), cfg.PolicyBlockedDomains...)
+	opts.Policy.RewriteRules = make([]dnsproxy.ProxyRewriteRule, 0, len(cfg.PolicyRewriteRules))
+	for _, rw := range cfg.PolicyRewriteRules {
+		opts.Policy.RewriteRules = append(opts.Policy.RewriteRules, dnsproxy.ProxyRewriteRule{
+			Domain: rw.Domain,
+			Type:   rw.Type,
+			Value:  rw.Value,
+			TTL:    rw.TTL,
+		})
+	}
+
+	opts.Policy.LoadBalancers = make([]dnsproxy.ProxyLoadBalancerRule, 0, len(cfg.PolicyLoadBalancers))
+	for _, lb := range cfg.PolicyLoadBalancers {
+		targets := make([]dnsproxy.ProxyLoadBalancerTarget, 0, len(lb.Targets))
+		for _, target := range lb.Targets {
+			targets = append(targets, dnsproxy.ProxyLoadBalancerTarget{
+				Value:  target.Value,
+				Weight: target.Weight,
+			})
+		}
+		opts.Policy.LoadBalancers = append(opts.Policy.LoadBalancers, dnsproxy.ProxyLoadBalancerRule{
+			Domain:   lb.Domain,
+			Type:     lb.Type,
+			Strategy: lb.Strategy,
+			TTL:      lb.TTL,
+			Targets:  targets,
+		})
+	}
+
+	return opts
 }

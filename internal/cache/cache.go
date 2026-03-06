@@ -41,6 +41,14 @@ type writeReq struct {
 	entry diskEntry
 }
 
+// MetricsHooks allows cache package to emit metrics without importing metrics package.
+type MetricsHooks interface {
+	IncrementDroppedCacheWrites()
+	IncrementLMDBCacheLoads()
+	IncrementLMDBErrors()
+	IncrementCacheEvictions()
+}
+
 /* =========================
    Cache
 ========================= */
@@ -52,6 +60,7 @@ type Cache struct {
 	writes chan writeReq
 	wg     sync.WaitGroup
 	stop   chan struct{}
+	hooks  MetricsHooks
 }
 
 var bucketName = []byte("decisions")
@@ -83,7 +92,6 @@ func NewCache(ramMB int, dbPath string) (*Cache, error) {
 		return nil, fmt.Errorf("failed to open l2 db: %v", err)
 	}
 
-	// Create bucket
 	err = l2.Update(func(tx *bbolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(bucketName)
 		return err
@@ -105,6 +113,35 @@ func NewCache(ramMB int, dbPath string) (*Cache, error) {
 	return c, nil
 }
 
+// SetMetricsHooks configures metrics callbacks.
+func (c *Cache) SetMetricsHooks(hooks MetricsHooks) {
+	c.hooks = hooks
+}
+
+func (c *Cache) incrementDroppedWrites() {
+	if c.hooks != nil {
+		c.hooks.IncrementDroppedCacheWrites()
+	}
+}
+
+func (c *Cache) incrementLMDBLoads() {
+	if c.hooks != nil {
+		c.hooks.IncrementLMDBCacheLoads()
+	}
+}
+
+func (c *Cache) incrementLMDBErrors() {
+	if c.hooks != nil {
+		c.hooks.IncrementLMDBErrors()
+	}
+}
+
+func (c *Cache) incrementEvictions() {
+	if c.hooks != nil {
+		c.hooks.IncrementCacheEvictions()
+	}
+}
+
 /* =========================
    Writer loop
 ========================= */
@@ -113,16 +150,60 @@ func (c *Cache) startWriter() {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
+
+		const maxBatchSize = 128
+		flushBatch := func(batch []writeReq) {
+			if len(batch) == 0 {
+				return
+			}
+
+			err := c.l2.Update(func(tx *bbolt.Tx) error {
+				b := tx.Bucket(bucketName)
+				for _, req := range batch {
+					data, err := json.Marshal(req.entry)
+					if err != nil {
+						return err
+					}
+					if err := b.Put([]byte(req.key), data); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				c.incrementLMDBErrors()
+			}
+		}
+
 		for {
 			select {
 			case req := <-c.writes:
-				_ = c.l2.Update(func(tx *bbolt.Tx) error {
-					b := tx.Bucket(bucketName)
-					data, _ := json.Marshal(req.entry)
-					return b.Put([]byte(req.key), data)
-				})
+				batch := make([]writeReq, 0, maxBatchSize)
+				batch = append(batch, req)
+				drained := false
+
+				for len(batch) < maxBatchSize {
+					select {
+					case req = <-c.writes:
+						batch = append(batch, req)
+					default:
+						drained = true
+					}
+					if drained {
+						break
+					}
+				}
+				flushBatch(batch)
 			case <-c.stop:
-				return
+				// Drain queue to persist accepted writes before shutdown.
+				for {
+					select {
+					case req := <-c.writes:
+						flushBatch([]writeReq{req})
+					default:
+						return
+					}
+				}
 			}
 		}
 	}()
@@ -151,16 +232,24 @@ func (c *Cache) Get(key string) (*Decision, bool) {
 		return json.Unmarshal(raw, &entry)
 	})
 	if err != nil {
+		if err.Error() != "miss" {
+			c.incrementLMDBErrors()
+		}
 		return nil, false
 	}
 
-	if time.Now().Unix() > entry.ExpireAt {
+	c.incrementLMDBLoads()
+
+	expireAt := time.Unix(entry.ExpireAt, 0)
+	ttl := time.Until(expireAt)
+	if ttl <= 0 {
 		_ = c.delete(key)
+		c.incrementEvictions()
 		return nil, false
 	}
 
-	// promote to L1
-	c.l1.SetWithTTL(key, &entry.Decision, 1, 30*time.Second)
+	// Promote to L1 with remaining TTL from L2.
+	c.l1.SetWithTTL(key, &entry.Decision, 1, ttl)
 	return &entry.Decision, true
 }
 
@@ -169,8 +258,11 @@ func (c *Cache) Get(key string) (*Decision, bool) {
 ========================= */
 
 func (c *Cache) Set(key string, d *Decision, ttl time.Duration) {
-	exp := time.Now().Add(ttl).Unix()
+	if ttl <= 0 {
+		return
+	}
 
+	exp := time.Now().Add(ttl).Unix()
 	c.l1.SetWithTTL(key, d, 1, ttl)
 
 	select {
@@ -182,7 +274,8 @@ func (c *Cache) Set(key string, d *Decision, ttl time.Duration) {
 		},
 	}:
 	default:
-		// drop on overload — L1 still works
+		// Drop on overload, L1 still serves hot path.
+		c.incrementDroppedWrites()
 	}
 }
 

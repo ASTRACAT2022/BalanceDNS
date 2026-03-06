@@ -1,205 +1,251 @@
+//go:build cgo && unbound
+// +build cgo,unbound
+
 package unbound
 
 import (
 	"fmt"
+	"log"
+	"os"
+	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/miekg/dns"
-	"github.com/miekg/unbound"
+	ub "github.com/miekg/unbound"
 )
 
-// Resolver wraps the Unbound instance.
+// Options controls Unbound recursion behavior.
+type Options struct {
+	RootAnchorPath string
+	WorkerCount    int
+	MsgCacheSize   string
+	RRsetCacheSize string
+	KeyCacheSize   string
+	Prefetch       bool
+	ServeExpired   bool
+}
+
+// Resolver wraps a pool of Unbound instances for parallel recursive resolution.
 type Resolver struct {
-	u  *unbound.Unbound
+	mu      sync.RWMutex
+	workers []*resolverWorker
+	opts    Options
+	next    atomic.Uint64
+}
+
+type resolverWorker struct {
+	u  *ub.Unbound
 	mu sync.Mutex
 }
 
-// NewResolver creates and initializes a new Unbound resolver.
+// NewResolver creates a resolver with sane defaults.
 func NewResolver(rootAnchorPath string) (*Resolver, error) {
-	if rootAnchorPath == "" {
-		rootAnchorPath = "/var/lib/unbound/root.key"
-	}
-	u := unbound.New()
-
-	// Apply User Configuration
-	opts := map[string]string{
-		"verbosity":              "0",
-		"do-ip4":                 "yes",
-		"do-ip6":                 "yes",
-		"do-udp":                 "yes",
-		"do-tcp":                 "yes",
-		"prefer-ip6":             "no",
-		"harden-glue":            "yes",
-		"harden-dnssec-stripped": "yes",
-		"use-caps-for-id":        "no",
-		"auto-trust-anchor-file": rootAnchorPath,
-		"val-clean-additional":   "yes",
-		"edns-buffer-size":       "1232",
-		"so-rcvbuf":              "1m",
-		"msg-cache-size":         "5k",
-		"rrset-cache-size":       "5k",
-		"prefetch":               "no",
-		"prefetch-key":           "no",
-		"serve-expired":          "no",
-		"cache-min-ttl":          "0",
-		"cache-max-ttl":          "86400",
-	}
-
-	for k, v := range opts {
-		if err := u.SetOption(k, v); err != nil {
-			return nil, fmt.Errorf("failed to set %s: %v", k, err)
-		}
-	}
-
-	// Private Addresses (Privacy / RFC6303)
-	privateAddrs := []string{
-		"192.168.0.0/16", "169.254.0.0/16", "172.16.0.0/12", "10.0.0.0/8",
-		"fd00::/8", "fe80::/10",
-		"192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24",
-		"255.255.255.255/32", "2001:db8::/32",
-	}
-	for _, addr := range privateAddrs {
-		if err := u.SetOption("private-address", addr); err != nil {
-			return nil, fmt.Errorf("failed to set private-address %s: %v", addr, err)
-		}
-	}
-
-	return &Resolver{u: u}, nil
+	return NewResolverWithOptions(Options{
+		RootAnchorPath: rootAnchorPath,
+		Prefetch:       true,
+		ServeExpired:   true,
+	})
 }
 
-// Resolve performs a DNS resolution for the given question.
+// NewResolverWithOptions creates a resolver and initializes worker pool.
+func NewResolverWithOptions(opts Options) (*Resolver, error) {
+	opts = withDefaultOptions(opts)
+	if err := ensureRootAnchor(opts.RootAnchorPath); err != nil {
+		return nil, err
+	}
+
+	workers := make([]*resolverWorker, 0, opts.WorkerCount)
+	for i := 0; i < opts.WorkerCount; i++ {
+		u := ub.New()
+		if err := configureUnbound(u, opts); err != nil {
+			u.Destroy()
+			for _, w := range workers {
+				w.u.Destroy()
+			}
+			return nil, err
+		}
+		workers = append(workers, &resolverWorker{u: u})
+	}
+
+	return &Resolver{workers: workers, opts: opts}, nil
+}
+
+// Resolve performs recursive DNS lookup.
 func (r *Resolver) Resolve(question dns.Question) (*dns.Msg, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	if len(r.workers) == 0 {
+		r.mu.RUnlock()
+		return nil, fmt.Errorf("resolver is not initialized")
+	}
+	workerCount := len(r.workers)
+	startIdx := selectWorkerIndex(r.next.Add(1), workerCount)
+	worker := r.workers[startIdx]
+	r.mu.RUnlock()
 
-	// Convert dns.Question to Unbound expectation
-	// Unbound Resolve() takes prompt, type, class
-	// Note: miekg/unbound Resolve returns (*Result, error)
-	// result.AnswerPacket is the raw wire bytes of the answer.
-
-	result, err := r.u.Resolve(question.Name, question.Qtype, question.Qclass)
+	result, err := resolveWithWorker(worker, question)
+	if shouldRetryResolve(result, err) && workerCount > 1 {
+		maxRetries := workerCount - 1
+		if maxRetries > 2 {
+			maxRetries = 2
+		}
+		for i := 1; i <= maxRetries; i++ {
+			r.mu.RLock()
+			alt := r.workers[(startIdx+i)%workerCount]
+			r.mu.RUnlock()
+			altResult, altErr := resolveWithWorker(alt, question)
+			if !shouldRetryResolve(altResult, altErr) {
+				if altErr == nil && altResult != nil && altResult.Rcode != dns.RcodeServerFailure {
+					log.Printf("Unbound retry recovered query %s %s on worker %d", question.Name, dns.TypeToString[question.Qtype], (startIdx+i)%workerCount)
+				}
+				result, err = altResult, altErr
+				break
+			}
+		}
+	}
 	if err != nil {
 		return nil, fmt.Errorf("unbound resolution failed: %v", err)
 	}
 
-	if result.HaveData || result.NxDomain {
-		// Parse the raw packet back into a dns.Msg
-		// result.Packet is a []byte (if available in wrapper?)
-		// Checking miekg/unbound docs (implied): result has fields like CanonName, Data...
-		// But usually we want the full packet if possible for DNSSEC data.
-		// Wait, miekg/unbound implementation details:
-		// Resolve() calls ub_resolve().
-		// Result struct has: Qname, Qtype, Qclass, Data [][]byte, CanonName, Rcode, Secure, WhyBogus...
-		// It does NOT expose the full raw packet easily in the basic Resolve struct unless we use async or newer bindings.
-		// However, for a proxy, we want to construct a dns.Msg response.
-
-		m := new(dns.Msg)
-		m.SetReply(&dns.Msg{Question: []dns.Question{question}})
-		m.Rcode = result.Rcode
-		m.AuthenticatedData = result.Secure
-
-		// Reconstruct RR from Data
-		// This is tedious. Let's see if there's a better way or if the wrapper provides the packet.
-		// The wrapper *unbound.Unbound has a method implementation.
-		// If we only get Data [][]byte, we have to rebuild RRs.
-
-		// Alternative: Use `ResolveAsync` which might behave differently, or check if `AnswerPacket` is available.
-		// Inspecting common Go unbound wrappers: often they just wrap ub_resolve.
-		// If we can't get the full packet easily, we might just reconstruct the Answer section.
-
-		// FOR MVP:
-		// Since we cannot verify the exact API of the wrapper without reading it (and I entered Execution without reading the wrapper source code which I don't have access to),
-		// I will assume for a moment that I need to build the response.
-		// BUT, actually, standard `miekg/unbound` doesn't seem to expose raw packet in synchronous Resolve.
-		// This might be why people use `github.com/miekg/dns` with `net.Resolver`.
-
-		// RE-EVALUATION:
-		// If I cannot easily get the whole packet, Unbound might just be acting as a cache/validator.
-		// However, `libunbound` does have `ub_result` which has `answer_packet` and `answer_len`.
-		// If `miekg/unbound` exposes `AnswerPacket []byte`, then we are good.
-		// Most updated forks do. Let's assume `AnswerPacket` exists.
-		// usage: if len(result.AnswerPacket) > 0 { msg.Unpack(result.AnswerPacket) }
-
-		// result.AnswerPacket seems to be *dns.Msg according to linter.
-		if result.AnswerPacket != nil {
-			m := result.AnswerPacket
-			m.SetReply(&dns.Msg{Question: []dns.Question{question}})
-			// Restore AD bit if needed, though SetReply might reset some flags,
-			// usually we want to keep the answer data.
-			// Actually SetReply sets QR=1, copies ID/Opcode/Question.
-			// We should ensure Rcode is correct.
-			m.Rcode = result.Rcode
-			// ID is handled by the caller (Proxy)
-
-			return m, nil
-		}
-
-		// Fallback for empty packet with Rcode (e.g. simplified NXDOMAIN without SOA?)
-		m = new(dns.Msg)
-		m.SetReply(&dns.Msg{Question: []dns.Question{question}})
-		m.Rcode = result.Rcode
-		m.AuthenticatedData = result.Secure
-		return m, nil
+	resp, err := responseFromResult(question, result)
+	if err != nil {
+		return nil, err
 	}
-
-	return nil, fmt.Errorf("resolution failed (Rcode: %d)", result.Rcode)
+	return resp, nil
 }
 
-// Close closes the Unbound instance.
+// Close closes all worker instances.
 func (r *Resolver) Close() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.u != nil {
-		r.u.Destroy()
-		r.u = nil
+	for _, w := range r.workers {
+		if w != nil && w.u != nil {
+			w.mu.Lock()
+			w.u.Destroy()
+			w.u = nil
+			w.mu.Unlock()
+		}
 	}
+	r.workers = nil
 }
 
-// Reload re-initializes the Unbound resolver.
+// Reload recreates the resolver with existing options and new root anchor path.
 func (r *Resolver) Reload(rootAnchorPath string) error {
-	if rootAnchorPath == "" {
-		rootAnchorPath = "/var/lib/unbound/root.key"
+	opts := r.opts
+	if rootAnchorPath != "" {
+		opts.RootAnchorPath = rootAnchorPath
 	}
+	fresh, err := NewResolverWithOptions(opts)
+	if err != nil {
+		return err
+	}
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	oldWorkers := r.workers
+	r.workers = fresh.workers
+	r.opts = opts
+	r.mu.Unlock()
 
-	if r.u != nil {
-		r.u.Destroy()
+	for _, w := range oldWorkers {
+		if w != nil && w.u != nil {
+			w.mu.Lock()
+			w.u.Destroy()
+			w.u = nil
+			w.mu.Unlock()
+		}
+	}
+	return nil
+}
+
+// ClearCache clears cache by full reload.
+func (r *Resolver) ClearCache(rootAnchorPath string) error {
+	return r.Reload(rootAnchorPath)
+}
+
+// WorkerCount returns active resolver workers.
+func (r *Resolver) WorkerCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.workers)
+}
+
+func responseFromResult(question dns.Question, result *ub.Result) (*dns.Msg, error) {
+	if result == nil {
+		return nil, fmt.Errorf("unbound returned empty result")
 	}
 
-	u := unbound.New()
-
-	// Apply User Configuration
-	opts := map[string]string{
-		"verbosity":              "0",
-		"do-ip4":                 "yes",
-		"do-ip6":                 "yes",
-		"do-udp":                 "yes",
-		"do-tcp":                 "yes",
-		"prefer-ip6":             "no",
-		"harden-glue":            "yes",
-		"harden-dnssec-stripped": "yes",
-		"use-caps-for-id":        "no",
-		"auto-trust-anchor-file": rootAnchorPath,
-		"val-clean-additional":   "yes",
-		"edns-buffer-size":       "1232",
-		"so-rcvbuf":              "1m",
-		"msg-cache-size":         "5k",
-		"rrset-cache-size":       "5k",
-		"prefetch":               "no",
-		"prefetch-key":           "no",
-		"serve-expired":          "no",
-		"cache-min-ttl":          "0",
-		"cache-max-ttl":          "86400",
+	if result.AnswerPacket != nil {
+		msg := result.AnswerPacket.Copy()
+		msg.MsgHdr.Response = true
+		msg.RecursionAvailable = true
+		msg.Question = []dns.Question{question}
+		msg.Rcode = result.Rcode
+		if result.Secure {
+			msg.AuthenticatedData = true
+		}
+		return msg, nil
 	}
 
-	for k, v := range opts {
-		if err := u.SetOption(k, v); err != nil {
-			return fmt.Errorf("failed to set %s: %v", k, err)
+	// Return NOERROR/NODATA and NXDOMAIN correctly instead of converting to SERVFAIL.
+	msg := new(dns.Msg)
+	msg.MsgHdr.Response = true
+	msg.RecursionAvailable = true
+	msg.Question = []dns.Question{question}
+	msg.Rcode = result.Rcode
+	msg.AuthenticatedData = result.Secure
+	if len(result.Rr) > 0 {
+		msg.Answer = append(msg.Answer, result.Rr...)
+	}
+	return msg, nil
+}
+
+func configureUnbound(u *ub.Unbound, opts Options) error {
+	entries := []struct {
+		name     string
+		value    string
+		required bool
+	}{
+		{"verbosity", "0", false},
+		{"do-ip4", "yes", false},
+		{"do-ip6", "yes", false},
+		{"do-udp", "yes", false},
+		{"do-tcp", "yes", false},
+		{"prefer-ip6", "no", false},
+		{"harden-glue", "yes", false},
+		{"harden-dnssec-stripped", "yes", false},
+		{"harden-algo-downgrade", "yes", false},
+		{"use-caps-for-id", "yes", false},
+		{"auto-trust-anchor-file", opts.RootAnchorPath, true},
+		{"val-clean-additional", "yes", false},
+		{"edns-buffer-size", "1232", false},
+		{"so-rcvbuf", "4m", false},
+		{"so-sndbuf", "4m", false},
+		{"msg-cache-size", opts.MsgCacheSize, false},
+		{"rrset-cache-size", opts.RRsetCacheSize, false},
+		{"key-cache-size", opts.KeyCacheSize, false},
+		{"prefetch", boolToYesNo(opts.Prefetch), false},
+		{"prefetch-key", boolToYesNo(opts.Prefetch), false},
+		{"serve-expired", boolToYesNo(opts.ServeExpired), false},
+		{"serve-expired-ttl", "86400", false},
+		{"serve-expired-reply-ttl", "30", false},
+		{"aggressive-nsec", "yes", false},
+		{"minimal-responses", "yes", false},
+		{"cache-min-ttl", "0", false},
+		{"cache-max-ttl", "86400", false},
+	}
+
+	for _, e := range entries {
+		if e.value == "" {
+			continue
+		}
+		if err := u.SetOption(e.name, e.value); err != nil {
+			if e.required {
+				return fmt.Errorf("failed to set required unbound option %s=%s: %w", e.name, e.value, err)
+			}
+			log.Printf("Warning: unsupported/unset unbound option %s=%s: %v", e.name, e.value, err)
 		}
 	}
 
-	// Private Addresses (Privacy / RFC6303)
 	privateAddrs := []string{
 		"192.168.0.0/16", "169.254.0.0/16", "172.16.0.0/12", "10.0.0.0/8",
 		"fd00::/8", "fe80::/10",
@@ -208,15 +254,76 @@ func (r *Resolver) Reload(rootAnchorPath string) error {
 	}
 	for _, addr := range privateAddrs {
 		if err := u.SetOption("private-address", addr); err != nil {
-			return fmt.Errorf("failed to set private-address %s: %v", addr, err)
+			log.Printf("Warning: failed to set private-address %s: %v", addr, err)
 		}
 	}
 
-	r.u = u
 	return nil
 }
 
-// ClearCache clears the cache by recreating the instance (simplest method for embedded libunbound).
-func (r *Resolver) ClearCache(rootAnchorPath string) error {
-	return r.Reload(rootAnchorPath)
+func withDefaultOptions(opts Options) Options {
+	if opts.RootAnchorPath == "" {
+		opts.RootAnchorPath = "/var/lib/unbound/root.key"
+	}
+	if opts.WorkerCount <= 0 {
+		workers := runtime.GOMAXPROCS(0)
+		if workers < 2 {
+			workers = 2
+		}
+		if workers > 16 {
+			workers = 16
+		}
+		opts.WorkerCount = workers
+	}
+	if opts.MsgCacheSize == "" {
+		opts.MsgCacheSize = "64m"
+	}
+	if opts.RRsetCacheSize == "" {
+		opts.RRsetCacheSize = "128m"
+	}
+	if opts.KeyCacheSize == "" {
+		opts.KeyCacheSize = "64m"
+	}
+	return opts
+}
+
+func selectWorkerIndex(next uint64, workerCount int) int {
+	if workerCount == 1 {
+		return 0
+	}
+	return int((next - 1) % uint64(workerCount))
+}
+
+func boolToYesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
+}
+
+func resolveWithWorker(worker *resolverWorker, question dns.Question) (*ub.Result, error) {
+	worker.mu.Lock()
+	defer worker.mu.Unlock()
+	return worker.u.Resolve(question.Name, question.Qtype, question.Qclass)
+}
+
+func shouldRetryResolve(result *ub.Result, err error) bool {
+	if err != nil {
+		return true
+	}
+	if result == nil {
+		return true
+	}
+	return result.Rcode == dns.RcodeServerFailure
+}
+
+func ensureRootAnchor(rootAnchorPath string) error {
+	info, err := os.Stat(rootAnchorPath)
+	if err != nil {
+		return fmt.Errorf("root anchor not found at %s: %w", rootAnchorPath, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("root anchor path %s is a directory", rootAnchorPath)
+	}
+	return nil
 }

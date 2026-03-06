@@ -1,80 +1,80 @@
 # AstracatDNS User Manual
 
-## Introduction
-AstracatDNS is a high-performance, modular DNS resolver written in Go. It focuses on speed, privacy, and extensibility through a plugin system.
+## 1. What It Is
 
-## Features
-- **High Performance**: Optimized concurrency, lazy-loading disk cache, and efficient memory usage.
-- **Privacy First**: Support for DNS-over-UDP/TCP with optional encryption (future).
-- **AdBlock**: Integrated AdBlock plugin with parallel blocklist updates.
-- **Customizable**: Hosts file support for local overrides.
-- **Admin Panel**: Web-based interface for monitoring and management.
+AstracatDNS is a recursive DNS resolver in Go. It resolves domains directly, validates DNSSEC, and applies configurable policies before recursion.
 
-## Installation
+## 2. Main Features
 
-### Prerequisites
-- Go 1.24+ (if building from source)
-- Linux or macOS
+- Recursive DNS resolver (UDP/TCP)
+- DNSSEC validation mode
+- Hybrid caching and request deduplication
+- Policy engine: block, rewrite, load-balance
+- `dnsdist`-compatible policy rules
+- `hosts` and `adblock` plugins
+- ODoH support
+- Prometheus metrics and web admin panel
 
-### Building from Source
+## 3. Build and Run
+
 ```bash
-go build -o AstracatDNS
+go build -o dns-resolver .
+./dns-resolver
 ```
 
-## Configuration
-The main configuration file is `config.yaml`.
+By default it loads `config.yaml` from the current directory.
+
+## 4. Basic Configuration
+
+Edit `config.yaml`:
+
+- DNS listener: `listen_addr`
+- Metrics: `metrics_addr`, `prometheus_enabled`
+- Admin panel: `admin_addr`, `admin_username`, `admin_password`
+- Recursor: `recursor_cache_entries`, `recursor_cache_min_ttl`, `recursor_cache_max_ttl`
+- DNSSEC: `dnssec_validate`, `dnssec_fail_closed`, `dnssec_trust_anchors`
+
+## 5. dnsdist-Compatible Policies
+
+Enable:
 
 ```yaml
-server:
-  port: 53
-  upstream: ["1.1.1.1:53", "8.8.8.8:53"]
-
-admin:
-  port: 8080
-  username: astracat
-  password: astracat  # Please change this immediately!
-
-plugins:
-  adblock:
-     enabled: true
-  adblock:
-     enabled: true
-     blocklists:
-       - https://example.com/ads.txt
-
-  # Secure DNS (DoT/DoH)
-  # Requires valid TLS certificates
-  do_t_addr: "0.0.0.0:853"
-  do_h_addr: "0.0.0.0:443"
-  cert_file: "/path/to/cert.pem"
-  key_file: "/path/to/key.pem"
+dnsdist_compat_enabled: true
 ```
 
-## Secure DNS (DoT/DoH/ODoH)
-To enable DNS-over-TLS (DoT) or DNS-over-HTTPS (DoH), you must provide a valid TLS certificate and key in `config.yaml`.
-- **DoT**: Listens on port 853 by default.
-- **DoH**: Listens on port 443 by default at `/dns-query`.
-- **ODoH**: Supported on the same DoH port. The server automatically generates a keypair on startup. Clients can fetch the config at `/odohconfigs`.
+Policy files (default under `/etc/dnsdist/`):
 
-## Running the Server
-```bash
-sudo ./AstracatDNS
+- `banned_ips.txt` - client CIDRs/IPs to drop
+- `sni_proxy_ips.txt` - spoof IP pool
+- `domains_with_subdomains.txt` - suffix spoof list
+- `custom.txt` - suffix spoof list
+- `domains.txt` - exact spoof list
+- `hosts.txt` - host overrides
+- `garbage.txt` - exact NXDOMAIN list
+
+Additional inline lists:
+
+- `dnsdist_compat_drop_suffixes`
+- `dnsdist_compat_late_drop_suffixes`
+
+## 6. DNSSEC Behavior
+
+When validation succeeds, responses are marked with `AD`.  
+If `dnssec_fail_closed: true`, bogus validation returns `SERVFAIL`.
+
+## 7. Secure DNS Endpoints
+
+- DoT: set `dot_addr` and valid TLS cert/key
+- ODoH: set `odoh_addr` and TLS cert/key
+
+## 8. Monitoring
+
+Prometheus endpoint:
+
+```text
+http://<host>:9090/metrics
 ```
-*Note: Binding to port 53 usually requires root privileges.*
 
-## Client Setup
-Configure your device or router to use the IP address of the server running AstracatDNS as its DNS server.
+## 9. Notes
 
-### macOS
-1. Open System Settings -> Network.
-2. Select your active network connection.
-3. Click "Details..." -> "DNS".
-4. Add the IP address of your AstracatDNS server.
-
-### Linux (systemd-resolved)
-Edit `/etc/systemd/resolved.conf`:
-```ini
-[Resolve]
-DNS=YOUR_SERVER_IP
-```
-Restart the service: `sudo systemctl restart systemd-resolved`
+- Cluster mode and cluster sync are not part of this version.

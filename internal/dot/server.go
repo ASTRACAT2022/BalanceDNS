@@ -41,10 +41,13 @@ func (s *Server) Start() error {
 	log.Printf("Starting DoT Server on %s (Upstream: %s)", s.Addr, s.UpstreamTarget)
 
 	srv := &dns.Server{
-		Addr:      s.Addr,
-		Net:       "tcp-tls",
-		TLSConfig: s.TLSConfig,
-		Handler:   dns.HandlerFunc(s.handleRequest),
+		Addr:         s.Addr,
+		Net:          "tcp-tls",
+		TLSConfig:    s.TLSConfig,
+		Handler:      dns.HandlerFunc(s.handleRequest),
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
+		IdleTimeout:  func() time.Duration { return 30 * time.Second },
 	}
 
 	return srv.ListenAndServe()
@@ -52,8 +55,35 @@ func (s *Server) Start() error {
 
 // handleRequest handles incoming DoT queries.
 func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
+	requestStart := time.Now()
+	outcome := "resolved"
+	rcodeText := dns.RcodeToString[dns.RcodeSuccess]
+
+	if s.Metrics != nil {
+		s.Metrics.IncrementInflightRequests()
+		defer s.Metrics.DecrementInflightRequests()
+		defer s.Metrics.RecordRequestOutcome("dot", outcome, rcodeText, time.Since(requestStart))
+	}
+
+	if r == nil || len(r.Question) == 0 {
+		outcome = "malformed"
+		rcodeText = dns.RcodeToString[dns.RcodeFormatError]
+		if s.Metrics != nil {
+			s.Metrics.RecordMalformedRequest("dot")
+		}
+		m := new(dns.Msg)
+		if r != nil {
+			m.SetRcode(r, dns.RcodeFormatError)
+		} else {
+			m.MsgHdr.Response = true
+			m.Rcode = dns.RcodeFormatError
+		}
+		_ = w.WriteMsg(m)
+		return
+	}
+
 	// 1. Record Request Metrics
-	if s.Metrics != nil && len(r.Question) > 0 {
+	if s.Metrics != nil {
 		qName := r.Question[0].Name
 		qType := dns.TypeToString[r.Question[0].Qtype]
 		s.Metrics.IncrementQueries(qName)
@@ -67,6 +97,7 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 			Metrics:        s.Metrics,
 		}
 		if handled := s.PM.ExecutePlugins(ctx, w, r); handled {
+			outcome = "plugin_handled"
 			return // Plugin handled (e.g. blocked)
 		}
 	}
@@ -76,19 +107,25 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 	// Since upstream is local Knot (optimised), UDP is fine, but TCP handles large responses better.
 	// We'll trust the client config (default TCP).
 
-	startTime := time.Now()
+	resolveStart := time.Now()
 	resp, _, err := s.Client.Exchange(r, s.UpstreamTarget)
 	if err != nil {
 		log.Printf("DoT Upstream Error: %v", err)
+		outcome = "resolver_error"
+		rcodeText = dns.RcodeToString[dns.RcodeServerFailure]
+		if s.Metrics != nil {
+			s.Metrics.IncrementUnboundErrors()
+		}
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeServerFailure)
-		w.WriteMsg(m)
+		_ = w.WriteMsg(m)
 		return
 	}
+	rcodeText = dns.RcodeToString[resp.Rcode]
 
 	// 4. Record Response Metrics
-	if s.Metrics != nil && len(r.Question) > 0 {
-		latency := time.Since(startTime)
+	if s.Metrics != nil {
+		latency := time.Since(resolveStart)
 		qName := r.Question[0].Name
 		s.Metrics.RecordLatency(qName, latency)
 		s.Metrics.RecordResponseCode(dns.RcodeToString[resp.Rcode])
@@ -97,5 +134,5 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 		}
 	}
 
-	w.WriteMsg(resp)
+	_ = w.WriteMsg(resp)
 }

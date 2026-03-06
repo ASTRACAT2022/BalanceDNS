@@ -1,56 +1,49 @@
 # AstracatDNS Administrator Manual
 
-## Admin Panel
-AstracatDNS comes with a built-in web-based Admin Panel for real-time monitoring and configuration.
+## 1. Admin Panel Access
 
-**Default URL**: `http://localhost:8080` (or the configured IP:Port)
+Enable in `config.yaml`:
 
-### Dashboard
-The dashboard provides a real-time overview of the system's health and performance:
-- **QPS (Queries Per Second)**: Current load on the resolver.
-- **Cache Hit Rate**: Efficiency of the caching mechanism.
-- **System Resources**: CPU and Memory usage visualization.
-- **Charts**: Traffic analysis over time.
-- **Top Tables**: Most blocked domains, high latency domains, and query types.
+```yaml
+admin_addr: "0.0.0.0:8080"
+admin_username: "admin"
+admin_password: "change_me"
+```
 
-### Plugin Management
+Open:
 
-#### AdBlock Manager
-- **Status**: View active blocklists.
-- **Add Blocklist**: Enter a URL to a standard hosts format blocklist (e.g., from StevenBlack/hosts) to subscribe to it.
-- **Remove**: Unsubscribe from a blocklist.
-- **Update**: Manually trigger a parallel update of all blocklists.
+```text
+http://<server>:8080
+```
 
-#### Hosts Editor
-- **Direct Edit**: Edit the local `hosts` file content directly from the browser.
-- **Reload**: Apply changes immediately without restarting the server.
-- **Syntax**: Standard hosts format: `IP_ADDRESS HOSTNAME [ALIASES...]`
-  ```
-  127.0.0.1 localhost
-  192.168.1.10 my-server.local
-  ```
+## 2. Available Admin APIs
 
-## Troubleshooting
+- `GET /api/metrics` - dashboard snapshot
+- `POST /api/control/reload` - reload resolver
+- `POST /api/control/cache/clear` - clear cache
 
-### High Memory Usage
-- Check the **Cache Misses** on the dashboard. If high, the cache might be filling up with unique queries.
-- The cache uses a **Lazy Loading** strategy with LMDB. It only loads frequent items into RAM. Verify disk I/O if performance drops.
+## 3. Operational Checklist
 
-### Blocklists Not Updating
-- Check the **System Logs** (stdout/stderr) for HTTP errors.
-- Ensure the server has internet access.
-- The update process uses a 10-second timeout per list to prevent hanging.
+- Restrict access to `admin_addr` via firewall/reverse proxy
+- Use strong admin credentials
+- Keep TLS cert/key valid when using DoT/ODoH
+- Monitor `/metrics` from Prometheus
 
-### "Address already in use" Error
-- Ensure no other DNS resolver (like `systemd-resolved` or `dnsmasq`) is running on port 53.
-- Use `sudo lsof -i :53` to identify conflicting processes.
+## 4. Plugin Operations
 
-### ODoH Verification
-- The server exposes ODoH configs at `https://<your-domain>/odohconfigs`.
-- You can verify this using `curl -v https://<your-domain>/odohconfigs`.
-- Ensure your TLS certificates are valid and trusted by the client.
+Current operational plugins:
 
-## Security Best Practices
-1. **Change Default Password**: Immediately change the admin password via the Admin Panel ("Quick Actions" -> "Admin").
-2. **Firewall**: Restrict access to the Admin Panel port (8080) to trusted IP addresses only.
-3. **HTTPS**: The current version runs on HTTP. For remote access, use a reverse proxy (like Nginx or Caddy) with TLS termination.
+- `hosts` (local overrides)
+- `adblock` (blocklist-based filtering)
+- `dnsdist_compat` (dnsdist-like policy chain for recursive mode)
+- `odoh` (oblivious DNS endpoint)
+
+## 5. Security Notes
+
+- `drop_any_queries` and attack protection limits should stay enabled in production
+- `dnssec_validate: true` is recommended
+- `dnssec_fail_closed: true` is recommended for strict mode
+
+## 6. Removed Functionality
+
+Cluster admin/node sync endpoints are not part of this version.

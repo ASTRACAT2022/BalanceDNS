@@ -11,11 +11,9 @@ import (
 	"os"
 	"time"
 
-	"dns-resolver/internal/cluster"
 	"dns-resolver/internal/config"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
-	"dns-resolver/internal/unbound"
 	"dns-resolver/plugins/adblock"
 	"dns-resolver/plugins/hosts"
 
@@ -31,7 +29,7 @@ var templatesFS embed.FS
 type Server struct {
 	addr          string
 	metrics       *metrics.Metrics
-	resolver      *unbound.Resolver
+	resolver      ControlResolver
 	hosts         *hosts.HostsPlugin
 	adblock       *adblock.AdBlockPlugin
 	pm            *plugins.PluginManager
@@ -40,15 +38,19 @@ type Server struct {
 	sessionToken  string
 	sessionExpiry time.Time
 	configPath    string // Path to config file
-	clusterToken  string
 	baseConfig    *config.Config
 }
 
+// ControlResolver provides resolver control hooks used by admin endpoints.
+type ControlResolver interface {
+	Reload(rootAnchorPath string) error
+	ClearCache(rootAnchorPath string) error
+}
+
 // New creates a new admin server.
-func New(cfg *config.Config, m *metrics.Metrics, r *unbound.Resolver, h *hosts.HostsPlugin, ab *adblock.AdBlockPlugin, pm *plugins.PluginManager) *Server {
-	// In a real application, load this from config
-	username := "astracat"
-	password := "astracat"
+func New(cfg *config.Config, m *metrics.Metrics, r ControlResolver, h *hosts.HostsPlugin, ab *adblock.AdBlockPlugin, pm *plugins.PluginManager) *Server {
+	username := cfg.AdminUsername
+	password := cfg.AdminPassword
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		log.Fatalf("Failed to hash password: %v", err)
@@ -64,7 +66,6 @@ func New(cfg *config.Config, m *metrics.Metrics, r *unbound.Resolver, h *hosts.H
 		username:     username,
 		passwordHash: hash,
 		configPath:   "config.yaml", // Default config path
-		clusterToken: cfg.ClusterToken,
 		baseConfig:   cfg,
 	}
 }
@@ -84,7 +85,6 @@ func (s *Server) Start() {
 	mux.Handle("/api/metrics", s.authMiddleware(http.HandlerFunc(s.handleApiMetrics)))
 	mux.Handle("/api/control/reload", s.authMiddleware(http.HandlerFunc(s.handleControlReload)))
 	mux.Handle("/api/control/cache/clear", s.authMiddleware(http.HandlerFunc(s.handleControlCacheClear)))
-	mux.Handle("/api/cluster/sync", http.HandlerFunc(s.handleClusterSync))
 	// Add other API routes here
 
 	// SPA Catch-all (Protected)
@@ -94,62 +94,6 @@ func (s *Server) Start() {
 	log.Printf("Starting admin server on %s", s.addr)
 	if err := http.ListenAndServe(s.addr, mux); err != nil {
 		log.Fatalf("Failed to start admin server: %v", err)
-	}
-}
-
-func (s *Server) handleClusterSync(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Only GET method is allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	if s.clusterToken != "" {
-		if r.Header.Get("X-Cluster-Token") != s.clusterToken {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-	}
-
-	cfg := config.NewConfig()
-	if data, err := os.ReadFile(s.configPath); err == nil {
-		if err := yaml.Unmarshal(data, cfg); err != nil {
-			http.Error(w, "Failed to load config", http.StatusInternalServerError)
-			return
-		}
-	} else if s.baseConfig != nil {
-		cfg = s.baseConfig
-	}
-
-	if cfg.ClusterRole != "" && cfg.ClusterRole != "admin" {
-		http.Error(w, "Cluster sync is only available on admin nodes", http.StatusNotFound)
-		return
-	}
-
-	certPath, keyPath, err := cluster.EnsureAdminCertificates(cfg)
-	if err != nil {
-		log.Printf("Failed to ensure cluster certs: %v", err)
-	}
-
-	var certData, keyData []byte
-	if certPath != "" && keyPath != "" {
-		certData, _ = os.ReadFile(certPath)
-		keyData, _ = os.ReadFile(keyPath)
-	}
-
-	configBytes, err := yaml.Marshal(cfg)
-	if err != nil {
-		http.Error(w, "Failed to encode config", http.StatusInternalServerError)
-		return
-	}
-
-	payload := map[string]string{
-		"config_yaml": string(configBytes),
-		"cert_pem":    string(certData),
-		"key_pem":     string(keyData),
-	}
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		log.Printf("Error encoding cluster payload: %v", err)
 	}
 }
 
@@ -273,65 +217,7 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleApiMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	s.metrics.RLock()
-	defer s.metrics.RUnlock()
-
-	var topNXDomains []metrics.DomainCount
-	s.metrics.TopNXDomains.Range(func(key, value interface{}) bool {
-		topNXDomains = append(topNXDomains, metrics.DomainCount{Domain: key.(string), Count: value.(int64)})
-		return true
-	})
-
-	// ... (rest of metrics logic same as before) ...
-
-	// Simplifying for brevity in this replace block, need to include the full logic or ensure I don't lose it.
-	// The prompt says "ReplacementContent" must be a complete drop-in.
-	// I will copy the metrics logic from the original file I read.
-
-	var topLatencyDomains []metrics.DomainLatency
-	s.metrics.TopLatencyDomains.Range(func(key, value interface{}) bool {
-		stat := value.(metrics.LatencyStat)
-		if stat.Count > 0 {
-			avgLatency := stat.TotalLatency.Seconds() * 1000 / float64(stat.Count)
-			topLatencyDomains = append(topLatencyDomains, metrics.DomainLatency{Domain: key.(string), AvgLatency: avgLatency})
-		}
-		return true
-	})
-
-	var queryTypes []metrics.TypeCount
-	s.metrics.QueryTypes.Range(func(key, value interface{}) bool {
-		queryTypes = append(queryTypes, metrics.TypeCount{Type: key.(string), Count: value.(int64)})
-		return true
-	})
-
-	var responseCodes []metrics.CodeCount
-	s.metrics.ResponseCodes.Range(func(key, value interface{}) bool {
-		responseCodes = append(responseCodes, metrics.CodeCount{Code: key.(string), Count: value.(int64)})
-		return true
-	})
-
-	var cacheHitRate float64
-	if s.metrics.CacheHits+s.metrics.CacheMisses > 0 {
-		cacheHitRate = float64(s.metrics.CacheHits) / float64(s.metrics.CacheHits+s.metrics.CacheMisses) * 100
-	}
-
-	data := metrics.DashboardMetrics{
-		QPS:               s.metrics.QPS,
-		TotalQueries:      s.metrics.GetQueries(),
-		BlockedDomains:    s.metrics.BlockedDomains,
-		CPUUsage:          s.metrics.CPUUsage,
-		MemoryUsage:       s.metrics.MemoryUsage,
-		Goroutines:        s.metrics.Goroutines,
-		CacheHits:         s.metrics.CacheHits,
-		CacheMisses:       s.metrics.CacheMisses,
-		CacheHitRate:      cacheHitRate,
-		TopNXDomains:      topNXDomains,
-		TopLatencyDomains: topLatencyDomains,
-		QueryTypes:        queryTypes,
-		ResponseCodes:     responseCodes,
-	}
-
-	if err := json.NewEncoder(w).Encode(data); err != nil {
+	if err := json.NewEncoder(w).Encode(s.metrics.SnapshotDashboard()); err != nil {
 		log.Printf("Error encoding metrics to JSON: %v", err)
 	}
 }
@@ -356,7 +242,9 @@ func (s *Server) saveConfig() error {
 		}
 	}
 
-	cfg.AdblockListURLs = s.adblock.GetBlocklists()
+	if s.adblock != nil {
+		cfg.AdblockListURLs = s.adblock.GetBlocklists()
+	}
 
 	if err := cfg.Save(s.configPath); err != nil {
 		return fmt.Errorf("failed to save config: %v", err)
