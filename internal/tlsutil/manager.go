@@ -2,8 +2,10 @@ package tlsutil
 
 import (
 	"crypto/tls"
+	"fmt"
 	"log"
 	"net/http"
+	"strings"
 
 	"dns-resolver/internal/config"
 
@@ -47,11 +49,8 @@ func (m *TLSManager) GetTLSConfig() (*tls.Config, error) {
 		}, nil
 	}
 
-	// Legacy / Static File Mode
 	certFile := m.Config.CertFile
 	keyFile := m.Config.KeyFile
-
-	// Default to local files if not specified, matching old logic
 	if certFile == "" {
 		certFile = "cert.pem"
 	}
@@ -59,25 +58,53 @@ func (m *TLSManager) GetTLSConfig() (*tls.Config, error) {
 		keyFile = "key.pem"
 	}
 
-	// Ensure certificates exist (generate self-signed if needed)
-	// We use the existing helper in this package.
-	// Defaults for self-signed: localhost, etc.
+	preferredDomain := ""
+	for _, domain := range m.Config.AcmeDomains {
+		if d := strings.TrimSpace(domain); d != "" {
+			preferredDomain = d
+			break
+		}
+	}
+
+	cert, selected, err := loadBestStaticTLSPair(m.Config, certFile, keyFile, preferredDomain)
+	if err == nil {
+		if selected.CertPath != certFile || selected.KeyPath != keyFile {
+			if syncErr := syncStaticTLSPair(certFile, keyFile, selected.CertPath, selected.KeyPath); syncErr != nil {
+				log.Printf("Warning: TLS auto-repair found a valid pair (%s, %s) but failed to sync to configured paths (%s, %s): %v",
+					selected.CertPath, selected.KeyPath, certFile, keyFile, syncErr)
+			} else {
+				log.Printf("TLS auto-repair applied: %s + %s -> %s + %s",
+					selected.CertPath, selected.KeyPath, certFile, keyFile)
+			}
+		}
+		return staticTLSConfig(cert), nil
+	}
+
+	log.Printf("Warning: no valid static TLS pair found for cert=%s key=%s: %v", certFile, keyFile, err)
+
+	// Fallback: generate self-signed certificate to keep DoT/DoH available.
 	hosts := []string{"astracat.dns", "localhost", "127.0.0.1", "::1"}
-	if err := EnsureCertificate(certFile, keyFile, hosts); err != nil {
-		log.Printf("Warning: Failed to ensure/generate certificates: %v", err)
-		// Proceeding, LoadX509KeyPair will likely fail if they don't exist
+	if preferredDomain != "" {
+		hosts = append([]string{preferredDomain}, hosts...)
+	}
+	if ensureErr := EnsureCertificate(certFile, keyFile, hosts); ensureErr != nil {
+		log.Printf("Warning: failed to ensure/generate fallback certificates: %v", ensureErr)
 	}
 
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, err
+	cert, loadErr := tls.LoadX509KeyPair(certFile, keyFile)
+	if loadErr != nil {
+		return nil, fmt.Errorf("failed to load TLS key pair from %s and %s: %w", certFile, keyFile, loadErr)
 	}
+	log.Printf("Warning: using fallback self-signed certificate at %s (key: %s)", certFile, keyFile)
+	return staticTLSConfig(cert), nil
+}
 
+func staticTLSConfig(cert tls.Certificate) *tls.Config {
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
 		NextProtos:   []string{"h2", "http/1.1"},
-	}, nil
+	}
 }
 
 // StartHTTPChallengeServer starts the HTTP server for ACME challenges and redirects.
@@ -87,10 +114,8 @@ func (m *TLSManager) StartHTTPChallengeServer() {
 		return
 	}
 
-	// Determine address. ACME requires port 80.
-	addr := ":80"
+	addr := ":80" // ACME requires port 80.
 
-	// Redirect handler: Redirects all non-ACME traffic to HTTPS
 	redirectHandler := func(w http.ResponseWriter, r *http.Request) {
 		target := "https://" + r.Host + r.URL.Path
 		if len(r.URL.RawQuery) > 0 {
@@ -101,8 +126,6 @@ func (m *TLSManager) StartHTTPChallengeServer() {
 
 	log.Printf("Starting HTTP Challenge Server on %s", addr)
 	go func() {
-		// manager.HTTPHandler configures the challenge handler.
-		// The fallback handler is our redirectHandler.
 		err := http.ListenAndServe(addr, m.AcmeManager.HTTPHandler(http.HandlerFunc(redirectHandler)))
 		if err != nil {
 			log.Printf("Error starting HTTP Challenge Server: %v", err)
