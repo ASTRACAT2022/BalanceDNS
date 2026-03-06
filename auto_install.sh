@@ -6,6 +6,9 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 INSTALL_DIR="/opt/astracatdns"
 BINARY_NAME="dns-resolver"
 ROOT_ANCHOR="/var/lib/unbound/root.key"
+DEPLOY_HELPER="/usr/local/bin/astracat-deploy"
+STATE_DIR="/etc/astracatdns"
+SOURCE_FILE="${STATE_DIR}/source_dir"
 GO_BIN=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,6 +44,7 @@ install_deps() {
       curl \
       wget \
       tar \
+      rsync \
       build-essential \
       pkg-config \
       libunbound-dev \
@@ -56,6 +60,7 @@ install_deps() {
       curl \
       wget \
       tar \
+      rsync \
       gcc \
       gcc-c++ \
       make \
@@ -135,6 +140,12 @@ prepare_install_dir() {
   fi
 }
 
+write_runtime_state() {
+  mkdir -p "${STATE_DIR}"
+  printf '%s\n' "${PROJECT_DIR}" > "${SOURCE_FILE}"
+  chmod 0644 "${SOURCE_FILE}" || true
+}
+
 build_binary() {
   log "Building project"
   cd "${INSTALL_DIR}"
@@ -187,6 +198,74 @@ WantedBy=multi-user.target
 EOF
 }
 
+install_deploy_helper() {
+  log "Installing deploy helper at ${DEPLOY_HELPER}"
+  cat > "${DEPLOY_HELPER}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVICE_NAME="${SERVICE_NAME}"
+INSTALL_DIR="${INSTALL_DIR}"
+BINARY_NAME="${BINARY_NAME}"
+SOURCE_FILE="${SOURCE_FILE}"
+
+log() { printf '[DEPLOY] %s\n' "\$*"; }
+err() { printf '[DEPLOY][ERR] %s\n' "\$*" >&2; }
+
+if [[ "\${EUID}" -ne 0 ]]; then
+  err "Run as root: sudo astracat-deploy"
+  exit 1
+fi
+
+if [[ -d "\${INSTALL_DIR}/.git" ]]; then
+  log "Git repository detected in \${INSTALL_DIR}, pulling main..."
+  git -C "\${INSTALL_DIR}" fetch origin
+  git -C "\${INSTALL_DIR}" checkout main
+  git -C "\${INSTALL_DIR}" pull --ff-only origin main
+else
+  SRC_DIR=""
+  if [[ -f "\${SOURCE_FILE}" ]]; then
+    SRC_DIR="\$(tr -d '\n' < "\${SOURCE_FILE}")"
+  fi
+  if [[ -z "\${SRC_DIR}" || ! -d "\${SRC_DIR}" ]]; then
+    err "Source directory is not configured or missing. Expected in \${SOURCE_FILE}."
+    exit 1
+  fi
+  if [[ "\${SRC_DIR}" == "\${INSTALL_DIR}" ]]; then
+    log "Source and install directories are identical, skipping sync step."
+  else
+    log "Syncing source from \${SRC_DIR} -> \${INSTALL_DIR}"
+    if command -v rsync >/dev/null 2>&1; then
+      rsync -a --delete --exclude '.git' --exclude '.github' --exclude '.DS_Store' "\${SRC_DIR}/" "\${INSTALL_DIR}/"
+    else
+      cp -a "\${SRC_DIR}/." "\${INSTALL_DIR}/"
+      rm -rf "\${INSTALL_DIR}/.git" "\${INSTALL_DIR}/.github"
+    fi
+  fi
+fi
+
+GO_BIN="\$(command -v go || true)"
+if [[ -z "\${GO_BIN}" && -x /usr/local/go/bin/go ]]; then
+  GO_BIN="/usr/local/go/bin/go"
+fi
+if [[ -z "\${GO_BIN}" ]]; then
+  err "go compiler is not installed"
+  exit 1
+fi
+
+log "Building \${BINARY_NAME} in \${INSTALL_DIR}"
+cd "\${INSTALL_DIR}"
+"\${GO_BIN}" clean -cache
+CGO_ENABLED=1 "\${GO_BIN}" build -a -o "\${INSTALL_DIR}/\${BINARY_NAME}" .
+
+log "Restarting \${SERVICE_NAME}"
+systemctl restart "\${SERVICE_NAME}"
+systemctl --no-pager --full status "\${SERVICE_NAME}" || true
+journalctl -u "\${SERVICE_NAME}" -n 20 --no-pager || true
+EOF
+  chmod 0755 "${DEPLOY_HELPER}"
+}
+
 start_service() {
   log "Reloading systemd and starting ${SERVICE_NAME}"
   systemctl daemon-reload
@@ -201,11 +280,14 @@ main() {
   install_deps
   ensure_go
   prepare_install_dir
+  write_runtime_state
   build_binary
   ensure_root_anchor
   write_service
+  install_deploy_helper
   start_service
   log "Done. Service '${SERVICE_NAME}' is installed."
+  log "Use 'sudo astracat-deploy' for safe updates and restarts."
 }
 
 main "$@"
