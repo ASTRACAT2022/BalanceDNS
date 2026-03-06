@@ -173,15 +173,33 @@ func responseFromResult(question dns.Question, result *ub.Result) (*dns.Msg, err
 	if result == nil {
 		return nil, fmt.Errorf("unbound returned empty result")
 	}
+	if result.Bogus {
+		msg := new(dns.Msg)
+		msg.MsgHdr.Response = true
+		msg.RecursionAvailable = true
+		msg.Question = []dns.Question{question}
+		msg.Rcode = dns.RcodeServerFailure
+		msg.AuthenticatedData = false
+		if result.WhyBogus != "" {
+			log.Printf("Unbound bogus DNSSEC response for %s type=%s: %s", question.Name, dns.TypeToString[question.Qtype], result.WhyBogus)
+		}
+		return msg, nil
+	}
 
 	if result.AnswerPacket != nil {
 		msg := result.AnswerPacket.Copy()
 		msg.MsgHdr.Response = true
 		msg.RecursionAvailable = true
 		msg.Question = []dns.Question{question}
-		msg.Rcode = result.Rcode
-		if result.Secure {
+		if result.NxDomain {
+			msg.Rcode = dns.RcodeNameError
+		} else if msg.Rcode == dns.RcodeSuccess && result.Rcode != dns.RcodeSuccess {
+			msg.Rcode = result.Rcode
+		}
+		if result.Secure && !result.Bogus {
 			msg.AuthenticatedData = true
+		} else {
+			msg.AuthenticatedData = false
 		}
 		return msg, nil
 	}
@@ -191,8 +209,12 @@ func responseFromResult(question dns.Question, result *ub.Result) (*dns.Msg, err
 	msg.MsgHdr.Response = true
 	msg.RecursionAvailable = true
 	msg.Question = []dns.Question{question}
-	msg.Rcode = result.Rcode
-	msg.AuthenticatedData = result.Secure
+	if result.NxDomain {
+		msg.Rcode = dns.RcodeNameError
+	} else {
+		msg.Rcode = result.Rcode
+	}
+	msg.AuthenticatedData = result.Secure && !result.Bogus
 	if len(result.Rr) > 0 {
 		msg.Answer = append(msg.Answer, result.Rr...)
 	}
@@ -205,6 +227,7 @@ func configureUnbound(u *ub.Unbound, opts Options) error {
 		value    string
 		required bool
 	}{
+		{"module-config", "validator iterator", false},
 		{"verbosity", "0", false},
 		{"do-ip4", "yes", false},
 		{"do-ip6", "yes", false},
@@ -214,6 +237,7 @@ func configureUnbound(u *ub.Unbound, opts Options) error {
 		{"harden-glue", "yes", false},
 		{"harden-dnssec-stripped", "yes", false},
 		{"harden-algo-downgrade", "yes", false},
+		{"val-permissive-mode", "no", false},
 		{"use-caps-for-id", "yes", false},
 		{"auto-trust-anchor-file", opts.RootAnchorPath, true},
 		{"val-clean-additional", "yes", false},

@@ -66,3 +66,52 @@ func TestResponseFromResult_UsesAnswerPacket(t *testing.T) {
 		t.Fatalf("unexpected qname: %s", msg.Question[0].Name)
 	}
 }
+
+func TestResponseFromResult_BogusForcesSERVFAIL(t *testing.T) {
+	q := dns.Question{Name: "dnssec-failed.org.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	packet := new(dns.Msg)
+	packet.SetQuestion(q.Name, q.Qtype)
+	rr, err := dns.NewRR("dnssec-failed.org. 60 IN A 96.99.227.255")
+	if err != nil {
+		t.Fatalf("failed to build rr: %v", err)
+	}
+	packet.Answer = []dns.RR{rr}
+
+	res := &ub.Result{
+		AnswerPacket: packet,
+		Rcode:        dns.RcodeSuccess,
+		Bogus:        true,
+		WhyBogus:     "signature verification failed",
+	}
+
+	msg, err := responseFromResult(q, res)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if msg.Rcode != dns.RcodeServerFailure {
+		t.Fatalf("expected SERVFAIL for bogus answer, got %s", dns.RcodeToString[msg.Rcode])
+	}
+	if msg.AuthenticatedData {
+		t.Fatal("expected AD to be false for bogus answer")
+	}
+}
+
+func TestResponseFromResult_NxDomainOverridesNoError(t *testing.T) {
+	q := dns.Question{Name: "missing.example.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	res := &ub.Result{
+		Qname:    q.Name,
+		Qtype:    q.Qtype,
+		Qclass:   q.Qclass,
+		HaveData: false,
+		NxDomain: true,
+		Rcode:    dns.RcodeSuccess,
+	}
+
+	msg, err := responseFromResult(q, res)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if msg.Rcode != dns.RcodeNameError {
+		t.Fatalf("expected NXDOMAIN, got %s", dns.RcodeToString[msg.Rcode])
+	}
+}
