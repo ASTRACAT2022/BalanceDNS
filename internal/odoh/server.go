@@ -59,6 +59,7 @@ func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.
 		Client: &dns.Client{
 			Net:     "udp",
 			Timeout: 2 * time.Second,
+			UDPSize: 1232,
 		},
 	}, nil
 }
@@ -373,8 +374,10 @@ func (s *Server) resolveDNSMessage(reqMsg *dns.Msg) (*dns.Msg, string, error) {
 		}
 	}
 
+	ensureEDNS(reqMsg)
+
 	startTime := time.Now()
-	respMsg, _, err := s.Client.Exchange(reqMsg, s.UpstreamTarget)
+	respMsg, err := s.exchangeUpstream(reqMsg)
 	if err != nil {
 		if s.Metrics != nil {
 			s.Metrics.IncrementUnboundErrors()
@@ -387,6 +390,55 @@ func (s *Server) resolveDNSMessage(reqMsg *dns.Msg) (*dns.Msg, string, error) {
 	}
 	s.recordResponseCodeMetrics(question.Name, respMsg.Rcode)
 	return respMsg, "resolved", nil
+}
+
+func (s *Server) exchangeUpstream(reqMsg *dns.Msg) (*dns.Msg, error) {
+	udpClient := s.Client
+	if udpClient == nil {
+		udpClient = &dns.Client{Net: "udp", Timeout: 2 * time.Second, UDPSize: 1232}
+	}
+
+	respMsg, _, err := udpClient.Exchange(reqMsg.Copy(), s.UpstreamTarget)
+	if err == nil {
+		if respMsg != nil && respMsg.Truncated {
+			return s.exchangeUpstreamTCP(reqMsg)
+		}
+		return respMsg, nil
+	}
+
+	// Some large answers fail in UDP unpack path; fallback to TCP.
+	if shouldFallbackTCPOnUpstreamError(err) {
+		return s.exchangeUpstreamTCP(reqMsg)
+	}
+	return nil, err
+}
+
+func (s *Server) exchangeUpstreamTCP(reqMsg *dns.Msg) (*dns.Msg, error) {
+	tcpClient := &dns.Client{Net: "tcp", Timeout: 3 * time.Second}
+	respMsg, _, err := tcpClient.Exchange(reqMsg.Copy(), s.UpstreamTarget)
+	if err != nil {
+		return nil, err
+	}
+	return respMsg, nil
+}
+
+func ensureEDNS(msg *dns.Msg) {
+	if msg == nil {
+		return
+	}
+	if msg.IsEdns0() == nil {
+		msg.SetEdns0(1232, true)
+	}
+}
+
+func shouldFallbackTCPOnUpstreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "buffer size too small") ||
+		strings.Contains(msg, "overflow") ||
+		strings.Contains(msg, "truncated")
 }
 
 func (s *Server) recordResponseCodeMetrics(qName string, rcode int) {

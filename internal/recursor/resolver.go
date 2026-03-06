@@ -2,7 +2,9 @@ package recursor
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"runtime"
 	"sort"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dgraph-io/ristretto"
+	"github.com/domainr/dnsr"
 	"github.com/miekg/dns"
 	"golang.org/x/sync/singleflight"
 )
@@ -54,6 +57,7 @@ type Resolver struct {
 	rootServers []string
 	next        atomic.Uint64
 	cache       *ristretto.Cache
+	fallback    *dnsr.Resolver
 	sf          singleflight.Group
 	trustedDS   []*dns.DS
 }
@@ -95,7 +99,12 @@ func NewResolverWithOptions(opts Options) (*Resolver, error) {
 		opts:        opts,
 		rootServers: roots,
 		cache:       c,
-		trustedDS:   trustDS,
+		fallback: dnsr.NewResolver(
+			dnsr.WithCache(10000),
+			dnsr.WithTimeout(opts.ResolveTimeout),
+			dnsr.WithTCPRetry(),
+		),
+		trustedDS: trustDS,
 	}, nil
 }
 
@@ -118,21 +127,33 @@ func (r *Resolver) Resolve(question dns.Question) (*dns.Msg, error) {
 
 		guard := map[string]int{}
 		resp, err := r.resolveIterative(ctx, q, r.rootServers, 0, guard)
+		usedFallback := false
 		if err != nil {
-			return nil, err
+			fallbackResp, fbErr := r.resolveWithFallbackDNSR(ctx, q)
+			if fbErr != nil {
+				return nil, err
+			}
+			resp = fallbackResp
+			usedFallback = true
+			log.Printf("Resolver fallback(dnsr) used for %s type=%d after iterative error: %v", q.Name, q.Qtype, err)
 		}
 		if resp == nil {
 			return nil, fmt.Errorf("empty resolver response")
 		}
 		if r.opts.ValidateDNSSEC {
-			status, valErr := r.validateResponseDNSSEC(ctx, q, resp)
-			if valErr != nil {
-				if r.opts.DNSSECFailClosed {
-					return nil, fmt.Errorf("dnssec validation failed for %s: %w", q.Name, valErr)
-				}
+			if usedFallback {
+				// dnsr fallback responses are not DNSSEC-validated.
 				resp.AuthenticatedData = false
 			} else {
-				resp.AuthenticatedData = status == dnssecStatusSecure
+				status, valErr := r.validateResponseDNSSEC(ctx, q, resp)
+				if valErr != nil {
+					if r.opts.DNSSECFailClosed {
+						return nil, fmt.Errorf("dnssec validation failed for %s: %w", q.Name, valErr)
+					}
+					resp.AuthenticatedData = false
+				} else {
+					resp.AuthenticatedData = status == dnssecStatusSecure
+				}
 			}
 		}
 		if shouldCacheResponse(resp, q) {
@@ -225,6 +246,10 @@ func (r *Resolver) resolveIterative(ctx context.Context, q dns.Question, servers
 		}
 
 		if resp.Rcode == dns.RcodeNameError {
+			if !resp.Authoritative && !hasSOAInAuthority(resp) {
+				lastErr = errors.New("non-authoritative NXDOMAIN ignored")
+				continue
+			}
 			if shouldCacheResponse(resp, q) {
 				r.setCached(q, resp)
 			}
@@ -336,18 +361,64 @@ func (r *Resolver) exchange(ctx context.Context, server string, query *dns.Msg) 
 	addr := normalizeServerAddr(server)
 
 	udpClient := &dns.Client{Net: "udp", Timeout: r.opts.QueryTimeout}
-	resp, _, err := udpClient.ExchangeContext(ctx, query.Copy(), addr)
-	if err != nil {
-		return nil, err
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		resp, _, err := udpClient.ExchangeContext(ctx, query.Copy(), addr)
+		if err == nil {
+			if resp != nil && resp.Truncated {
+				tcpResp, tcpErr := r.exchangeTCP(ctx, addr, query)
+				if tcpErr == nil && tcpResp != nil {
+					return tcpResp, nil
+				}
+			}
+			return resp, nil
+		}
+		lastErr = err
+		if !isRetriableExchangeError(err) {
+			break
+		}
 	}
-	if resp != nil && resp.Truncated {
-		tcpClient := &dns.Client{Net: "tcp", Timeout: r.opts.QueryTimeout}
-		tcpResp, _, tcpErr := tcpClient.ExchangeContext(ctx, query.Copy(), addr)
+
+	if shouldFallbackToTCPOnError(lastErr) {
+		tcpResp, tcpErr := r.exchangeTCP(ctx, addr, query)
 		if tcpErr == nil && tcpResp != nil {
 			return tcpResp, nil
 		}
+		if tcpErr != nil {
+			lastErr = tcpErr
+		}
 	}
-	return resp, nil
+	return nil, lastErr
+}
+
+func (r *Resolver) exchangeTCP(ctx context.Context, addr string, query *dns.Msg) (*dns.Msg, error) {
+	tcpClient := &dns.Client{Net: "tcp", Timeout: r.opts.QueryTimeout}
+	tcpResp, _, tcpErr := tcpClient.ExchangeContext(ctx, query.Copy(), addr)
+	if tcpErr != nil {
+		return nil, tcpErr
+	}
+	return tcpResp, nil
+}
+
+func isRetriableExchangeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if nerr, ok := err.(net.Error); ok {
+		return nerr.Timeout() || nerr.Temporary()
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "timeout") || strings.Contains(msg, "temporary")
+}
+
+func shouldFallbackToTCPOnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "buffer size too small") ||
+		strings.Contains(msg, "overflow") ||
+		strings.Contains(msg, "truncated")
 }
 
 func (r *Resolver) getCached(q dns.Question) (*dns.Msg, bool) {
@@ -375,7 +446,8 @@ func (r *Resolver) setCached(q dns.Question, resp *dns.Msg) {
 	}
 	cpy := resp.Copy()
 	if r.cache.SetWithTTL(cacheKey(q), cpy, 1, ttl) {
-		r.cache.Wait()
+		// Intentionally do not block on Wait(); cache writes are async.
+		// Blocking here hurts throughput under load.
 	}
 }
 
@@ -548,6 +620,123 @@ func isAuthoritativeNoData(resp *dns.Msg) bool {
 		}
 	}
 	return false
+}
+
+func hasSOAInAuthority(resp *dns.Msg) bool {
+	if resp == nil {
+		return false
+	}
+	for _, rr := range resp.Ns {
+		if rr.Header() != nil && rr.Header().Rrtype == dns.TypeSOA {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Resolver) resolveWithFallbackDNSR(ctx context.Context, q dns.Question) (*dns.Msg, error) {
+	if r.fallback == nil {
+		return nil, fmt.Errorf("dnsr fallback not initialized")
+	}
+
+	qtype := dns.TypeToString[q.Qtype]
+	if qtype == "" {
+		qtype = "A"
+	}
+
+	rrs, err := r.fallback.ResolveContext(ctx, q.Name, qtype)
+	if err != nil {
+		if errors.Is(err, dnsr.NXDOMAIN) {
+			msg := new(dns.Msg)
+			msg.MsgHdr.Response = true
+			msg.RecursionAvailable = true
+			msg.Authoritative = true
+			msg.Rcode = dns.RcodeNameError
+			msg.Question = []dns.Question{q}
+			return msg, nil
+		}
+		return nil, err
+	}
+
+	msg := new(dns.Msg)
+	msg.MsgHdr.Response = true
+	msg.RecursionAvailable = true
+	msg.Rcode = dns.RcodeSuccess
+	msg.Question = []dns.Question{q}
+
+	for _, rr := range rrs {
+		dnsRR, ok := convertDNSRRFromDNSR(rr)
+		if !ok || dnsRR == nil || dnsRR.Header() == nil {
+			continue
+		}
+		if strings.EqualFold(dnsRR.Header().Name, q.Name) {
+			if q.Qtype == dns.TypeANY || dnsRR.Header().Rrtype == q.Qtype || dnsRR.Header().Rrtype == dns.TypeCNAME {
+				msg.Answer = append(msg.Answer, dnsRR)
+			}
+		}
+	}
+	return msg, nil
+}
+
+func convertDNSRRFromDNSR(rr dnsr.RR) (dns.RR, bool) {
+	name := dns.Fqdn(strings.TrimSpace(rr.Name))
+	if name == "." {
+		name = rr.Name
+	}
+	if name == "" {
+		return nil, false
+	}
+
+	ttl := uint32(60)
+	if rr.TTL > 0 {
+		ttl = uint32(rr.TTL / time.Second)
+		if ttl == 0 {
+			ttl = 1
+		}
+	}
+
+	h := dns.RR_Header{
+		Name:     name,
+		Class:    dns.ClassINET,
+		Ttl:      ttl,
+		Rdlength: 0,
+	}
+
+	switch strings.ToUpper(strings.TrimSpace(rr.Type)) {
+	case "A":
+		ip := net.ParseIP(strings.TrimSpace(rr.Value)).To4()
+		if ip == nil {
+			return nil, false
+		}
+		h.Rrtype = dns.TypeA
+		return &dns.A{Hdr: h, A: ip}, true
+	case "AAAA":
+		ip := net.ParseIP(strings.TrimSpace(rr.Value))
+		if ip == nil || ip.To16() == nil {
+			return nil, false
+		}
+		h.Rrtype = dns.TypeAAAA
+		return &dns.AAAA{Hdr: h, AAAA: ip}, true
+	case "CNAME":
+		h.Rrtype = dns.TypeCNAME
+		return &dns.CNAME{Hdr: h, Target: dns.Fqdn(rr.Value)}, true
+	case "NS":
+		h.Rrtype = dns.TypeNS
+		return &dns.NS{Hdr: h, Ns: dns.Fqdn(rr.Value)}, true
+	case "TXT":
+		h.Rrtype = dns.TypeTXT
+		parts := strings.Split(rr.Value, "\t")
+		if len(parts) == 0 {
+			parts = []string{rr.Value}
+		}
+		return &dns.TXT{Hdr: h, Txt: parts}, true
+	default:
+		parsed, err := dns.NewRR(rr.String())
+		if err != nil {
+			return nil, false
+		}
+		return parsed, true
+	}
 }
 
 func extractNSHostnames(resp *dns.Msg) []string {
