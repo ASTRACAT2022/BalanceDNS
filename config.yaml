@@ -1,0 +1,203 @@
+# AstracatDNS Configuration
+
+# ------------------------------------------------------------------------------
+# Network Settings
+# ------------------------------------------------------------------------------
+# The address and port to listen for standard DNS (UDP/TCP) queries.
+# The address and port to listen for standard DNS (UDP/TCP) queries.
+# Default: 0.0.0.0:53 (Standard DNS port)
+listen_addr: "0.0.0.0:53"
+
+# The address and port for the Prometheus metrics server.
+# Default: 0.0.0.0:9090
+metrics_addr: "0.0.0.0:9090"
+metrics_top_domains_enabled: true
+
+# The address and port for the Admin Panel.
+# Leave empty to disable in public deployments.
+admin_addr: ""
+
+# Admin credentials (required when admin_addr is set).
+admin_username: ""
+admin_password: ""
+
+# ------------------------------------------------------------------------------
+# TLS Settings (DoT / DoH / ODoH)
+# ------------------------------------------------------------------------------
+# To enable DoT/DoH, you MUST provide valid paths to your SSL certificate and key.
+# If these are empty, DoT/DoH/ODoH will be disabled.
+
+# Address for DNS over TLS (DoT)
+# Default: 0.0.0.0:853
+# dot_addr: "0.0.0.0:853"
+
+# Address for Oblivious DoH (ODoH)
+# Default: 0.0.0.0:443
+odoh_addr: "0.0.0.0:443"
+
+# Path to the SSL Certificate file (fullchain.pem)
+cert_file: "./cert.pem"
+
+# Path to the SSL Private Key file (privkey.pem)
+key_file: "./key.pem"
+
+# ACME / Let's Encrypt Configuration
+# ------------------------------------------------------------------------------
+# Set to true to enable automatic certificate generation via Let's Encrypt.
+acme_enabled: false
+
+# Email address for Let's Encrypt registration (required if enabled).
+acme_email: ""
+
+# List of domains to obtain certificates for.
+acme_domains: []
+
+# Directory to store ACME certificates.
+acme_cache_dir: "certs-cache"
+
+# ------------------------------------------------------------------------------
+# Performance & Cache
+# ------------------------------------------------------------------------------
+# Number of worker goroutines for handling requests.
+max_workers: 10
+
+# Cache size in Megabytes (MB) for Knot Resolver.
+cache_size: 1024
+
+# Path to the persistent BoltDB cache file.
+# This allows the cache to survive restarts.
+cache_path: "cache/dns.db"
+
+# Cache TTL settings (in seconds/duration)
+cache_min_ttl: 60s
+cache_max_ttl: 1h
+
+# Stale-While-Revalidate: How long to serve expired items while fetching fresh ones in the background.
+stale_while_revalidate: 1m
+
+# Resolving backend:
+# - "recursor" or "knot": built-in Go recursor (default)
+# - "unbound": miekg/unbound backend (requires binary built with: CGO_ENABLED=1 and -tags unbound)
+resolver_type: "knot"
+
+# Path to the DNSSEC root trust anchor for Unbound.
+root_anchor_path: "/var/lib/unbound/root.key"
+
+# Unbound recursion performance tuning
+# 0 = auto (2..16 workers based on CPU)
+resolver_workers: 0
+unbound_msg_cache_size: "64m"
+unbound_rrset_cache_size: "128m"
+unbound_key_cache_size: "64m"
+unbound_prefetch: true
+unbound_serve_expired: true
+unbound_disable_cache: false
+
+# Built-in recursor tuning
+# Empty list means built-in defaults (root hints in code).
+recursor_root_servers: []
+recursor_cache_entries: 200000
+recursor_cache_min_ttl: 5s
+recursor_cache_max_ttl: 30m
+dnssec_validate: true
+dnssec_fail_closed: true
+# Optional DS trust anchors in RR format. Empty => built-in root trust anchor.
+dnssec_trust_anchors: []
+
+# ------------------------------------------------------------------------------
+# Security / Attack Protection
+# ------------------------------------------------------------------------------
+# Global and per-client protections against burst attacks, abuse, and amplification.
+attack_protection_enabled: true
+max_global_inflight: 4096
+max_qps_per_ip: 300
+rate_limit_burst_per_ip: 600
+max_concurrent_per_ip: 200
+max_questions_per_request: 1
+max_qname_length: 253
+drop_any_queries: true
+reuse_port: false
+reuse_addr: false
+
+# ------------------------------------------------------------------------------
+# Flexible Policy Engine (Block / Rewrite / Load Balance)
+# ------------------------------------------------------------------------------
+policy_engine_enabled: true
+
+# Block exact domains or wildcard suffixes.
+policy_blocked_domains: []
+# Example:
+# policy_blocked_domains:
+#   - "bad.example"
+#   - "*.tracking.example"
+
+# Static rewrite rules (Type: A/AAAA/CNAME/TXT).
+policy_rewrite_rules: []
+# Example:
+# policy_rewrite_rules:
+#   - domain: "internal.api.local"
+#     type: "A"
+#     value: "10.10.10.5"
+#     ttl: 120
+
+# DNS response load balancing rules (Type: A/AAAA, Strategy: round_robin).
+policy_load_balancers: []
+# Example:
+# policy_load_balancers:
+#   - domain: "app.service.local"
+#     type: "A"
+#     strategy: "round_robin"
+#     ttl: 30
+#     targets:
+#       - value: "10.20.0.11"
+#         weight: 2
+#       - value: "10.20.0.12"
+#         weight: 1
+
+# ------------------------------------------------------------------------------
+# Plugins
+# ------------------------------------------------------------------------------
+
+# Hosts Plugin: Allows overriding domains via a local hosts file.
+hosts_enabled: true
+hosts_path: "hosts"
+
+# AdBlock Plugin: Blocks domains matching the provided lists.
+adblock_enabled: true
+adblock_list_urls:
+  - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+  # Add more lists here
+
+# ------------------------------------------------------------------------------
+# dnsdist Compatibility Policy Layer
+# ------------------------------------------------------------------------------
+# Enables dnsdist-like policy actions for recursive mode.
+dnsdist_compat_enabled: false
+dnsdist_compat_log_all: false
+
+# Source files (same shape as dnsdist Lua example)
+dnsdist_compat_banned_ips_path: "/etc/dnsdist/banned_ips.txt"
+dnsdist_compat_sni_proxy_ips_path: "/etc/dnsdist/sni_proxy_ips.txt"
+dnsdist_compat_domains_with_subdomains_path: "/etc/dnsdist/domains_with_subdomains.txt"
+dnsdist_compat_custom_path: "/etc/dnsdist/custom.txt"
+dnsdist_compat_domains_path: "/etc/dnsdist/domains.txt"
+dnsdist_compat_hosts_path: "/etc/dnsdist/hosts.txt"
+dnsdist_compat_garbage_path: "/etc/dnsdist/garbage.txt"
+
+# Early and late drop suffix groups (QNameSuffixRule equivalent)
+dnsdist_compat_drop_suffixes:
+  - "dhitc.com"
+  - "whoami.akamai.net"
+dnsdist_compat_late_drop_suffixes:
+  - "googlesyndication.com"
+  - "adcolony.com"
+  - "hotjar.com"
+  - "mouseflow.com"
+  - "freshmarketer.com"
+  - "luckyorange.com"
+  - "bugsnag.com"
+  - "samsungads.com"
+  - "doubleclick.net"
+  - "media.net"
+  - "sentry.com"
+  - "sentry.io"
