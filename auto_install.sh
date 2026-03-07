@@ -211,6 +211,8 @@ SERVICE_NAME="${SERVICE_NAME}"
 INSTALL_DIR="${INSTALL_DIR}"
 BINARY_NAME="${BINARY_NAME}"
 SOURCE_FILE="${SOURCE_FILE}"
+BACKUP_DIR="/var/backups/astracatdns"
+CONFIG_FILE="\${INSTALL_DIR}/config.yaml"
 
 log() { printf '[DEPLOY] %s\n' "\$*"; }
 err() { printf '[DEPLOY][ERR] %s\n' "\$*" >&2; }
@@ -218,6 +220,21 @@ err() { printf '[DEPLOY][ERR] %s\n' "\$*" >&2; }
 if [[ "\${EUID}" -ne 0 ]]; then
   err "Run as root: sudo astracat-deploy"
   exit 1
+fi
+
+mkdir -p "\${BACKUP_DIR}"
+TS="\$(date +%Y%m%d-%H%M%S)"
+CONFIG_BACKUP=""
+BINARY_BACKUP=""
+if [[ -f "\${CONFIG_FILE}" ]]; then
+  CONFIG_BACKUP="\${BACKUP_DIR}/config-\${TS}.yaml"
+  cp -a "\${CONFIG_FILE}" "\${CONFIG_BACKUP}"
+  log "Backed up config: \${CONFIG_BACKUP}"
+fi
+if [[ -x "\${INSTALL_DIR}/\${BINARY_NAME}" ]]; then
+  BINARY_BACKUP="\${BACKUP_DIR}/\${BINARY_NAME}-\${TS}"
+  cp -a "\${INSTALL_DIR}/\${BINARY_NAME}" "\${BINARY_BACKUP}"
+  log "Backed up binary: \${BINARY_BACKUP}"
 fi
 
 if [[ -d "\${INSTALL_DIR}/.git" ]]; then
@@ -247,6 +264,11 @@ else
   fi
 fi
 
+if [[ -n "\${CONFIG_BACKUP}" ]]; then
+  cp -a "\${CONFIG_BACKUP}" "\${CONFIG_FILE}"
+  log "Restored production config into \${CONFIG_FILE}"
+fi
+
 GO_BIN="\$(command -v go || true)"
 if [[ -z "\${GO_BIN}" && -x /usr/local/go/bin/go ]]; then
   GO_BIN="/usr/local/go/bin/go"
@@ -259,7 +281,9 @@ fi
 log "Building \${BINARY_NAME} in \${INSTALL_DIR}"
 cd "\${INSTALL_DIR}"
 "\${GO_BIN}" clean -cache
-CGO_ENABLED=1 "\${GO_BIN}" build -a -o "\${INSTALL_DIR}/\${BINARY_NAME}" .
+TMP_BIN="\${INSTALL_DIR}/\${BINARY_NAME}.new"
+CGO_ENABLED=1 "\${GO_BIN}" build -a -o "\${TMP_BIN}" .
+mv -f "\${TMP_BIN}" "\${INSTALL_DIR}/\${BINARY_NAME}"
 
 if command -v astracat-fix-tls >/dev/null 2>&1; then
   log "Repairing TLS cert/key config automatically"
@@ -267,7 +291,19 @@ if command -v astracat-fix-tls >/dev/null 2>&1; then
 fi
 
 log "Restarting \${SERVICE_NAME}"
-systemctl restart "\${SERVICE_NAME}"
+if ! systemctl restart "\${SERVICE_NAME}" || ! systemctl is-active --quiet "\${SERVICE_NAME}"; then
+  err "Restart failed, rolling back binary/config"
+  if [[ -n "\${BINARY_BACKUP}" && -f "\${BINARY_BACKUP}" ]]; then
+    cp -a "\${BINARY_BACKUP}" "\${INSTALL_DIR}/\${BINARY_NAME}"
+  fi
+  if [[ -n "\${CONFIG_BACKUP}" && -f "\${CONFIG_BACKUP}" ]]; then
+    cp -a "\${CONFIG_BACKUP}" "\${CONFIG_FILE}"
+  fi
+  systemctl restart "\${SERVICE_NAME}" || true
+  systemctl --no-pager --full status "\${SERVICE_NAME}" || true
+  journalctl -u "\${SERVICE_NAME}" -n 50 --no-pager || true
+  exit 1
+fi
 systemctl --no-pager --full status "\${SERVICE_NAME}" || true
 journalctl -u "\${SERVICE_NAME}" -n 20 --no-pager || true
 EOF

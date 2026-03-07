@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,6 +62,8 @@ func (p *Proxy) Start() error {
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
 		IdleTimeout:  func() time.Duration { return 30 * time.Second },
+		ReusePort:    p.opts.ReusePort,
+		ReuseAddr:    p.opts.ReuseAddr,
 	}
 	go func() {
 		log.Printf("Starting DNS Proxy (TCP) on %s", p.Addr)
@@ -77,6 +80,8 @@ func (p *Proxy) Start() error {
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
 		UDPSize:      1232,
+		ReusePort:    p.opts.ReusePort,
+		ReuseAddr:    p.opts.ReuseAddr,
 	}
 	log.Printf("Starting DNS Proxy (UDP) on %s", p.Addr)
 	if err := udpServer.ListenAndServe(); err != nil {
@@ -197,7 +202,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 	// Record basic stats if metrics enabled.
 	if p.Metrics != nil {
 		qName := question.Name
-		qType := dns.TypeToString[question.Qtype]
+		qType := qtypeToText(question.Qtype)
 		p.Metrics.IncrementQueries(qName)
 		p.Metrics.RecordQueryType(qType)
 	}
@@ -225,7 +230,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 	// 1. Check Policy Cache
 	var decision *cache.Decision
 	var found bool
-	cacheKey := fmt.Sprintf("%d:%s", question.Qtype, question.Name)
+	cacheKey := buildDecisionCacheKey(question.Qtype, question.Name)
 
 	if p.Cache != nil {
 		decision, found = p.Cache.Get(cacheKey)
@@ -391,4 +396,19 @@ func extractClientIP(w dns.ResponseWriter) string {
 		}
 	}
 	return "unknown"
+}
+
+func buildDecisionCacheKey(qtype uint16, qname string) string {
+	buf := make([]byte, 0, len(qname)+8)
+	buf = strconv.AppendUint(buf, uint64(qtype), 10)
+	buf = append(buf, ':')
+	buf = append(buf, qname...)
+	return string(buf)
+}
+
+func qtypeToText(qtype uint16) string {
+	if text := dns.TypeToString[qtype]; text != "" {
+		return text
+	}
+	return strconv.FormatUint(uint64(qtype), 10)
 }

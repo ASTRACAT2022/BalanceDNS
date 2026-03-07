@@ -8,6 +8,7 @@ import (
 	"net"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,8 @@ type Resolver struct {
 	fallback    *dnsr.Resolver
 	sf          singleflight.Group
 	trustedDS   []*dns.DS
+	udpClient   *dns.Client
+	tcpClient   *dns.Client
 }
 
 type serverQueryResult struct {
@@ -106,6 +109,8 @@ func NewResolverWithOptions(opts Options) (*Resolver, error) {
 		opts:        opts,
 		rootServers: roots,
 		cache:       c,
+		udpClient:   &dns.Client{Net: "udp", Timeout: opts.QueryTimeout},
+		tcpClient:   &dns.Client{Net: "tcp", Timeout: opts.QueryTimeout},
 		fallback: dnsr.NewResolver(
 			dnsr.WithCache(10000),
 			dnsr.WithTimeout(opts.ResolveTimeout),
@@ -439,10 +444,9 @@ func (r *Resolver) orderServers(servers []string) []string {
 func (r *Resolver) exchange(ctx context.Context, server string, query *dns.Msg) (*dns.Msg, error) {
 	addr := normalizeServerAddr(server)
 
-	udpClient := &dns.Client{Net: "udp", Timeout: r.opts.QueryTimeout}
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
-		resp, _, err := udpClient.ExchangeContext(ctx, query.Copy(), addr)
+		resp, _, err := r.udpClient.ExchangeContext(ctx, query.Copy(), addr)
 		if err == nil {
 			if resp != nil && resp.Truncated {
 				tcpResp, tcpErr := r.exchangeTCP(ctx, addr, query)
@@ -471,8 +475,7 @@ func (r *Resolver) exchange(ctx context.Context, server string, query *dns.Msg) 
 }
 
 func (r *Resolver) exchangeTCP(ctx context.Context, addr string, query *dns.Msg) (*dns.Msg, error) {
-	tcpClient := &dns.Client{Net: "tcp", Timeout: r.opts.QueryTimeout}
-	tcpResp, _, tcpErr := tcpClient.ExchangeContext(ctx, query.Copy(), addr)
+	tcpResp, _, tcpErr := r.tcpClient.ExchangeContext(ctx, query.Copy(), addr)
 	if tcpErr != nil {
 		return nil, tcpErr
 	}
@@ -542,7 +545,14 @@ func (r *Resolver) setCached(q dns.Question, resp *dns.Msg) {
 }
 
 func cacheKey(q dns.Question) string {
-	return fmt.Sprintf("%s|%d|%d", strings.ToLower(q.Name), q.Qtype, q.Qclass)
+	name := strings.ToLower(q.Name)
+	buf := make([]byte, 0, len(name)+24)
+	buf = append(buf, name...)
+	buf = append(buf, '|')
+	buf = strconv.AppendUint(buf, uint64(q.Qtype), 10)
+	buf = append(buf, '|')
+	buf = strconv.AppendUint(buf, uint64(q.Qclass), 10)
+	return string(buf)
 }
 
 func shouldCacheResponse(resp *dns.Msg, q dns.Question) bool {

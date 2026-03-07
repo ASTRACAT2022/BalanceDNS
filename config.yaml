@@ -11,6 +11,7 @@ listen_addr: "0.0.0.0:53"
 # The address and port for the Prometheus metrics server.
 # Default: 0.0.0.0:9090
 metrics_addr: "0.0.0.0:9090"
+metrics_top_domains_enabled: true
 
 # The address and port for the Admin Panel.
 # Leave empty to disable in public deployments.
@@ -115,6 +116,8 @@ max_concurrent_per_ip: 200
 max_questions_per_request: 1
 max_qname_length: 253
 drop_any_queries: true
+reuse_port: false
+reuse_addr: false
 
 # ------------------------------------------------------------------------------
 # Flexible Policy Engine (Block / Rewrite / Load Balance)

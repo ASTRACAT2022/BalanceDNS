@@ -35,6 +35,7 @@ type Config struct {
 	MetricsAddr         string        `yaml:"metrics_addr"`
 	PrometheusEnabled   bool          `yaml:"prometheus_enabled"`
 	PrometheusNamespace string        `yaml:"prometheus_namespace"`
+	MetricsTopDomains   bool          `yaml:"metrics_top_domains_enabled"`
 	UpstreamTimeout     time.Duration `yaml:"upstream_timeout"`
 	RequestTimeout      time.Duration `yaml:"request_timeout"`
 
@@ -70,6 +71,8 @@ type Config struct {
 	MaxQuestionsPerRequest  int  `yaml:"max_questions_per_request"`
 	MaxQNameLength          int  `yaml:"max_qname_length"`
 	DropANYQueries          bool `yaml:"drop_any_queries"`
+	ReusePort               bool `yaml:"reuse_port"`
+	ReuseAddr               bool `yaml:"reuse_addr"`
 
 	// Flexible policy engine (block/rewrite/load-balancing).
 	PolicyEngineEnabled  bool                     `yaml:"policy_engine_enabled"`
@@ -142,6 +145,7 @@ func NewConfig() *Config {
 		MetricsAddr:                     "0.0.0.0:9090",
 		PrometheusEnabled:               true,
 		PrometheusNamespace:             "dns_resolver",
+		MetricsTopDomains:               true,
 		UpstreamTimeout:                 5 * time.Second,
 		RequestTimeout:                  5 * time.Second,
 		MaxWorkers:                      10,
@@ -160,6 +164,8 @@ func NewConfig() *Config {
 		MaxQuestionsPerRequest:          1,
 		MaxQNameLength:                  253,
 		DropANYQueries:                  true,
+		ReusePort:                       false,
+		ReuseAddr:                       false,
 		PolicyEngineEnabled:             true,
 		PolicyBlockedDomains:            []string{},
 		PolicyRewriteRules:              []PolicyRewriteRule{},
@@ -255,6 +261,11 @@ func (c *Config) LoadFromEnv() {
 	}
 	if v := os.Getenv("PROMETHEUS_NAMESPACE"); v != "" {
 		c.PrometheusNamespace = v
+	}
+	if v := os.Getenv("METRICS_TOP_DOMAINS_ENABLED"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.MetricsTopDomains = b
+		}
 	}
 	if v := os.Getenv("ADMIN_ADDR"); v != "" {
 		c.AdminAddr = v
@@ -362,6 +373,16 @@ func (c *Config) LoadFromEnv() {
 	if v := os.Getenv("DROP_ANY_QUERIES"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.DropANYQueries = b
+		}
+	}
+	if v := os.Getenv("REUSE_PORT"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.ReusePort = b
+		}
+	}
+	if v := os.Getenv("REUSE_ADDR"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.ReuseAddr = b
 		}
 	}
 	if v := os.Getenv("POLICY_ENGINE_ENABLED"); v != "" {

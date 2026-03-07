@@ -80,7 +80,36 @@ For high-load environments:
 - Increase `MaxWorkers` in config
 - Adjust cache sizes based on available memory
 - Tune rate limiting parameters
+- Enable `reuse_port: true` and `reuse_addr: true` (Linux)
+- Set `metrics_top_domains_enabled: false` to reduce per-request metrics overhead under extreme QPS
 - Monitor with the included performance testing tool
+
+Example high-load snippet:
+
+```yaml
+resolver_workers: 0
+max_global_inflight: 65536
+max_qps_per_ip: 0
+max_concurrent_per_ip: 0
+reuse_port: true
+reuse_addr: true
+metrics_top_domains_enabled: false
+recursor_cache_entries: 1000000
+cache_ram_size: 512
+```
+
+## Safe Update Command (Keep Current Prod Config)
+
+If `auto_install.sh` was used, run:
+
+```bash
+sudo astracat-deploy
+```
+
+The deploy helper now:
+- backs up current `config.yaml` and binary;
+- restores existing production config after code sync;
+- rolls back binary/config automatically if restart fails.
 
 ## Testing
 

@@ -36,6 +36,8 @@ type ProxyOptions struct {
 	MaxQuestionsPerRequest int
 	MaxQNameLength         int
 	DropANYQueries         bool
+	ReusePort              bool
+	ReuseAddr              bool
 	Policy                 ProxyPolicyOptions
 }
 
@@ -49,6 +51,8 @@ func DefaultProxyOptions() ProxyOptions {
 		MaxQuestionsPerRequest: 1,
 		MaxQNameLength:         253,
 		DropANYQueries:         true,
+		ReusePort:              false,
+		ReuseAddr:              false,
 		Policy: ProxyPolicyOptions{
 			Enabled:        true,
 			BlockedDomains: []string{},

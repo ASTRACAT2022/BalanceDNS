@@ -44,6 +44,8 @@ Important sections:
 - Unbound tuning: `root_anchor_path`, `unbound_*`
   - Set `unbound_disable_cache: true` to disable Unbound's internal caches when using `resolver_type: "unbound"`
 - Security: `attack_protection_enabled`, `drop_any_queries`, rate limits
+- Socket tuning: `reuse_port`, `reuse_addr` (for high-load Linux deployments)
+- High-cardinality metrics toggle: `metrics_top_domains_enabled`
 - Policy engine: `policy_*`
 - Plugins: `hosts_*`, `adblock_*`, `dnsdist_compat_*`
 
@@ -98,6 +100,7 @@ Set `admin_addr`, `admin_username`, and `admin_password` in `config.yaml`.
 - Deployment guide: `DEPLOYMENT.md`
 - User manual: `docs/user_manual.md`
 - Admin manual: `docs/admin_manual.md`
+- Policy manual: `docs/policy_manual.md`
 
 ## TLS Auto-Fix (No Manual Paths)
 

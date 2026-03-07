@@ -73,6 +73,7 @@ func main() {
 
 	// 5. Initialize Metrics
 	m := metrics.NewMetrics(cfg.MetricsStoragePath)
+	m.SetTopDomainsTracking(cfg.MetricsTopDomains)
 	if cfg.PrometheusEnabled {
 		go m.StartMetricsServer(cfg.MetricsAddr)
 	} else {
@@ -221,6 +222,8 @@ func buildProxyOptions(cfg *config.Config) dnsproxy.ProxyOptions {
 	opts.MaxQuestionsPerRequest = cfg.MaxQuestionsPerRequest
 	opts.MaxQNameLength = cfg.MaxQNameLength
 	opts.DropANYQueries = cfg.DropANYQueries
+	opts.ReusePort = cfg.ReusePort
+	opts.ReuseAddr = cfg.ReuseAddr
 	if cfg.DNSDistCompatEnabled {
 		// dnsdist compat plugin implements silent DropAction() for ANY.
 		opts.DropANYQueries = false

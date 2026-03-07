@@ -94,6 +94,7 @@ type Metrics struct {
 	goroutines      atomic.Int64
 	cacheHits       atomic.Int64
 	cacheMisses     atomic.Int64
+	topDomainsOn    atomic.Bool
 }
 
 var (
@@ -250,6 +251,7 @@ func NewMetrics(storagePath string) *Metrics {
 		instance = &Metrics{
 			startTime: time.Now(),
 		}
+		instance.topDomainsOn.Store(true)
 
 		if err := instance.loadHistoricalData(storagePath); err != nil {
 			log.Printf("Could not load historical metrics: %v", err)
@@ -370,11 +372,26 @@ func (m *Metrics) SnapshotDashboard() DashboardMetrics {
 	}
 }
 
+// SetTopDomainsTracking enables/disables high-cardinality per-domain stats.
+func (m *Metrics) SetTopDomainsTracking(enabled bool) {
+	if m == nil {
+		return
+	}
+	m.topDomainsOn.Store(enabled)
+	if !enabled {
+		promTopNXDomains.Reset()
+		promTopLatencyDomains.Reset()
+		promTopQueriedDomains.Reset()
+	}
+}
+
 // IncrementQueries increments the total number of queries.
 func (m *Metrics) IncrementQueries(domain string) {
 	m.TotalQueries.Add(1)
 	promTotalQueries.Inc()
-	incrementCounterMap(&m.TopQueriedDomains, domain)
+	if m.topDomainsOn.Load() {
+		incrementCounterMap(&m.TopQueriedDomains, domain)
+	}
 }
 
 // GetQueries returns the total number of queries.
@@ -507,12 +524,16 @@ func (m *Metrics) RecordPolicyAction(action string) {
 
 // RecordNXDOMAIN records an NXDOMAIN response for a given domain.
 func (m *Metrics) RecordNXDOMAIN(domain string) {
-	incrementCounterMap(&m.TopNXDomains, domain)
+	if m.topDomainsOn.Load() {
+		incrementCounterMap(&m.TopNXDomains, domain)
+	}
 }
 
 // RecordLatency records query latency for a given domain.
 func (m *Metrics) RecordLatency(domain string, latency time.Duration) {
-	recordLatencyMap(&m.TopLatencyDomains, domain, latency)
+	if m.topDomainsOn.Load() {
+		recordLatencyMap(&m.TopLatencyDomains, domain, latency)
+	}
 }
 
 func (m *Metrics) topDomainsProcessor() {
@@ -520,6 +541,9 @@ func (m *Metrics) topDomainsProcessor() {
 	defer ticker.Stop()
 
 	for range ticker.C {
+		if !m.topDomainsOn.Load() {
+			continue
+		}
 		m.processTopNXDomains()
 		m.processTopLatencyDomains()
 		m.processTopQueriedDomains()
