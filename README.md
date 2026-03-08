@@ -41,6 +41,7 @@ Important sections:
 - TLS/ACME: `cert_file`, `key_file`, `acme_*`
 - Resolver backend: `resolver_type` (`recursor`/`knot`/`unbound`)
 - Recursor and DNSSEC: `recursor_*`, `dnssec_*`
+  - High-load tuning knobs: `recursor_ns_lookup_workers`, `recursor_max_ns_address_lookups`, `recursor_max_concurrent_exchanges`, `recursor_ns_addr_cache_entries`, `recursor_ns_prefetch_threshold`, `recursor_ns_prefetch_concurrency`, `recursor_hedge_delay`, `recursor_zonecut_cache_entries`
 - Unbound tuning: `root_anchor_path`, `unbound_*`
   - Set `unbound_disable_cache: true` to disable Unbound's internal caches when using `resolver_type: "unbound"`
 - Security: `attack_protection_enabled`, `drop_any_queries`, rate limits
@@ -101,6 +102,7 @@ Set `admin_addr`, `admin_username`, and `admin_password` in `config.yaml`.
 - User manual: `docs/user_manual.md`
 - Admin manual: `docs/admin_manual.md`
 - Policy manual: `docs/policy_manual.md`
+- Production notes: `PRODUCTION.md` (includes safe update workflow)
 
 ## TLS Auto-Fix (No Manual Paths)
 

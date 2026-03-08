@@ -66,7 +66,9 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 	if s.Metrics != nil {
 		s.Metrics.IncrementInflightRequests()
 		defer s.Metrics.DecrementInflightRequests()
-		defer s.Metrics.RecordRequestOutcome("dot", outcome, rcodeText, time.Since(requestStart))
+		defer func() {
+			s.Metrics.RecordRequestOutcome("dot", outcome, rcodeText, time.Since(requestStart))
+		}()
 	}
 
 	if r == nil || len(r.Question) == 0 {

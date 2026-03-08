@@ -142,7 +142,9 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	if s.Metrics != nil {
 		s.Metrics.IncrementInflightRequests()
 		defer s.Metrics.DecrementInflightRequests()
-		defer s.Metrics.RecordRequestOutcome("doh", outcome, rcodeText, time.Since(requestStart))
+		defer func() {
+			s.Metrics.RecordRequestOutcome("doh", outcome, rcodeText, time.Since(requestStart))
+		}()
 	}
 
 	reqMsg, err := parseDoHRequest(r)
@@ -189,7 +191,9 @@ func (s *Server) handleODoH(w http.ResponseWriter, r *http.Request) {
 	if s.Metrics != nil {
 		s.Metrics.IncrementInflightRequests()
 		defer s.Metrics.DecrementInflightRequests()
-		defer s.Metrics.RecordRequestOutcome("odoh", outcome, rcodeText, time.Since(requestStart))
+		defer func() {
+			s.Metrics.RecordRequestOutcome("odoh", outcome, rcodeText, time.Since(requestStart))
+		}()
 	}
 
 	if r.Method != http.MethodPost {
