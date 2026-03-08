@@ -123,13 +123,21 @@ type Config struct {
 	UnboundDisableCache   bool   `yaml:"unbound_disable_cache"`
 
 	// Built-in recursor settings
-	RecursorRootServers  []string      `yaml:"recursor_root_servers"`
-	RecursorCacheEntries int           `yaml:"recursor_cache_entries"`
-	RecursorCacheMinTTL  time.Duration `yaml:"recursor_cache_min_ttl"`
-	RecursorCacheMaxTTL  time.Duration `yaml:"recursor_cache_max_ttl"`
-	DNSSECValidate       bool          `yaml:"dnssec_validate"`
-	DNSSECFailClosed     bool          `yaml:"dnssec_fail_closed"`
-	DNSSECTrustAnchors   []string      `yaml:"dnssec_trust_anchors"`
+	RecursorRootServers            []string      `yaml:"recursor_root_servers"`
+	RecursorCacheEntries           int           `yaml:"recursor_cache_entries"`
+	RecursorCacheMinTTL            time.Duration `yaml:"recursor_cache_min_ttl"`
+	RecursorCacheMaxTTL            time.Duration `yaml:"recursor_cache_max_ttl"`
+	RecursorNSLookupWorkers        int           `yaml:"recursor_ns_lookup_workers"`
+	RecursorMaxNSAddressLookups    int           `yaml:"recursor_max_ns_address_lookups"`
+	RecursorMaxConcurrentExchanges int           `yaml:"recursor_max_concurrent_exchanges"`
+	RecursorNSAddrCacheEntries     int           `yaml:"recursor_ns_addr_cache_entries"`
+	RecursorNSPrefetchThreshold    int           `yaml:"recursor_ns_prefetch_threshold"`
+	RecursorNSPrefetchConcurrency  int           `yaml:"recursor_ns_prefetch_concurrency"`
+	RecursorHedgeDelay             time.Duration `yaml:"recursor_hedge_delay"`
+	RecursorZoneCutCacheEntries    int           `yaml:"recursor_zonecut_cache_entries"`
+	DNSSECValidate                 bool          `yaml:"dnssec_validate"`
+	DNSSECFailClosed               bool          `yaml:"dnssec_fail_closed"`
+	DNSSECTrustAnchors             []string      `yaml:"dnssec_trust_anchors"`
 
 	// ACME / Let's Encrypt settings
 	AcmeEnabled  bool     `yaml:"acme_enabled"`
@@ -200,34 +208,42 @@ func NewConfig() *Config {
 			"sentry.com",
 			"sentry.io",
 		},
-		AdminAddr:             "",
-		AdminUsername:         "",
-		AdminPassword:         "",
-		MetricsStoragePath:    "/tmp/dns_metrics.json",
-		DoTAddr:               "", // Disabled by default
-		ODoHAddr:              "", // Disabled by default
-		LegacyDoHAddr:         "",
-		CertFile:              "",
-		KeyFile:               "",
-		CertContent:           "",
-		KeyContent:            "",
-		RootAnchorPath:        "/var/lib/unbound/root.key",
-		ResolverWorkers:       0, // auto
-		UnboundMsgCacheSize:   "64m",
-		UnboundRRsetCacheSize: "128m",
-		UnboundKeyCacheSize:   "64m",
-		UnboundPrefetch:       true,
-		UnboundServeExpired:   true,
-		UnboundDisableCache:   false,
-		RecursorRootServers:   []string{},
-		RecursorCacheEntries:  200000,
-		RecursorCacheMinTTL:   5 * time.Second,
-		RecursorCacheMaxTTL:   30 * time.Minute,
-		DNSSECValidate:        true,
-		DNSSECFailClosed:      true,
-		DNSSECTrustAnchors:    []string{},
-		AcmeEnabled:           false,
-		AcmeCacheDir:          "certs-cache",
+		AdminAddr:                      "",
+		AdminUsername:                  "",
+		AdminPassword:                  "",
+		MetricsStoragePath:             "/tmp/dns_metrics.json",
+		DoTAddr:                        "", // Disabled by default
+		ODoHAddr:                       "", // Disabled by default
+		LegacyDoHAddr:                  "",
+		CertFile:                       "",
+		KeyFile:                        "",
+		CertContent:                    "",
+		KeyContent:                     "",
+		RootAnchorPath:                 "/var/lib/unbound/root.key",
+		ResolverWorkers:                0, // auto
+		UnboundMsgCacheSize:            "64m",
+		UnboundRRsetCacheSize:          "128m",
+		UnboundKeyCacheSize:            "64m",
+		UnboundPrefetch:                true,
+		UnboundServeExpired:            true,
+		UnboundDisableCache:            false,
+		RecursorRootServers:            []string{},
+		RecursorCacheEntries:           200000,
+		RecursorCacheMinTTL:            5 * time.Second,
+		RecursorCacheMaxTTL:            30 * time.Minute,
+		RecursorNSLookupWorkers:        8,
+		RecursorMaxNSAddressLookups:    24,
+		RecursorMaxConcurrentExchanges: 8192,
+		RecursorNSAddrCacheEntries:     500000,
+		RecursorNSPrefetchThreshold:    8,
+		RecursorNSPrefetchConcurrency:  32,
+		RecursorHedgeDelay:             15 * time.Millisecond,
+		RecursorZoneCutCacheEntries:    200000,
+		DNSSECValidate:                 true,
+		DNSSECFailClosed:               true,
+		DNSSECTrustAnchors:             []string{},
+		AcmeEnabled:                    false,
+		AcmeCacheDir:                   "certs-cache",
 	}
 }
 
@@ -458,6 +474,41 @@ func (c *Config) LoadFromEnv() {
 			c.RecursorCacheEntries = i
 		}
 	}
+	if v := os.Getenv("RECURSOR_NS_LOOKUP_WORKERS"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.RecursorNSLookupWorkers = i
+		}
+	}
+	if v := os.Getenv("RECURSOR_MAX_NS_ADDRESS_LOOKUPS"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.RecursorMaxNSAddressLookups = i
+		}
+	}
+	if v := os.Getenv("RECURSOR_MAX_CONCURRENT_EXCHANGES"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.RecursorMaxConcurrentExchanges = i
+		}
+	}
+	if v := os.Getenv("RECURSOR_NS_ADDR_CACHE_ENTRIES"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.RecursorNSAddrCacheEntries = i
+		}
+	}
+	if v := os.Getenv("RECURSOR_NS_PREFETCH_THRESHOLD"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.RecursorNSPrefetchThreshold = i
+		}
+	}
+	if v := os.Getenv("RECURSOR_NS_PREFETCH_CONCURRENCY"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.RecursorNSPrefetchConcurrency = i
+		}
+	}
+	if v := os.Getenv("RECURSOR_ZONECUT_CACHE_ENTRIES"); v != "" {
+		if i, err := strconv.Atoi(v); err == nil {
+			c.RecursorZoneCutCacheEntries = i
+		}
+	}
 	if v := os.Getenv("RECURSOR_ROOT_SERVERS"); v != "" {
 		items := strings.Split(v, ",")
 		servers := make([]string, 0, len(items))
@@ -477,6 +528,11 @@ func (c *Config) LoadFromEnv() {
 	if v := os.Getenv("RECURSOR_CACHE_MAX_TTL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			c.RecursorCacheMaxTTL = d
+		}
+	}
+	if v := os.Getenv("RECURSOR_HEDGE_DELAY"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.RecursorHedgeDelay = d
 		}
 	}
 	if v := os.Getenv("DNSSEC_VALIDATE"); v != "" {

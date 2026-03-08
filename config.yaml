@@ -99,6 +99,14 @@ recursor_root_servers: []
 recursor_cache_entries: 200000
 recursor_cache_min_ttl: 5s
 recursor_cache_max_ttl: 30m
+recursor_ns_lookup_workers: 8
+recursor_max_ns_address_lookups: 24
+recursor_max_concurrent_exchanges: 8192
+recursor_ns_addr_cache_entries: 500000
+recursor_ns_prefetch_threshold: 8
+recursor_ns_prefetch_concurrency: 32
+recursor_hedge_delay: 15ms
+recursor_zonecut_cache_entries: 200000
 dnssec_validate: true
 dnssec_fail_closed: true
 # Optional DS trust anchors in RR format. Empty => built-in root trust anchor.

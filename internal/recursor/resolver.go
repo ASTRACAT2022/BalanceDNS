@@ -38,11 +38,19 @@ var defaultRootServers = []string{
 
 // Options configures the pure-Go recursive resolver.
 type Options struct {
-	WorkerCount    int
-	QueryTimeout   time.Duration
-	ResolveTimeout time.Duration
-	MaxDepth       int
-	RootServers    []string
+	WorkerCount            int
+	QueryTimeout           time.Duration
+	ResolveTimeout         time.Duration
+	MaxDepth               int
+	RootServers            []string
+	NSLookupWorkers        int
+	MaxNSAddressLookups    int
+	MaxConcurrentExchanges int
+	NSAddrCacheEntries     int
+	NSPrefetchThreshold    int
+	NSPrefetchConcurrency  int
+	HedgeDelay             time.Duration
+	ZoneCutCacheEntries    int
 
 	CacheEntries int
 	CacheMinTTL  time.Duration
@@ -55,21 +63,66 @@ type Options struct {
 
 // Resolver performs iterative DNS resolution starting from root servers.
 type Resolver struct {
-	opts        Options
-	rootServers []string
-	next        atomic.Uint64
-	cache       *ristretto.Cache
-	fallback    *dnsr.Resolver
-	sf          singleflight.Group
-	trustedDS   []*dns.DS
-	udpClient   *dns.Client
-	tcpClient   *dns.Client
+	opts         Options
+	rootServers  []string
+	next         atomic.Uint64
+	cache        *ristretto.Cache
+	fallback     *dnsr.Resolver
+	sf           singleflight.Group
+	trustedDS    []*dns.DS
+	udpClient    *dns.Client
+	tcpClient    *dns.Client
+	exchangeSem  chan struct{}
+	nsAddrMu     sync.RWMutex
+	nsAddrCache  map[string]*nsAddrCacheEntry
+	nsStatsMu    sync.RWMutex
+	nsStats      map[string]nsServerStats
+	zoneCutMu    sync.RWMutex
+	zoneCutCache map[string]zoneCutEntry
+	nsLookupSF   singleflight.Group
+	nsPrefetchSF singleflight.Group
+	prefetchSem  chan struct{}
 }
 
 type serverQueryResult struct {
 	server string
 	resp   *dns.Msg
 	err    error
+}
+
+type nsAddrCacheItem struct {
+	addr      string
+	expiresAt time.Time
+}
+
+type nsAddrCacheEntry struct {
+	items       []nsAddrCacheItem
+	originalTTL time.Duration
+	hits        uint32
+	prefetching bool
+}
+
+type nsServerStats struct {
+	srtt     time.Duration
+	failures uint32
+	last     time.Time
+}
+
+type nsAddrTTL struct {
+	ip  string
+	ttl time.Duration
+}
+
+type zoneCutEntry struct {
+	zone      string
+	nsNames   []string
+	nsIPs     []string
+	expiresAt time.Time
+}
+
+type nsLookupResult struct {
+	ips     []string
+	records []nsAddrCacheItem
 }
 
 // NewResolverWithOptions builds a recursive resolver with sane defaults.
@@ -105,6 +158,15 @@ func NewResolverWithOptions(opts Options) (*Resolver, error) {
 		c = rc
 	}
 
+	var exchangeSem chan struct{}
+	if opts.MaxConcurrentExchanges > 0 {
+		exchangeSem = make(chan struct{}, opts.MaxConcurrentExchanges)
+	}
+	var prefetchSem chan struct{}
+	if opts.NSPrefetchConcurrency > 0 {
+		prefetchSem = make(chan struct{}, opts.NSPrefetchConcurrency)
+	}
+
 	return &Resolver{
 		opts:        opts,
 		rootServers: roots,
@@ -116,7 +178,12 @@ func NewResolverWithOptions(opts Options) (*Resolver, error) {
 			dnsr.WithTimeout(opts.ResolveTimeout),
 			dnsr.WithTCPRetry(),
 		),
-		trustedDS: trustDS,
+		trustedDS:    trustDS,
+		exchangeSem:  exchangeSem,
+		nsAddrCache:  make(map[string]*nsAddrCacheEntry),
+		nsStats:      make(map[string]nsServerStats),
+		zoneCutCache: make(map[string]zoneCutEntry),
+		prefetchSem:  prefetchSem,
 	}, nil
 }
 
@@ -222,6 +289,11 @@ func (r *Resolver) resolveIterative(ctx context.Context, q dns.Question, servers
 	if cached, ok := r.getCached(q); ok {
 		return cached, nil
 	}
+	if depth == 0 && isSameServerSet(servers, r.rootServers) {
+		if cachedServers := r.lookupZoneCutServers(q.Name); len(cachedServers) > 0 {
+			servers = cachedServers
+		}
+	}
 
 	key := fmt.Sprintf("%s|%d", strings.ToLower(q.Name), q.Qtype)
 	guard[key]++
@@ -252,17 +324,7 @@ func (r *Resolver) resolveIterative(ctx context.Context, q dns.Question, servers
 		batch := ordered[i:end]
 		batchCtx, batchCancel := context.WithCancel(ctx)
 		resultsCh := make(chan serverQueryResult, len(batch))
-
-		for _, server := range batch {
-			server := server
-			go func() {
-				resp, err := r.exchange(batchCtx, server, query)
-				select {
-				case resultsCh <- serverQueryResult{server: server, resp: resp, err: err}:
-				case <-batchCtx.Done():
-				}
-			}()
-		}
+		r.queryBatch(batchCtx, batch, query, resultsCh)
 
 		for j := 0; j < len(batch); j++ {
 			var result serverQueryResult
@@ -340,15 +402,23 @@ func (r *Resolver) resolveIterative(ctx context.Context, q dns.Question, servers
 				return resp, nil
 			}
 
+			nsNames := extractNSHostnames(resp)
+			zoneName, zoneTTL, hasZone := extractZoneCutMetadata(resp)
+
 			if glue := extractGlueIPs(resp); len(glue) > 0 {
+				if hasZone && len(nsNames) > 0 {
+					r.storeZoneCut(zoneName, nsNames, glue, zoneTTL)
+				}
 				batchCancel()
 				return r.resolveIterative(ctx, q, glue, depth+1, guard)
 			}
 
-			nsNames := extractNSHostnames(resp)
 			if len(nsNames) > 0 {
 				nextIPs := r.resolveNSHostIPs(ctx, nsNames, depth+1, guard)
 				if len(nextIPs) > 0 {
+					if hasZone {
+						r.storeZoneCut(zoneName, nsNames, nextIPs, zoneTTL)
+					}
 					batchCancel()
 					return r.resolveIterative(ctx, q, nextIPs, depth+1, guard)
 				}
@@ -370,54 +440,78 @@ func (r *Resolver) resolveIterative(ctx context.Context, q dns.Question, servers
 }
 
 func (r *Resolver) resolveNSHostIPs(ctx context.Context, nsNames []string, depth int, guard map[string]int) []string {
-	ips := make(map[string]struct{})
+	if len(nsNames) == 0 {
+		return nil
+	}
+	nsNames = normalizeNSHostnames(nsNames)
+	if limit := r.opts.MaxNSAddressLookups; limit > 0 && len(nsNames) > limit {
+		nsNames = nsNames[:limit]
+	}
+
+	ips := make(map[string]struct{}, len(nsNames)*2)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, 8)
 
-	for _, nsName := range nsNames {
-		if err := ctx.Err(); err != nil {
-			break
-		}
+	taskCount := len(nsNames)
+	workerCount := r.opts.NSLookupWorkers
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+	if workerCount > taskCount {
+		workerCount = taskCount
+	}
+	if workerCount <= 0 {
+		workerCount = 1
+	}
 
-		for _, qt := range []uint16{dns.TypeA, dns.TypeAAAA} {
-			nsName := nsName
-			qt := qt
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				select {
-				case sem <- struct{}{}:
-				case <-ctx.Done():
+	tasks := make(chan string, workerCount*2)
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for nsName := range tasks {
+				if err := ctx.Err(); err != nil {
 					return
 				}
-				defer func() { <-sem }()
 
-				q := dns.Question{Name: dns.Fqdn(nsName), Qtype: qt, Qclass: dns.ClassINET}
-				resp, err := r.resolveIterative(ctx, q, r.rootServers, depth+1, cloneGuardMap(guard))
-				if err != nil || resp == nil {
-					return
-				}
-				local := make([]string, 0, 2)
-				for _, rr := range resp.Answer {
-					switch v := rr.(type) {
-					case *dns.A:
-						local = append(local, v.A.String())
-					case *dns.AAAA:
-						local = append(local, v.AAAA.String())
+				cachedIPs, prefetch := r.getNSHostIPsFromCache(nsName)
+				if len(cachedIPs) > 0 {
+					if prefetch {
+						r.startNSPrefetch(nsName, depth, guard)
 					}
+					mu.Lock()
+					for _, ip := range cachedIPs {
+						ips[ip] = struct{}{}
+					}
+					mu.Unlock()
+					continue
 				}
-				if len(local) == 0 {
-					return
+
+				resolved, records := r.lookupNSHostIPsCollapsed(ctx, nsName, depth, guard)
+				if len(records) > 0 {
+					r.storeNSHostIPs(nsName, records)
+				}
+				if len(resolved) == 0 {
+					continue
 				}
 				mu.Lock()
-				for _, ip := range local {
+				for _, ip := range resolved {
 					ips[ip] = struct{}{}
 				}
 				mu.Unlock()
-			}()
+			}
+		}()
+	}
+
+enqueue:
+	for _, nsName := range nsNames {
+		select {
+		case <-ctx.Done():
+			break enqueue
+		case tasks <- nsName:
 		}
 	}
+	close(tasks)
 	wg.Wait()
 
 	out := make([]string, 0, len(ips))
@@ -429,16 +523,110 @@ func (r *Resolver) resolveNSHostIPs(ctx context.Context, nsNames []string, depth
 }
 
 func (r *Resolver) orderServers(servers []string) []string {
-	clean := sanitizeServers(servers)
-	if len(clean) <= 1 {
-		return clean
+	if len(servers) <= 1 {
+		return append([]string(nil), servers...)
 	}
+	ordered := append([]string(nil), servers...)
+	r.nsStatsMu.RLock()
+	defer r.nsStatsMu.RUnlock()
 
-	start := int((r.next.Add(1) - 1) % uint64(len(clean)))
-	ordered := make([]string, 0, len(clean))
-	ordered = append(ordered, clean[start:]...)
-	ordered = append(ordered, clean[:start]...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		si := r.serverScoreLocked(ordered[i])
+		sj := r.serverScoreLocked(ordered[j])
+		if si == sj {
+			return ordered[i] < ordered[j]
+		}
+		return si < sj
+	})
+
+	// Keep light balancing among similarly-ranked servers.
+	if len(ordered) > 2 {
+		start := int((r.next.Add(1) - 1) % uint64(minInt(len(ordered), 3)))
+		if start > 0 {
+			head := append([]string(nil), ordered[:3]...)
+			rot := append(head[start:], head[:start]...)
+			copy(ordered[:3], rot)
+		}
+	}
 	return ordered
+}
+
+func (r *Resolver) queryBatch(ctx context.Context, batch []string, query *dns.Msg, resultsCh chan<- serverQueryResult) {
+	for i, server := range batch {
+		server := server
+		delay := time.Duration(i) * r.opts.HedgeDelay
+		go func() {
+			if delay > 0 {
+				timer := time.NewTimer(delay)
+				defer timer.Stop()
+				select {
+				case <-ctx.Done():
+					return
+				case <-timer.C:
+				}
+			}
+
+			resp, err := r.exchange(ctx, server, query)
+			select {
+			case resultsCh <- serverQueryResult{server: server, resp: resp, err: err}:
+			case <-ctx.Done():
+			}
+		}()
+	}
+}
+
+func (r *Resolver) serverScoreLocked(server string) time.Duration {
+	addr := normalizeServerAddr(server)
+	stat, ok := r.nsStats[addr]
+	if !ok {
+		if r.opts.QueryTimeout > 0 {
+			return r.opts.QueryTimeout / 2
+		}
+		return 200 * time.Millisecond
+	}
+	base := stat.srtt
+	if base <= 0 {
+		base = 1 * time.Millisecond
+	}
+	failPenalty := time.Duration(minInt(int(stat.failures), 8)) * 25 * time.Millisecond
+	return base + failPenalty
+}
+
+func (r *Resolver) markServerSuccess(server string, rtt time.Duration) {
+	if rtt <= 0 {
+		return
+	}
+	addr := normalizeServerAddr(server)
+	r.nsStatsMu.Lock()
+	defer r.nsStatsMu.Unlock()
+	stat := r.nsStats[addr]
+	if stat.srtt <= 0 {
+		stat.srtt = rtt
+	} else {
+		stat.srtt = (stat.srtt*7 + rtt) / 8
+	}
+	if stat.failures > 0 {
+		stat.failures--
+	}
+	stat.last = time.Now()
+	r.nsStats[addr] = stat
+}
+
+func (r *Resolver) markServerFailure(server string) {
+	addr := normalizeServerAddr(server)
+	r.nsStatsMu.Lock()
+	defer r.nsStatsMu.Unlock()
+	stat := r.nsStats[addr]
+	stat.failures++
+	if stat.srtt <= 0 {
+		if r.opts.QueryTimeout > 0 {
+			stat.srtt = r.opts.QueryTimeout
+		} else {
+			stat.srtt = 500 * time.Millisecond
+		}
+	}
+	stat.last = time.Now()
+	r.nsStats[addr] = stat
 }
 
 func (r *Resolver) exchange(ctx context.Context, server string, query *dns.Msg) (*dns.Msg, error) {
@@ -446,8 +634,16 @@ func (r *Resolver) exchange(ctx context.Context, server string, query *dns.Msg) 
 
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
+		release, semErr := r.acquireExchangeSlot(ctx)
+		if semErr != nil {
+			r.markServerFailure(addr)
+			return nil, semErr
+		}
+		start := time.Now()
 		resp, _, err := r.udpClient.ExchangeContext(ctx, query.Copy(), addr)
+		release()
 		if err == nil {
+			r.markServerSuccess(addr, time.Since(start))
 			if resp != nil && resp.Truncated {
 				tcpResp, tcpErr := r.exchangeTCP(ctx, addr, query)
 				if tcpErr == nil && tcpResp != nil {
@@ -456,6 +652,7 @@ func (r *Resolver) exchange(ctx context.Context, server string, query *dns.Msg) 
 			}
 			return resp, nil
 		}
+		r.markServerFailure(addr)
 		lastErr = err
 		if !isRetriableExchangeError(err) {
 			break
@@ -475,11 +672,32 @@ func (r *Resolver) exchange(ctx context.Context, server string, query *dns.Msg) 
 }
 
 func (r *Resolver) exchangeTCP(ctx context.Context, addr string, query *dns.Msg) (*dns.Msg, error) {
+	release, err := r.acquireExchangeSlot(ctx)
+	if err != nil {
+		r.markServerFailure(addr)
+		return nil, err
+	}
+	start := time.Now()
 	tcpResp, _, tcpErr := r.tcpClient.ExchangeContext(ctx, query.Copy(), addr)
+	release()
 	if tcpErr != nil {
+		r.markServerFailure(addr)
 		return nil, tcpErr
 	}
+	r.markServerSuccess(addr, time.Since(start))
 	return tcpResp, nil
+}
+
+func (r *Resolver) acquireExchangeSlot(ctx context.Context) (func(), error) {
+	if r.exchangeSem == nil {
+		return func() {}, nil
+	}
+	select {
+	case r.exchangeSem <- struct{}{}:
+		return func() { <-r.exchangeSem }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func isRetriableExchangeError(err error) bool {
@@ -512,6 +730,384 @@ func cloneGuardMap(in map[string]int) map[string]int {
 		out[k] = v
 	}
 	return out
+}
+
+func normalizeNSHostnames(nsNames []string) []string {
+	out := make([]string, 0, len(nsNames))
+	seen := make(map[string]struct{}, len(nsNames))
+	for _, ns := range nsNames {
+		normalized := strings.ToLower(dns.Fqdn(strings.TrimSpace(ns)))
+		if normalized == "." {
+			continue
+		}
+		if _, ok := seen[normalized]; ok {
+			continue
+		}
+		seen[normalized] = struct{}{}
+		out = append(out, normalized)
+	}
+	return out
+}
+
+func (r *Resolver) getNSHostIPsFromCache(nsName string) ([]string, bool) {
+	now := time.Now()
+	nsName = strings.ToLower(dns.Fqdn(nsName))
+	r.nsAddrMu.Lock()
+	defer r.nsAddrMu.Unlock()
+
+	entry, ok := r.nsAddrCache[nsName]
+	if !ok || entry == nil {
+		return nil, false
+	}
+
+	valid := make([]nsAddrCacheItem, 0, len(entry.items))
+	ips := make([]string, 0, len(entry.items))
+	seen := make(map[string]struct{}, len(entry.items))
+	soonest := time.Time{}
+
+	for _, item := range entry.items {
+		if !item.expiresAt.After(now) {
+			continue
+		}
+		valid = append(valid, item)
+		if _, ok := seen[item.addr]; !ok {
+			seen[item.addr] = struct{}{}
+			ips = append(ips, item.addr)
+		}
+		if soonest.IsZero() || item.expiresAt.Before(soonest) {
+			soonest = item.expiresAt
+		}
+	}
+	if len(valid) == 0 {
+		delete(r.nsAddrCache, nsName)
+		return nil, false
+	}
+
+	entry.items = valid
+	entry.hits++
+	needPrefetch := false
+	if !entry.prefetching && int(entry.hits) >= r.opts.NSPrefetchThreshold {
+		remaining := soonest.Sub(now)
+		threshold := entry.originalTTL / 4
+		if threshold < 5*time.Second {
+			threshold = 5 * time.Second
+		}
+		if threshold > 5*time.Minute {
+			threshold = 5 * time.Minute
+		}
+		if remaining <= threshold {
+			entry.prefetching = true
+			needPrefetch = true
+		}
+	}
+	sort.Strings(ips)
+	return ips, needPrefetch
+}
+
+func (r *Resolver) clearNSPrefetchFlag(nsName string) {
+	nsName = strings.ToLower(dns.Fqdn(nsName))
+	r.nsAddrMu.Lock()
+	defer r.nsAddrMu.Unlock()
+	entry, ok := r.nsAddrCache[nsName]
+	if !ok || entry == nil {
+		return
+	}
+	entry.prefetching = false
+}
+
+func (r *Resolver) storeNSHostIPs(nsName string, records []nsAddrCacheItem) {
+	if len(records) == 0 {
+		r.clearNSPrefetchFlag(nsName)
+		return
+	}
+	nsName = strings.ToLower(dns.Fqdn(nsName))
+	now := time.Now()
+	byIP := make(map[string]time.Time, len(records))
+	minTTL := time.Duration(0)
+
+	for _, record := range records {
+		if record.addr == "" || !record.expiresAt.After(now) {
+			continue
+		}
+		if existing, ok := byIP[record.addr]; !ok || record.expiresAt.After(existing) {
+			byIP[record.addr] = record.expiresAt
+		}
+		ttl := record.expiresAt.Sub(now)
+		if ttl <= 0 {
+			continue
+		}
+		if minTTL == 0 || ttl < minTTL {
+			minTTL = ttl
+		}
+	}
+	if len(byIP) == 0 {
+		r.clearNSPrefetchFlag(nsName)
+		return
+	}
+
+	items := make([]nsAddrCacheItem, 0, len(byIP))
+	for ip, expiresAt := range byIP {
+		items = append(items, nsAddrCacheItem{addr: ip, expiresAt: expiresAt})
+	}
+
+	r.nsAddrMu.Lock()
+	defer r.nsAddrMu.Unlock()
+	if _, exists := r.nsAddrCache[nsName]; !exists && r.opts.NSAddrCacheEntries > 0 && len(r.nsAddrCache) >= r.opts.NSAddrCacheEntries {
+		for key, entry := range r.nsAddrCache {
+			if entry == nil {
+				delete(r.nsAddrCache, key)
+				continue
+			}
+			allExpired := true
+			for _, item := range entry.items {
+				if item.expiresAt.After(now) {
+					allExpired = false
+					break
+				}
+			}
+			if allExpired {
+				delete(r.nsAddrCache, key)
+			}
+			if len(r.nsAddrCache) < r.opts.NSAddrCacheEntries {
+				break
+			}
+		}
+		if len(r.nsAddrCache) >= r.opts.NSAddrCacheEntries {
+			for key := range r.nsAddrCache {
+				delete(r.nsAddrCache, key)
+				break
+			}
+		}
+	}
+
+	r.nsAddrCache[nsName] = &nsAddrCacheEntry{
+		items:       items,
+		originalTTL: minTTL,
+		hits:        0,
+		prefetching: false,
+	}
+}
+
+func (r *Resolver) startNSPrefetch(nsName string, depth int, guard map[string]int) {
+	if r.prefetchSem == nil {
+		r.clearNSPrefetchFlag(nsName)
+		return
+	}
+	select {
+	case r.prefetchSem <- struct{}{}:
+	default:
+		r.clearNSPrefetchFlag(nsName)
+		return
+	}
+
+	go func() {
+		defer func() {
+			<-r.prefetchSem
+			r.clearNSPrefetchFlag(nsName)
+		}()
+		key := strings.ToLower(dns.Fqdn(nsName))
+		_, _, _ = r.nsPrefetchSF.Do(key, func() (interface{}, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), fallbackResolveTimeout(r.opts))
+			defer cancel()
+			_, records := r.resolveNSHostIPsFresh(ctx, key, depth, cloneGuardMap(guard))
+			if len(records) > 0 {
+				r.storeNSHostIPs(key, records)
+			}
+			return nil, nil
+		})
+	}()
+}
+
+func (r *Resolver) lookupNSHostIPsCollapsed(ctx context.Context, nsName string, depth int, guard map[string]int) ([]string, []nsAddrCacheItem) {
+	key := strings.ToLower(dns.Fqdn(nsName))
+	v, err, _ := r.nsLookupSF.Do("nslookup|"+key, func() (interface{}, error) {
+		if cachedIPs, prefetch := r.getNSHostIPsFromCache(key); len(cachedIPs) > 0 {
+			if prefetch {
+				r.startNSPrefetch(key, depth, guard)
+			}
+			return nsLookupResult{ips: cachedIPs, records: nil}, nil
+		}
+
+		resolved, records := r.resolveNSHostIPsFresh(ctx, key, depth, cloneGuardMap(guard))
+		return nsLookupResult{ips: resolved, records: records}, nil
+	})
+	if err != nil || v == nil {
+		return nil, nil
+	}
+	result, ok := v.(nsLookupResult)
+	if !ok {
+		return nil, nil
+	}
+	return result.ips, result.records
+}
+
+func (r *Resolver) resolveNSHostIPsFresh(ctx context.Context, nsName string, depth int, guard map[string]int) ([]string, []nsAddrCacheItem) {
+	addrs := make(map[string]time.Duration, 2)
+
+	for _, qt := range []uint16{dns.TypeA, dns.TypeAAAA} {
+		if err := ctx.Err(); err != nil {
+			break
+		}
+		q := dns.Question{Name: dns.Fqdn(nsName), Qtype: qt, Qclass: dns.ClassINET}
+		resp, err := r.resolveIterative(ctx, q, r.rootServers, depth+1, cloneGuardMap(guard))
+		if err != nil || resp == nil {
+			continue
+		}
+		for _, item := range extractAddressTTLs(resp) {
+			if current, exists := addrs[item.ip]; !exists || item.ttl > current {
+				addrs[item.ip] = item.ttl
+			}
+		}
+	}
+
+	if len(addrs) == 0 {
+		return nil, nil
+	}
+
+	now := time.Now()
+	ips := make([]string, 0, len(addrs))
+	records := make([]nsAddrCacheItem, 0, len(addrs))
+	for ip, ttl := range addrs {
+		ips = append(ips, ip)
+		records = append(records, nsAddrCacheItem{
+			addr:      ip,
+			expiresAt: now.Add(ttl),
+		})
+	}
+	sort.Strings(ips)
+	return ips, records
+}
+
+func extractAddressTTLs(resp *dns.Msg) []nsAddrTTL {
+	out := make([]nsAddrTTL, 0, len(resp.Answer))
+	for _, rr := range resp.Answer {
+		switch v := rr.(type) {
+		case *dns.A:
+			if v.A == nil {
+				continue
+			}
+			out = append(out, nsAddrTTL{ip: v.A.String(), ttl: ttlFromRR(v.Hdr.Ttl)})
+		case *dns.AAAA:
+			if v.AAAA == nil {
+				continue
+			}
+			out = append(out, nsAddrTTL{ip: v.AAAA.String(), ttl: ttlFromRR(v.Hdr.Ttl)})
+		}
+	}
+	return out
+}
+
+func ttlFromRR(ttl uint32) time.Duration {
+	if ttl == 0 {
+		return 5 * time.Minute
+	}
+	return time.Duration(ttl) * time.Second
+}
+
+func (r *Resolver) lookupZoneCutServers(qName string) []string {
+	now := time.Now()
+	name := strings.ToLower(dns.Fqdn(strings.TrimSpace(qName)))
+	if name == "." {
+		return nil
+	}
+
+	r.zoneCutMu.RLock()
+	defer r.zoneCutMu.RUnlock()
+
+	for zone := name; zone != "."; zone = parentZone(zone) {
+		entry, ok := r.zoneCutCache[zone]
+		if !ok {
+			continue
+		}
+		if !entry.expiresAt.After(now) || len(entry.nsIPs) == 0 {
+			continue
+		}
+		servers := append([]string(nil), entry.nsIPs...)
+		sort.Strings(servers)
+		return servers
+	}
+	return nil
+}
+
+func (r *Resolver) storeZoneCut(zone string, nsNames []string, nsIPs []string, ttl time.Duration) {
+	zone = strings.ToLower(dns.Fqdn(strings.TrimSpace(zone)))
+	if zone == "." || len(nsIPs) == 0 {
+		return
+	}
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	if ttl > 2*time.Hour {
+		ttl = 2 * time.Hour
+	}
+
+	uniqNames := normalizeNSHostnames(nsNames)
+	uniqIPs := sanitizeServers(nsIPs)
+	if len(uniqIPs) == 0 {
+		return
+	}
+
+	entry := zoneCutEntry{
+		zone:      zone,
+		nsNames:   uniqNames,
+		nsIPs:     uniqIPs,
+		expiresAt: time.Now().Add(ttl),
+	}
+
+	r.zoneCutMu.Lock()
+	defer r.zoneCutMu.Unlock()
+
+	if _, exists := r.zoneCutCache[zone]; !exists && r.opts.ZoneCutCacheEntries > 0 && len(r.zoneCutCache) >= r.opts.ZoneCutCacheEntries {
+		now := time.Now()
+		for key, e := range r.zoneCutCache {
+			if !e.expiresAt.After(now) {
+				delete(r.zoneCutCache, key)
+			}
+			if len(r.zoneCutCache) < r.opts.ZoneCutCacheEntries {
+				break
+			}
+		}
+		if len(r.zoneCutCache) >= r.opts.ZoneCutCacheEntries {
+			for key := range r.zoneCutCache {
+				delete(r.zoneCutCache, key)
+				break
+			}
+		}
+	}
+	r.zoneCutCache[zone] = entry
+}
+
+func extractZoneCutMetadata(resp *dns.Msg) (string, time.Duration, bool) {
+	if resp == nil {
+		return "", 0, false
+	}
+	bestZone := ""
+	var ttl time.Duration
+
+	for _, rr := range resp.Ns {
+		ns, ok := rr.(*dns.NS)
+		if !ok || ns.Hdr.Name == "" {
+			continue
+		}
+		zone := strings.ToLower(dns.Fqdn(ns.Hdr.Name))
+		if zone == "." {
+			continue
+		}
+		if len(zone) > len(bestZone) {
+			bestZone = zone
+		}
+		rrTTL := ttlFromRR(ns.Hdr.Ttl)
+		if ttl == 0 || rrTTL < ttl {
+			ttl = rrTTL
+		}
+	}
+	if bestZone == "" {
+		return "", 0, false
+	}
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	return bestZone, ttl, true
 }
 
 func (r *Resolver) getCached(q dns.Question) (*dns.Msg, bool) {
@@ -756,8 +1352,6 @@ func findAliasTarget(resp *dns.Msg, name string) (string, bool) {
 	}
 	prefix := name[:len(name)-len(bestOwner)]
 	return dns.Fqdn(prefix + bestTarget), true
-
-	return "", false
 }
 
 func isAuthoritativeNoData(resp *dns.Msg) bool {
@@ -973,6 +1567,42 @@ func withDefaultOptions(opts Options) Options {
 	if opts.CacheMaxTTL <= 0 {
 		opts.CacheMaxTTL = 30 * time.Minute
 	}
+	if opts.NSLookupWorkers <= 0 {
+		opts.NSLookupWorkers = opts.WorkerCount
+		if opts.NSLookupWorkers > 8 {
+			opts.NSLookupWorkers = 8
+		}
+		if opts.NSLookupWorkers < 2 {
+			opts.NSLookupWorkers = 2
+		}
+	}
+	if opts.MaxNSAddressLookups <= 0 {
+		opts.MaxNSAddressLookups = 24
+	}
+	if opts.MaxConcurrentExchanges <= 0 {
+		opts.MaxConcurrentExchanges = opts.WorkerCount * 1024
+		if opts.MaxConcurrentExchanges < 2048 {
+			opts.MaxConcurrentExchanges = 2048
+		}
+	}
+	if opts.NSAddrCacheEntries <= 0 {
+		opts.NSAddrCacheEntries = 500000
+	}
+	if opts.NSPrefetchThreshold <= 0 {
+		opts.NSPrefetchThreshold = 8
+	}
+	if opts.NSPrefetchConcurrency <= 0 {
+		opts.NSPrefetchConcurrency = 32
+	}
+	if opts.HedgeDelay < 0 {
+		opts.HedgeDelay = 0
+	}
+	if opts.HedgeDelay == 0 {
+		opts.HedgeDelay = 15 * time.Millisecond
+	}
+	if opts.ZoneCutCacheEntries <= 0 {
+		opts.ZoneCutCacheEntries = 200000
+	}
 	return opts
 }
 
@@ -1037,4 +1667,23 @@ func normalizeServerAddr(server string) string {
 		return net.JoinHostPort(server, "53")
 	}
 	return server
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func isSameServerSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if normalizeServerAddr(a[i]) != normalizeServerAddr(b[i]) {
+			return false
+		}
+	}
+	return true
 }
