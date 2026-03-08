@@ -4,7 +4,7 @@ ASTRACAT DNS is a recursive DNS resolver written in Go with DNSSEC validation, p
 
 ## Key Capabilities
 
-- Built-in recursive resolver (no external forwarder required)
+- DNR (Distributed Name Resolver) core (no external forwarder required)
 - Optional `miekg/unbound` backend via `resolver_type: "unbound"`
 - DNSSEC validation (`AD` on validated answers)
 - UDP/TCP DNS listener

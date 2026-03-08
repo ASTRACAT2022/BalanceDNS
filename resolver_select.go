@@ -26,7 +26,7 @@ func newRuntimeResolver(cfg *config.Config) (runtimeResolver, error) {
 
 	switch resolverType {
 	case "recursor", "knot":
-		log.Println("Initializing built-in recursive resolver...")
+		log.Println("Initializing DNR (Distributed Name Resolver)...")
 		r, err := recursor.NewResolverWithOptions(recursor.Options{
 			WorkerCount:            cfg.ResolverWorkers,
 			QueryTimeout:           cfg.UpstreamTimeout,
@@ -51,7 +51,7 @@ func newRuntimeResolver(cfg *config.Config) (runtimeResolver, error) {
 			return nil, err
 		}
 		log.Printf(
-			"Built-in recursion configured: workers=%d query-timeout=%s resolve-timeout=%s cache-entries=%d cache-min-ttl=%s cache-max-ttl=%s ns-lookup-workers=%d max-ns-lookups=%d max-concurrent-exchanges=%d ns-addr-cache=%d prefetch-threshold=%d prefetch-concurrency=%d hedge-delay=%s zonecut-cache=%d dnssec-validate=%v dnssec-fail-closed=%v",
+			"DNR configured: workers=%d query-timeout=%s resolve-timeout=%s cache-entries=%d cache-min-ttl=%s cache-max-ttl=%s ns-lookup-workers=%d max-ns-lookups=%d max-concurrent-exchanges=%d ns-addr-cache=%d prefetch-threshold=%d prefetch-concurrency=%d hedge-delay=%s zonecut-cache=%d dnssec-validate=%v dnssec-fail-closed=%v",
 			r.WorkerCount(),
 			cfg.UpstreamTimeout,
 			cfg.RequestTimeout,

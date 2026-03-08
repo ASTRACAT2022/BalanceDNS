@@ -65,7 +65,7 @@ func main() {
 		log.Println("No certificate content in environment variables.")
 	}
 
-	// 4. Initialize built-in recursive resolver
+	// 4. Initialize DNR (Distributed Name Resolver) core
 	resolver, err := newRuntimeResolver(cfg)
 	if err != nil {
 		log.Fatalf("Failed to initialize resolver backend: %v", err)
@@ -180,7 +180,7 @@ func main() {
 	}
 
 	// 8. Start Go DNS Proxy
-	log.Printf("DEBUG: Initializing DNS Proxy on %s using embedded Go recursor", proxyAddr)
+	log.Printf("DEBUG: Initializing DNS Proxy on %s using DNR core", proxyAddr)
 	proxyOptions := buildProxyOptions(cfg)
 	dnsProxy := dnsproxy.NewProxyWithOptions(proxyAddr, resolver, pm, m, hybridCache, proxyOptions)
 	go func() {
@@ -199,7 +199,7 @@ func main() {
 		}
 	}
 
-	log.Println("ASTRACAT Control Plane is running (embedded Go recursor)")
+	log.Println("ASTRACAT Control Plane is running (DNR: Distributed Name Resolver)")
 
 	// 10. Graceful shutdown
 	sig := make(chan os.Signal, 1)
