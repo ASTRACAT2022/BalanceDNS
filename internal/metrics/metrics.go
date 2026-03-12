@@ -9,10 +9,12 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -382,6 +384,26 @@ func (m *Metrics) SetTopDomainsTracking(enabled bool) {
 		promTopNXDomains.Reset()
 		promTopLatencyDomains.Reset()
 		promTopQueriedDomains.Reset()
+	}
+}
+
+// RecordDNSQuery records a valid DNS question consistently across transports.
+func (m *Metrics) RecordDNSQuery(question dns.Question) {
+	if m == nil {
+		return
+	}
+	m.IncrementQueries(question.Name)
+	m.RecordQueryType(qtypeToText(question.Qtype))
+}
+
+// RecordDNSResponse records a DNS response code and NXDOMAIN statistics.
+func (m *Metrics) RecordDNSResponse(qName string, rcode int) {
+	if m == nil {
+		return
+	}
+	m.RecordResponseCode(rcodeToText(rcode))
+	if rcode == dns.RcodeNameError {
+		m.RecordNXDOMAIN(qName)
 	}
 }
 
@@ -759,6 +781,20 @@ func storeFloat64(target *atomic.Uint64, v float64) {
 
 func loadFloat64(target *atomic.Uint64) float64 {
 	return math.Float64frombits(target.Load())
+}
+
+func qtypeToText(qtype uint16) string {
+	if text := dns.TypeToString[qtype]; text != "" {
+		return text
+	}
+	return strconv.FormatUint(uint64(qtype), 10)
+}
+
+func rcodeToText(rcode int) string {
+	if text := dns.RcodeToString[rcode]; text != "" {
+		return text
+	}
+	return strconv.Itoa(rcode)
 }
 
 func snapshotCounterMap(store *sync.Map) map[string]int64 {

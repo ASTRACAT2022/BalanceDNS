@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"dns-resolver/internal/cache"
+	"dns-resolver/internal/dnsutil"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
 
@@ -114,6 +115,13 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 				m.MsgHdr.Response = true
 				m.Rcode = dns.RcodeServerFailure
 			}
+			if p.Metrics != nil {
+				qName := ""
+				if r != nil && len(r.Question) > 0 {
+					qName = r.Question[0].Name
+				}
+				p.Metrics.RecordDNSResponse(qName, dns.RcodeServerFailure)
+			}
 			_ = p.writeResponse(transport, w, r, m)
 		}
 
@@ -130,6 +138,11 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 			rcodeText = dns.RcodeToString[dns.RcodeRefused]
 			if p.Metrics != nil {
 				p.Metrics.RecordSecurityDrop(denyReason, transport)
+				qName := ""
+				if r != nil && len(r.Question) > 0 {
+					qName = r.Question[0].Name
+				}
+				p.Metrics.RecordDNSResponse(qName, dns.RcodeRefused)
 			}
 			m := new(dns.Msg)
 			if r != nil {
@@ -149,6 +162,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		rcodeText = dns.RcodeToString[dns.RcodeFormatError]
 		if p.Metrics != nil {
 			p.Metrics.RecordMalformedRequest(transport)
+			p.Metrics.RecordDNSResponse("", dns.RcodeFormatError)
 		}
 
 		m := new(dns.Msg)
@@ -167,6 +181,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		rcodeText = dns.RcodeToString[dns.RcodeFormatError]
 		if p.Metrics != nil {
 			p.Metrics.RecordSecurityDrop("too_many_questions", transport)
+			p.Metrics.RecordDNSResponse(r.Question[0].Name, dns.RcodeFormatError)
 		}
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeFormatError)
@@ -175,11 +190,16 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 	}
 
 	question := r.Question[0]
+	if p.Metrics != nil {
+		p.Metrics.RecordDNSQuery(question)
+	}
+
 	if p.opts.MaxQNameLength > 0 && len(question.Name) > p.opts.MaxQNameLength {
 		outcome = "security_drop_qname_too_long"
 		rcodeText = dns.RcodeToString[dns.RcodeFormatError]
 		if p.Metrics != nil {
 			p.Metrics.RecordSecurityDrop("qname_too_long", transport)
+			p.Metrics.RecordDNSResponse(question.Name, dns.RcodeFormatError)
 		}
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeFormatError)
@@ -192,19 +212,12 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		rcodeText = dns.RcodeToString[dns.RcodeRefused]
 		if p.Metrics != nil {
 			p.Metrics.RecordSecurityDrop("any_query", transport)
+			p.Metrics.RecordDNSResponse(question.Name, dns.RcodeRefused)
 		}
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeRefused)
 		_ = p.writeResponse(transport, w, r, m)
 		return
-	}
-
-	// Record basic stats if metrics enabled.
-	if p.Metrics != nil {
-		qName := question.Name
-		qType := qtypeToText(question.Qtype)
-		p.Metrics.IncrementQueries(qName)
-		p.Metrics.RecordQueryType(qType)
 	}
 
 	if p.policy != nil {
@@ -213,10 +226,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 			rcodeText = dns.RcodeToString[msg.Rcode]
 			if p.Metrics != nil {
 				p.Metrics.RecordPolicyAction(action)
-				if msg.Rcode == dns.RcodeNameError {
-					p.Metrics.RecordNXDOMAIN(question.Name)
-				}
-				p.Metrics.RecordResponseCode(dns.RcodeToString[msg.Rcode])
+				p.Metrics.RecordDNSResponse(question.Name, msg.Rcode)
 			}
 			_ = p.writeResponse(transport, w, r, msg)
 			return
@@ -271,14 +281,30 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 
 		// 2. Policy Miss: Execute Plugins
 		if p.PM != nil {
+			pluginWriter := dnsutil.NewCapturingResponseWriter(w)
 			ctx := &plugins.PluginContext{
-				ResponseWriter: w,
+				ResponseWriter: pluginWriter,
 				Metrics:        p.Metrics,
 			}
 
-			if handled := p.PM.ExecutePlugins(ctx, w, r); handled {
-				outcome = "plugin_handled"
-				rcodeText = dns.RcodeToString[dns.RcodeSuccess]
+			if handled := p.PM.ExecutePlugins(ctx, pluginWriter, r); handled {
+				if pluginWriter.Msg != nil {
+					outcome = "plugin_handled"
+					rcodeText = dns.RcodeToString[pluginWriter.Msg.Rcode]
+					if p.Metrics != nil {
+						p.Metrics.RecordDNSResponse(question.Name, pluginWriter.Msg.Rcode)
+					}
+					return
+				}
+
+				outcome = "plugin_dropped"
+				rcodeText = "DROPPED"
+				if question.Qtype == dns.TypeANY {
+					outcome = "security_drop_any_query"
+					if p.Metrics != nil {
+						p.Metrics.RecordSecurityDrop("any_query", transport)
+					}
+				}
 				return
 			}
 
@@ -292,6 +318,9 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 	if p.Resolver == nil {
 		outcome = "resolver_unavailable"
 		rcodeText = dns.RcodeToString[dns.RcodeServerFailure]
+		if p.Metrics != nil {
+			p.Metrics.RecordDNSResponse(question.Name, dns.RcodeServerFailure)
+		}
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeServerFailure)
 		_ = p.writeResponse(transport, w, r, m)
@@ -305,6 +334,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		rcodeText = dns.RcodeToString[dns.RcodeServerFailure]
 		if p.Metrics != nil {
 			p.Metrics.IncrementUnboundErrors()
+			p.Metrics.RecordDNSResponse(question.Name, dns.RcodeServerFailure)
 		}
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeServerFailure)
@@ -318,10 +348,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		latency := time.Since(startTime)
 		qName := question.Name
 		p.Metrics.RecordLatency(qName, latency)
-		p.Metrics.RecordResponseCode(dns.RcodeToString[resp.Rcode])
-		if resp.Rcode == dns.RcodeNameError {
-			p.Metrics.RecordNXDOMAIN(qName)
-		}
+		p.Metrics.RecordDNSResponse(qName, resp.Rcode)
 	}
 
 	_ = p.writeResponse(transport, w, r, resp)
@@ -404,11 +431,4 @@ func buildDecisionCacheKey(qtype uint16, qname string) string {
 	buf = append(buf, ':')
 	buf = append(buf, qname...)
 	return string(buf)
-}
-
-func qtypeToText(qtype uint16) string {
-	if text := dns.TypeToString[qtype]; text != "" {
-		return text
-	}
-	return strconv.FormatUint(uint64(qtype), 10)
 }
