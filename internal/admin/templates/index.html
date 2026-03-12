@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Astracat DNS Control Plane</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div class="shell">
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="brand-mark">AD</div>
+                <div>
+                    <div class="brand-title">Astracat DNS</div>
+                    <div class="brand-subtitle">Control Plane</div>
+                </div>
+            </div>
+
+            <nav class="nav">
+                <button class="nav-link" data-route="dashboard">Мониторинг</button>
+                <button class="nav-link" data-route="config">Конфиг</button>
+                <button class="nav-link" data-route="plugins">Плагины</button>
+                <button class="nav-link" data-route="dns">DNS / Hosts</button>
+                <button class="nav-link" data-route="policy">Policy Manager</button>
+            </nav>
+
+            <div class="sidebar-foot">
+                <div class="side-card">
+                    <div class="eyebrow">Runtime</div>
+                    <div id="sidebarStatus" class="side-card-value">Connecting...</div>
+                    <p class="side-card-copy">Живые метрики, конфиги и DNS-правила в одной панели.</p>
+                </div>
+                <a href="/logout" class="logout-link">Выйти</a>
+            </div>
+        </aside>
+
+        <main class="workspace">
+            <header class="topbar">
+                <div>
+                    <div class="eyebrow" id="pageEyebrow">Astracat</div>
+                    <h1 id="pageTitle">Control Plane</h1>
+                </div>
+                <div class="topbar-actions">
+                    <button id="refreshPage" class="ghost-button">Обновить</button>
+                    <button id="reloadResolver" class="primary-button">Reload Resolver</button>
+                    <button id="clearCache" class="ghost-button danger">Clear Cache</button>
+                </div>
+            </header>
+
+            <section id="app" class="view"></section>
+        </main>
+    </div>
+
+    <div id="flashStack" class="flash-stack"></div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

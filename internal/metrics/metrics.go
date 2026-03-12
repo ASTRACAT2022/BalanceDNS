@@ -50,6 +50,18 @@ type CodeCount struct {
 	Count int64  `json:"count"`
 }
 
+type MetricPoint struct {
+	Timestamp      time.Time `json:"timestamp"`
+	QPS            float64   `json:"qps"`
+	TotalQueries   int64     `json:"total_queries"`
+	BlockedDomains int64     `json:"blocked_domains"`
+	CPUUsage       float64   `json:"cpu_usage"`
+	MemoryUsage    float64   `json:"memory_usage"`
+	CacheHitRate   float64   `json:"cache_hit_rate"`
+	CacheHits      int64     `json:"cache_hits"`
+	CacheMisses    int64     `json:"cache_misses"`
+}
+
 type DashboardMetrics struct {
 	QPS               float64         `json:"qps"`
 	TotalQueries      int64           `json:"total_queries"`
@@ -60,11 +72,16 @@ type DashboardMetrics struct {
 	CacheHits         int64           `json:"cache_hits"`
 	CacheMisses       int64           `json:"cache_misses"`
 	CacheHitRate      float64         `json:"cache_hit_rate"`
+	UptimeSeconds     float64         `json:"uptime_seconds"`
+	NetworkSentBytes  uint64          `json:"network_sent_bytes"`
+	NetworkRecvBytes  uint64          `json:"network_recv_bytes"`
 	TopNXDomains      []DomainCount   `json:"top_nx_domains"`
 	TopLatencyDomains []DomainLatency `json:"top_latency_domains"`
 	TopQueriedDomains []DomainCount   `json:"top_queried_domains"`
 	QueryTypes        []TypeCount     `json:"query_types"`
 	ResponseCodes     []CodeCount     `json:"response_codes"`
+	History24h        []MetricPoint   `json:"history_24h"`
+	History7d         []MetricPoint   `json:"history_7d"`
 }
 
 type counterValue struct {
@@ -93,10 +110,16 @@ type Metrics struct {
 	qpsBits         atomic.Uint64
 	cpuUsageBits    atomic.Uint64
 	memoryUsageBits atomic.Uint64
+	networkSent     atomic.Uint64
+	networkRecv     atomic.Uint64
 	goroutines      atomic.Int64
 	cacheHits       atomic.Int64
 	cacheMisses     atomic.Int64
 	topDomainsOn    atomic.Bool
+
+	historyMu     sync.RWMutex
+	minuteHistory []MetricPoint
+	hourHistory   []MetricPoint
 }
 
 var (
@@ -244,7 +267,9 @@ var (
 
 // HistoricalData holds metrics that are persisted.
 type HistoricalData struct {
-	TotalQueries int64 `json:"total_queries"`
+	TotalQueries  int64         `json:"total_queries"`
+	MinuteHistory []MetricPoint `json:"minute_history"`
+	HourHistory   []MetricPoint `json:"hour_history"`
 }
 
 // NewMetrics returns a singleton Metrics instance.
@@ -262,6 +287,7 @@ func NewMetrics(storagePath string) *Metrics {
 		go instance.qpsCalculator()
 		go instance.systemMetricsCollector()
 		go instance.topDomainsProcessor()
+		go instance.historyCollector()
 	})
 	return instance
 }
@@ -285,12 +311,23 @@ func (m *Metrics) loadHistoricalData(path string) error {
 		promTotalQueries.Add(float64(historicalData.TotalQueries))
 	}
 
+	m.historyMu.Lock()
+	m.minuteHistory = pruneMetricHistory(historicalData.MinuteHistory, 24*time.Hour, 24*60)
+	m.hourHistory = pruneMetricHistory(historicalData.HourHistory, 7*24*time.Hour, 7*24)
+	m.historyMu.Unlock()
+
 	return nil
 }
 
 // SaveHistoricalData saves metrics to a file.
 func (m *Metrics) SaveHistoricalData(path string) error {
-	historicalData := HistoricalData{TotalQueries: m.TotalQueries.Load()}
+	m.historyMu.RLock()
+	historicalData := HistoricalData{
+		TotalQueries:  m.TotalQueries.Load(),
+		MinuteHistory: append([]MetricPoint(nil), m.minuteHistory...),
+		HourHistory:   append([]MetricPoint(nil), m.hourHistory...),
+	}
+	m.historyMu.RUnlock()
 
 	data, err := json.Marshal(historicalData)
 	if err != nil {
@@ -343,6 +380,17 @@ func (m *Metrics) jsonMetricsHandler(w http.ResponseWriter, _ *http.Request) {
 
 // SnapshotDashboard returns a point-in-time metrics snapshot safe for concurrent use.
 func (m *Metrics) SnapshotDashboard() DashboardMetrics {
+	base := m.snapshotBase()
+
+	m.historyMu.RLock()
+	base.History24h = append([]MetricPoint(nil), m.minuteHistory...)
+	base.History7d = append([]MetricPoint(nil), m.hourHistory...)
+	m.historyMu.RUnlock()
+
+	return base
+}
+
+func (m *Metrics) snapshotBase() DashboardMetrics {
 	topNXDomains := getTopDomainCounts(&m.TopNXDomains, 10)
 	topLatencyDomains := getTopLatencyDomains(&m.TopLatencyDomains, 10)
 	topQueriedDomains := getTopDomainCounts(&m.TopQueriedDomains, 10)
@@ -366,6 +414,9 @@ func (m *Metrics) SnapshotDashboard() DashboardMetrics {
 		CacheHits:         cacheHits,
 		CacheMisses:       cacheMisses,
 		CacheHitRate:      cacheHitRate,
+		UptimeSeconds:     time.Since(m.startTime).Seconds(),
+		NetworkSentBytes:  m.networkSent.Load(),
+		NetworkRecvBytes:  m.networkRecv.Load(),
 		TopNXDomains:      topNXDomains,
 		TopLatencyDomains: topLatencyDomains,
 		TopQueriedDomains: topQueriedDomains,
@@ -475,12 +526,47 @@ func (m *Metrics) systemMetricsCollector() {
 
 		netIO, err := net.IOCounters(false)
 		if err == nil && len(netIO) > 0 {
+			m.networkSent.Store(netIO[0].BytesSent)
+			m.networkRecv.Store(netIO[0].BytesRecv)
 			promNetworkSent.Set(float64(netIO[0].BytesSent))
 			promNetworkRecv.Set(float64(netIO[0].BytesRecv))
 		} else if err != nil {
 			log.Printf("Error collecting network metrics: %v", err)
 		}
 	}
+}
+
+func (m *Metrics) historyCollector() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	m.captureHistoryPoint(true, true)
+	lastHourKey := time.Now().UTC().Format("2006-01-02T15")
+
+	for t := range ticker.C {
+		m.captureHistoryPoint(true, false)
+
+		hourKey := t.UTC().Format("2006-01-02T15")
+		if hourKey != lastHourKey {
+			m.captureHistoryPoint(false, true)
+			lastHourKey = hourKey
+		}
+	}
+}
+
+func (m *Metrics) captureHistoryPoint(captureMinute, captureHour bool) {
+	point := metricPointFromSnapshot(m.snapshotBase())
+
+	m.historyMu.Lock()
+	if captureMinute {
+		m.minuteHistory = append(m.minuteHistory, point)
+		m.minuteHistory = pruneMetricHistory(m.minuteHistory, 24*time.Hour, 24*60)
+	}
+	if captureHour {
+		m.hourHistory = append(m.hourHistory, point)
+		m.hourHistory = pruneMetricHistory(m.hourHistory, 7*24*time.Hour, 7*24)
+	}
+	m.historyMu.Unlock()
 }
 
 // UpdateCacheStats updates the cache statistics.
@@ -781,6 +867,43 @@ func storeFloat64(target *atomic.Uint64, v float64) {
 
 func loadFloat64(target *atomic.Uint64) float64 {
 	return math.Float64frombits(target.Load())
+}
+
+func metricPointFromSnapshot(snapshot DashboardMetrics) MetricPoint {
+	return MetricPoint{
+		Timestamp:      time.Now().UTC(),
+		QPS:            snapshot.QPS,
+		TotalQueries:   snapshot.TotalQueries,
+		BlockedDomains: snapshot.BlockedDomains,
+		CPUUsage:       snapshot.CPUUsage,
+		MemoryUsage:    snapshot.MemoryUsage,
+		CacheHitRate:   snapshot.CacheHitRate,
+		CacheHits:      snapshot.CacheHits,
+		CacheMisses:    snapshot.CacheMisses,
+	}
+}
+
+func pruneMetricHistory(points []MetricPoint, maxAge time.Duration, maxLen int) []MetricPoint {
+	if len(points) == 0 {
+		return nil
+	}
+
+	cutoff := time.Now().UTC().Add(-maxAge)
+	pruned := make([]MetricPoint, 0, len(points))
+	for _, point := range points {
+		if point.Timestamp.IsZero() {
+			continue
+		}
+		if point.Timestamp.UTC().Before(cutoff) {
+			continue
+		}
+		pruned = append(pruned, point)
+	}
+
+	if len(pruned) > maxLen {
+		pruned = pruned[len(pruned)-maxLen:]
+	}
+	return pruned
 }
 
 func qtypeToText(qtype uint16) string {

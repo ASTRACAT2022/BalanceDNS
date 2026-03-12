@@ -196,7 +196,7 @@ func main() {
 		if cfg.AdminUsername == "" || cfg.AdminPassword == "" {
 			log.Printf("Admin server disabled: set both admin_username and admin_password to enable %s", cfg.AdminAddr)
 		} else {
-			adminServer := admin.New(cfg, m, resolver, hostsPlugin, adBlockPlugin, pm)
+			adminServer := admin.New(cfg, m, resolver, hostsPlugin, adBlockPlugin, pm, dnsProxy)
 			go adminServer.Start()
 		}
 	}

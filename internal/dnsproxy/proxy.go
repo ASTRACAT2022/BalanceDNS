@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"dns-resolver/internal/cache"
@@ -23,6 +24,8 @@ type Resolver interface {
 
 // Proxy forwards DNS queries to an upstream resolver.
 type Proxy struct {
+	mu sync.RWMutex
+
 	Addr     string
 	Resolver Resolver
 	PM       *plugins.PluginManager
@@ -97,6 +100,14 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 	outcome := "resolved"
 	rcodeText := dns.RcodeToString[dns.RcodeSuccess]
 
+	p.mu.RLock()
+	security := p.security
+	policy := p.policy
+	maxQuestionsPerRequest := p.opts.MaxQuestionsPerRequest
+	maxQNameLength := p.opts.MaxQNameLength
+	dropANYQueries := p.opts.DropANYQueries
+	p.mu.RUnlock()
+
 	if p.Metrics != nil {
 		p.Metrics.IncrementInflightRequests()
 		defer p.Metrics.DecrementInflightRequests()
@@ -131,8 +142,8 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 	}()
 
 	clientIP := extractClientIP(w)
-	if p.security != nil {
-		release, denyReason := p.security.admit(clientIP)
+	if security != nil {
+		release, denyReason := security.admit(clientIP)
 		if denyReason != "" {
 			outcome = "security_drop_" + denyReason
 			rcodeText = dns.RcodeToString[dns.RcodeRefused]
@@ -176,7 +187,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		return
 	}
 
-	if p.opts.MaxQuestionsPerRequest > 0 && len(r.Question) > p.opts.MaxQuestionsPerRequest {
+	if maxQuestionsPerRequest > 0 && len(r.Question) > maxQuestionsPerRequest {
 		outcome = "security_drop_too_many_questions"
 		rcodeText = dns.RcodeToString[dns.RcodeFormatError]
 		if p.Metrics != nil {
@@ -194,7 +205,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		p.Metrics.RecordDNSQuery(question)
 	}
 
-	if p.opts.MaxQNameLength > 0 && len(question.Name) > p.opts.MaxQNameLength {
+	if maxQNameLength > 0 && len(question.Name) > maxQNameLength {
 		outcome = "security_drop_qname_too_long"
 		rcodeText = dns.RcodeToString[dns.RcodeFormatError]
 		if p.Metrics != nil {
@@ -207,7 +218,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		return
 	}
 
-	if p.opts.DropANYQueries && question.Qtype == dns.TypeANY {
+	if dropANYQueries && question.Qtype == dns.TypeANY {
 		outcome = "security_drop_any_query"
 		rcodeText = dns.RcodeToString[dns.RcodeRefused]
 		if p.Metrics != nil {
@@ -220,8 +231,8 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		return
 	}
 
-	if p.policy != nil {
-		if msg, handled, action := p.policy.apply(r); handled {
+	if policy != nil {
+		if msg, handled, action := policy.apply(r); handled {
 			outcome = "policy_" + action
 			rcodeText = dns.RcodeToString[msg.Rcode]
 			if p.Metrics != nil {
@@ -352,6 +363,14 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 	}
 
 	_ = p.writeResponse(transport, w, r, resp)
+}
+
+// UpdatePolicy applies a new in-memory policy configuration for subsequent requests.
+func (p *Proxy) UpdatePolicy(opts ProxyPolicyOptions) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.opts.Policy = opts
+	p.policy = newPolicyEngine(opts)
 }
 
 func (p *Proxy) writeResponse(transport string, w dns.ResponseWriter, req *dns.Msg, resp *dns.Msg) error {
