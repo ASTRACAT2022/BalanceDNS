@@ -33,6 +33,12 @@ type Plugin interface {
 	GetConfigFields() []ConfigField
 }
 
+// PreflightPlugin runs before policy/cache so it can block traffic early.
+type PreflightPlugin interface {
+	Plugin
+	PreflightOnly() bool
+}
+
 // PluginManager manages the lifecycle of plugins.
 type PluginManager struct {
 	plugins []Plugin
@@ -51,9 +57,32 @@ func (pm *PluginManager) Register(p Plugin) {
 	pm.plugins = append(pm.plugins, p)
 }
 
+// ExecutePreflightPlugins runs only plugins marked for early execution.
+func (pm *PluginManager) ExecutePreflightPlugins(ctx *PluginContext, w dns.ResponseWriter, r *dns.Msg) bool {
+	for _, p := range pm.plugins {
+		preflight, ok := p.(PreflightPlugin)
+		if !ok || !preflight.PreflightOnly() {
+			continue
+		}
+
+		handled, err := p.Execute(ctx, w, r)
+		if err != nil {
+			log.Printf("Error executing preflight plugin %s: %v", p.Name(), err)
+		}
+		if handled {
+			return true
+		}
+	}
+	return false
+}
+
 // ExecutePlugins runs all registered plugins.
 func (pm *PluginManager) ExecutePlugins(ctx *PluginContext, w dns.ResponseWriter, r *dns.Msg) bool {
 	for _, p := range pm.plugins {
+		if preflight, ok := p.(PreflightPlugin); ok && preflight.PreflightOnly() {
+			continue
+		}
+
 		handled, err := p.Execute(ctx, w, r)
 		if err != nil {
 			log.Printf("Error executing plugin %s: %v", p.Name(), err)

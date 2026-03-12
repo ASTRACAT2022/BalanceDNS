@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"dns-resolver/internal/dnsutil"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
 
@@ -22,16 +23,18 @@ type Server struct {
 	Client         *dns.Client
 	PM             *plugins.PluginManager
 	Metrics        *metrics.Metrics
+	DropANYQueries bool
 }
 
 // NewServer creates a new DoT server.
-func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.PluginManager, m *metrics.Metrics) *Server {
+func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.PluginManager, m *metrics.Metrics, dropANYQueries bool) *Server {
 	return &Server{
 		Addr:           addr,
 		TLSConfig:      tlsConfig,
 		UpstreamTarget: upstream,
 		PM:             pm,
 		Metrics:        m,
+		DropANYQueries: dropANYQueries,
 		Client: &dns.Client{
 			Net:     "udp",
 			Timeout: 3 * time.Second,
@@ -76,6 +79,7 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 		rcodeText = dns.RcodeToString[dns.RcodeFormatError]
 		if s.Metrics != nil {
 			s.Metrics.RecordMalformedRequest("dot")
+			s.Metrics.RecordDNSResponse("", dns.RcodeFormatError)
 		}
 		m := new(dns.Msg)
 		if r != nil {
@@ -88,23 +92,78 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 
+	question := r.Question[0]
+
 	// 1. Record Request Metrics
 	if s.Metrics != nil {
-		qName := r.Question[0].Name
-		qType := dns.TypeToString[r.Question[0].Qtype]
-		s.Metrics.IncrementQueries(qName)
-		s.Metrics.RecordQueryType(qType)
+		s.Metrics.RecordDNSQuery(question)
+	}
+
+	if s.PM != nil {
+		pluginWriter := dnsutil.NewCapturingResponseWriter(w)
+		ctx := &plugins.PluginContext{
+			ResponseWriter: pluginWriter,
+			Metrics:        s.Metrics,
+		}
+		if handled := s.PM.ExecutePreflightPlugins(ctx, pluginWriter, r); handled {
+			if pluginWriter.Msg != nil {
+				outcome = "plugin_handled"
+				rcodeText = dns.RcodeToString[pluginWriter.Msg.Rcode]
+				if s.Metrics != nil {
+					s.Metrics.RecordDNSResponse(question.Name, pluginWriter.Msg.Rcode)
+				}
+				return
+			}
+			outcome = "plugin_dropped"
+			rcodeText = "DROPPED"
+			if question.Qtype == dns.TypeANY {
+				outcome = "security_drop_any_query"
+				if s.Metrics != nil {
+					s.Metrics.RecordSecurityDrop("any_query", "dot")
+				}
+			}
+			return
+		}
+	}
+
+	if s.DropANYQueries && question.Qtype == dns.TypeANY {
+		outcome = "security_drop_any_query"
+		rcodeText = dns.RcodeToString[dns.RcodeRefused]
+		if s.Metrics != nil {
+			s.Metrics.RecordSecurityDrop("any_query", "dot")
+			s.Metrics.RecordDNSResponse(question.Name, dns.RcodeRefused)
+		}
+		m := new(dns.Msg)
+		m.SetRcode(r, dns.RcodeRefused)
+		_ = w.WriteMsg(m)
+		return
 	}
 
 	// 2. Execute Plugins
 	if s.PM != nil {
+		pluginWriter := dnsutil.NewCapturingResponseWriter(w)
 		ctx := &plugins.PluginContext{
-			ResponseWriter: w,
+			ResponseWriter: pluginWriter,
 			Metrics:        s.Metrics,
 		}
-		if handled := s.PM.ExecutePlugins(ctx, w, r); handled {
-			outcome = "plugin_handled"
-			return // Plugin handled (e.g. blocked)
+		if handled := s.PM.ExecutePlugins(ctx, pluginWriter, r); handled {
+			if pluginWriter.Msg != nil {
+				outcome = "plugin_handled"
+				rcodeText = dns.RcodeToString[pluginWriter.Msg.Rcode]
+				if s.Metrics != nil {
+					s.Metrics.RecordDNSResponse(question.Name, pluginWriter.Msg.Rcode)
+				}
+				return
+			}
+			outcome = "plugin_dropped"
+			rcodeText = "DROPPED"
+			if question.Qtype == dns.TypeANY {
+				outcome = "security_drop_any_query"
+				if s.Metrics != nil {
+					s.Metrics.RecordSecurityDrop("any_query", "dot")
+				}
+			}
+			return
 		}
 	}
 
@@ -124,6 +183,7 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 		rcodeText = dns.RcodeToString[dns.RcodeServerFailure]
 		if s.Metrics != nil {
 			s.Metrics.IncrementUnboundErrors()
+			s.Metrics.RecordDNSResponse(question.Name, dns.RcodeServerFailure)
 		}
 		m := new(dns.Msg)
 		m.SetRcode(r, dns.RcodeServerFailure)
@@ -135,12 +195,8 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 	// 4. Record Response Metrics
 	if s.Metrics != nil {
 		latency := time.Since(resolveStart)
-		qName := r.Question[0].Name
-		s.Metrics.RecordLatency(qName, latency)
-		s.Metrics.RecordResponseCode(dns.RcodeToString[resp.Rcode])
-		if resp.Rcode == dns.RcodeNameError {
-			s.Metrics.RecordNXDOMAIN(qName)
-		}
+		s.Metrics.RecordLatency(question.Name, latency)
+		s.Metrics.RecordDNSResponse(question.Name, resp.Rcode)
 	}
 
 	_ = w.WriteMsg(resp)
