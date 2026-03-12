@@ -32,13 +32,14 @@ type Server struct {
 	Client         *dns.Client
 	PM             *plugins.PluginManager
 	Metrics        *metrics.Metrics
+	DropANYQueries bool
 
 	// ODoH specific
 	KeyPair odoh.ObliviousDoHKeyPair
 }
 
 // NewServer creates a new ODoH server.
-func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.PluginManager, m *metrics.Metrics) (*Server, error) {
+func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.PluginManager, m *metrics.Metrics, dropANYQueries bool) (*Server, error) {
 	if tlsConfig == nil {
 		return nil, fmt.Errorf("tls config is nil")
 	}
@@ -56,6 +57,7 @@ func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.
 		UpstreamTarget: upstream,
 		PM:             pm,
 		Metrics:        m,
+		DropANYQueries: dropANYQueries,
 		KeyPair:        kp,
 		Client: &dns.Client{
 			Net:     "udp",
@@ -161,7 +163,7 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respMsg, resolveOutcome, err := s.resolveDNSMessage(r.Context(), reqMsg)
+	respMsg, resolveOutcome, err := s.resolveDNSMessage(r.Context(), "doh", reqMsg)
 	if err != nil {
 		log.Printf("DoH Upstream Error: %v", err)
 		outcome = resolveOutcome
@@ -268,7 +270,7 @@ func (s *Server) handleODoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respMsg, resolveOutcome, err := s.resolveDNSMessage(r.Context(), reqMsg)
+	respMsg, resolveOutcome, err := s.resolveDNSMessage(r.Context(), "odoh", reqMsg)
 	if err != nil {
 		log.Printf("ODoH Upstream Error: %v", err)
 		outcome = resolveOutcome
@@ -347,17 +349,48 @@ func normalizeContentType(contentType string) string {
 	return contentType
 }
 
-func (s *Server) resolveDNSMessage(ctx context.Context, reqMsg *dns.Msg) (*dns.Msg, string, error) {
+func (s *Server) resolveDNSMessage(ctx context.Context, transport string, reqMsg *dns.Msg) (*dns.Msg, string, error) {
 	if len(reqMsg.Question) == 0 {
 		return nil, "malformed_dns", errors.New("dns message has no question")
 	}
 
 	question := reqMsg.Question[0]
 	if s.Metrics != nil {
-		qName := question.Name
-		qType := dns.TypeToString[question.Qtype]
-		s.Metrics.IncrementQueries(qName)
-		s.Metrics.RecordQueryType(qType)
+		s.Metrics.RecordDNSQuery(question)
+	}
+
+	if s.PM != nil {
+		dummyWriter := &DumbResponseWriter{}
+		ctx := &plugins.PluginContext{
+			ResponseWriter: dummyWriter,
+			Metrics:        s.Metrics,
+		}
+		if handled := s.PM.ExecutePreflightPlugins(ctx, dummyWriter, reqMsg); handled {
+			if dummyWriter.Msg != nil {
+				s.recordResponseCodeMetrics(question.Name, dummyWriter.Msg.Rcode)
+				return dummyWriter.Msg, "plugin_handled", nil
+			}
+			if question.Qtype == dns.TypeANY && s.Metrics != nil {
+				s.Metrics.RecordSecurityDrop("any_query", transport)
+			}
+			refused := new(dns.Msg)
+			refused.SetRcode(reqMsg, dns.RcodeRefused)
+			s.recordResponseCodeMetrics(question.Name, refused.Rcode)
+			if question.Qtype == dns.TypeANY {
+				return refused, "security_drop_any_query", nil
+			}
+			return refused, "plugin_dropped", nil
+		}
+	}
+
+	if s.DropANYQueries && question.Qtype == dns.TypeANY {
+		if s.Metrics != nil {
+			s.Metrics.RecordSecurityDrop("any_query", transport)
+			s.Metrics.RecordDNSResponse(question.Name, dns.RcodeRefused)
+		}
+		refused := new(dns.Msg)
+		refused.SetRcode(reqMsg, dns.RcodeRefused)
+		return refused, "security_drop_any_query", nil
 	}
 
 	dummyWriter := &DumbResponseWriter{}
@@ -371,10 +404,16 @@ func (s *Server) resolveDNSMessage(ctx context.Context, reqMsg *dns.Msg) (*dns.M
 				s.recordResponseCodeMetrics(question.Name, dummyWriter.Msg.Rcode)
 				return dummyWriter.Msg, "plugin_handled", nil
 			}
+			if question.Qtype == dns.TypeANY && s.Metrics != nil {
+				s.Metrics.RecordSecurityDrop("any_query", transport)
+			}
 			// HTTP-based DNS transport cannot silently drop; synthesize REFUSED.
 			refused := new(dns.Msg)
 			refused.SetRcode(reqMsg, dns.RcodeRefused)
 			s.recordResponseCodeMetrics(question.Name, refused.Rcode)
+			if question.Qtype == dns.TypeANY {
+				return refused, "security_drop_any_query", nil
+			}
 			return refused, "plugin_dropped", nil
 		}
 	}

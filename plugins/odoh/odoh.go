@@ -11,11 +11,12 @@ import (
 
 // Config holds configuration for the ODoH plugin.
 type Config struct {
-	ODoHAddr     string
-	CertFile     string      // Deprecated: use TLSConfig
-	KeyFile      string      // Deprecated: use TLSConfig
-	TLSConfig    *tls.Config // New field for pre-configured TLS
-	DNSProxyAddr string
+	ODoHAddr       string
+	CertFile       string      // Deprecated: use TLSConfig
+	KeyFile        string      // Deprecated: use TLSConfig
+	TLSConfig      *tls.Config // New field for pre-configured TLS
+	DNSProxyAddr   string
+	DropANYQueries bool
 }
 
 // Plugin manages the lifecycle of ODoH server.
@@ -46,7 +47,7 @@ func (p *Plugin) Start() {
 
 	// 2. Start DoH/ODoH server
 	log.Printf("[ODoH Plugin] Starting DoH/ODoH server on %s...", p.config.ODoHAddr)
-	srv, err := odoh.NewServer(p.config.ODoHAddr, p.config.TLSConfig, p.config.DNSProxyAddr, p.pm, p.m)
+	srv, err := odoh.NewServer(p.config.ODoHAddr, p.config.TLSConfig, p.config.DNSProxyAddr, p.pm, p.m, p.config.DropANYQueries)
 	if err != nil {
 		log.Printf("[ODoH Plugin] Failed to initialize server: %v", err)
 		return

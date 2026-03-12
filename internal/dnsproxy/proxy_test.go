@@ -2,8 +2,15 @@ package dnsproxy
 
 import (
 	"net"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"dns-resolver/internal/cache"
+	"dns-resolver/internal/metrics"
+	"dns-resolver/internal/plugins"
+	"dns-resolver/plugins/anyblock"
 
 	"github.com/miekg/dns"
 )
@@ -145,4 +152,129 @@ func TestHandleRequestUDPTruncatesWithoutEDNS(t *testing.T) {
 	if !w.msg.Truncated {
 		t.Fatal("expected TC bit on oversized UDP response")
 	}
+}
+
+type testRefusedPlugin struct{}
+
+func (p *testRefusedPlugin) Name() string { return "test_refused" }
+
+func (p *testRefusedPlugin) Execute(_ *plugins.PluginContext, w dns.ResponseWriter, r *dns.Msg) (bool, error) {
+	resp := new(dns.Msg)
+	resp.SetRcode(r, dns.RcodeRefused)
+	return true, w.WriteMsg(resp)
+}
+
+func (p *testRefusedPlugin) GetConfig() map[string]any { return nil }
+
+func (p *testRefusedPlugin) SetConfig(map[string]any) error { return nil }
+
+func (p *testRefusedPlugin) GetConfigFields() []plugins.ConfigField { return nil }
+
+func TestHandleRequestAnyDropRecordsMetrics(t *testing.T) {
+	m := &metrics.Metrics{}
+	opts := DefaultProxyOptions()
+	opts.DropANYQueries = true
+
+	p := NewProxyWithOptions("127.0.0.1:0", nil, nil, m, nil, opts)
+	w := &testResponseWriter{}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeANY)
+	p.handleRequest("udp", w, req)
+
+	if w.msg == nil {
+		t.Fatal("expected response")
+	}
+	if got, want := w.msg.Rcode, dns.RcodeRefused; got != want {
+		t.Fatalf("unexpected rcode: got=%d want=%d", got, want)
+	}
+
+	snapshot := m.SnapshotDashboard()
+	if got, want := snapshot.TotalQueries, int64(1); got != want {
+		t.Fatalf("unexpected total queries: got=%d want=%d", got, want)
+	}
+	if got, want := typeCount(snapshot.QueryTypes, "ANY"), int64(1); got != want {
+		t.Fatalf("unexpected ANY query count: got=%d want=%d", got, want)
+	}
+	if got, want := codeCount(snapshot.ResponseCodes, dns.RcodeToString[dns.RcodeRefused]), int64(1); got != want {
+		t.Fatalf("unexpected REFUSED count: got=%d want=%d", got, want)
+	}
+}
+
+func TestHandleRequestPluginResponseRecordsMetrics(t *testing.T) {
+	m := &metrics.Metrics{}
+	pm := plugins.NewPluginManager()
+	pm.Register(&testRefusedPlugin{})
+
+	p := NewProxy("127.0.0.1:0", &testResolver{}, pm, m, nil)
+	w := &testResponseWriter{}
+
+	req := new(dns.Msg)
+	req.SetQuestion("blocked.example.", dns.TypeA)
+	p.handleRequest("udp", w, req)
+
+	if w.msg == nil {
+		t.Fatal("expected response")
+	}
+	if got, want := w.msg.Rcode, dns.RcodeRefused; got != want {
+		t.Fatalf("unexpected rcode: got=%d want=%d", got, want)
+	}
+
+	snapshot := m.SnapshotDashboard()
+	if got, want := snapshot.TotalQueries, int64(1); got != want {
+		t.Fatalf("unexpected total queries: got=%d want=%d", got, want)
+	}
+	if got, want := typeCount(snapshot.QueryTypes, "A"), int64(1); got != want {
+		t.Fatalf("unexpected A query count: got=%d want=%d", got, want)
+	}
+	if got, want := codeCount(snapshot.ResponseCodes, dns.RcodeToString[dns.RcodeRefused]), int64(1); got != want {
+		t.Fatalf("unexpected REFUSED count: got=%d want=%d", got, want)
+	}
+}
+
+func TestPreflightAnyBlockPluginRunsBeforePolicyCache(t *testing.T) {
+	c, err := cache.NewCache(1, filepath.Join(t.TempDir(), "policy.db"))
+	if err != nil {
+		t.Fatalf("new cache: %v", err)
+	}
+	defer c.Close()
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeANY)
+
+	pm := plugins.NewPluginManager()
+	pm.Register(anyblock.New(true))
+
+	opts := DefaultProxyOptions()
+	opts.DropANYQueries = false
+
+	cacheKey := buildDecisionCacheKey(dns.TypeANY, "example.com.")
+	c.Set(cacheKey, &cache.Decision{Action: cache.ActionPass}, time.Hour)
+
+	p := NewProxyWithOptions("127.0.0.1:0", &testResolver{}, pm, nil, c, opts)
+	w := &testResponseWriter{}
+
+	p.handleRequest("udp", w, req)
+
+	if w.msg != nil {
+		t.Fatalf("expected silent drop for ANY preflight plugin, got response rcode=%d", w.msg.Rcode)
+	}
+}
+
+func typeCount(items []metrics.TypeCount, value string) int64 {
+	for _, item := range items {
+		if item.Type == value {
+			return item.Count
+		}
+	}
+	return 0
+}
+
+func codeCount(items []metrics.CodeCount, value string) int64 {
+	for _, item := range items {
+		if item.Code == value {
+			return item.Count
+		}
+	}
+	return 0
 }

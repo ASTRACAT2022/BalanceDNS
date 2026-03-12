@@ -17,6 +17,7 @@ import (
 	"dns-resolver/internal/plugins"
 	"dns-resolver/internal/tlsutil"
 	"dns-resolver/plugins/adblock"
+	"dns-resolver/plugins/anyblock"
 	"dns-resolver/plugins/dnsdistcompat"
 	"dns-resolver/plugins/hosts"
 	"dns-resolver/plugins/odoh"
@@ -65,7 +66,7 @@ func main() {
 		log.Println("No certificate content in environment variables.")
 	}
 
-	// 4. Initialize built-in recursive resolver
+	// 4. Initialize DNR (Distributed Name Resolver) core
 	resolver, err := newRuntimeResolver(cfg)
 	if err != nil {
 		log.Fatalf("Failed to initialize resolver backend: %v", err)
@@ -82,6 +83,10 @@ func main() {
 
 	// 6. Initialize Plugin Manager & Plugins
 	pm := plugins.NewPluginManager()
+
+	if cfg.DropANYQueries {
+		pm.Register(anyblock.New(true))
+	}
 
 	if cfg.DNSDistCompatEnabled {
 		pm.Register(dnsdistcompat.New(dnsdistcompat.Config{
@@ -149,7 +154,8 @@ func main() {
 		if tlsConfig == nil {
 			log.Printf("DoT disabled: tls config unavailable (dot_addr=%s)", cfg.DoTAddr)
 		} else {
-			dotServer := dot.NewServer(cfg.DoTAddr, tlsConfig, dnsProxyAddr, pm, m)
+			dropANYQueries := cfg.DropANYQueries && !cfg.DNSDistCompatEnabled
+			dotServer := dot.NewServer(cfg.DoTAddr, tlsConfig, dnsProxyAddr, pm, m, dropANYQueries)
 			go func() {
 				if err := dotServer.Start(); err != nil {
 					log.Printf("DoT Server Error: %v", err)
@@ -160,11 +166,12 @@ func main() {
 
 	// 5.0.2 Start ODoH/DoH service plugin
 	odohConfig := odoh.Config{
-		ODoHAddr:     cfg.ODoHAddr,
-		CertFile:     cfg.CertFile,
-		KeyFile:      cfg.KeyFile,
-		TLSConfig:    tlsConfig,
-		DNSProxyAddr: dnsProxyAddr,
+		ODoHAddr:       cfg.ODoHAddr,
+		CertFile:       cfg.CertFile,
+		KeyFile:        cfg.KeyFile,
+		TLSConfig:      tlsConfig,
+		DNSProxyAddr:   dnsProxyAddr,
+		DropANYQueries: cfg.DropANYQueries && !cfg.DNSDistCompatEnabled,
 	}
 	odohPlugin := odoh.New(odohConfig, pm, m)
 	odohPlugin.Start()
@@ -180,7 +187,7 @@ func main() {
 	}
 
 	// 8. Start Go DNS Proxy
-	log.Printf("DEBUG: Initializing DNS Proxy on %s using embedded Go recursor", proxyAddr)
+	log.Printf("DEBUG: Initializing DNS Proxy on %s using DNR core", proxyAddr)
 	proxyOptions := buildProxyOptions(cfg)
 	dnsProxy := dnsproxy.NewProxyWithOptions(proxyAddr, resolver, pm, m, hybridCache, proxyOptions)
 	go func() {
@@ -199,7 +206,7 @@ func main() {
 		}
 	}
 
-	log.Println("ASTRACAT Control Plane is running (embedded Go recursor)")
+	log.Println("ASTRACAT Control Plane is running (DNR: Distributed Name Resolver)")
 
 	// 10. Graceful shutdown
 	sig := make(chan os.Signal, 1)

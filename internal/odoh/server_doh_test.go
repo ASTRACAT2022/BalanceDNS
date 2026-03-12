@@ -2,10 +2,15 @@ package odoh
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
 	"net/http/httptest"
 	"testing"
+
+	"dns-resolver/internal/metrics"
+	"dns-resolver/internal/plugins"
+	"dns-resolver/plugins/anyblock"
 
 	"github.com/miekg/dns"
 )
@@ -66,4 +71,77 @@ func TestParseDoHPOSTUnsupportedMediaType(t *testing.T) {
 	if !errors.Is(err, errUnsupportedDoHMediaType) {
 		t.Fatalf("expected errUnsupportedDoHMediaType, got: %v", err)
 	}
+}
+
+func TestResolveDNSMessageBlocksANYQueries(t *testing.T) {
+	m := &metrics.Metrics{}
+	s := &Server{Metrics: m, DropANYQueries: true}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeANY)
+
+	resp, outcome, err := s.resolveDNSMessage(context.Background(), "odoh", req)
+	if err != nil {
+		t.Fatalf("resolveDNSMessage() error = %v", err)
+	}
+	if got, want := outcome, "security_drop_any_query"; got != want {
+		t.Fatalf("unexpected outcome: got=%q want=%q", got, want)
+	}
+	if resp == nil {
+		t.Fatal("expected DNS response")
+	}
+	if got, want := resp.Rcode, dns.RcodeRefused; got != want {
+		t.Fatalf("unexpected rcode: got=%d want=%d", got, want)
+	}
+
+	snapshot := m.SnapshotDashboard()
+	if got, want := snapshot.TotalQueries, int64(1); got != want {
+		t.Fatalf("unexpected total queries: got=%d want=%d", got, want)
+	}
+	if got, want := typeCount(snapshot.QueryTypes, "ANY"), int64(1); got != want {
+		t.Fatalf("unexpected ANY query count: got=%d want=%d", got, want)
+	}
+	if got, want := codeCount(snapshot.ResponseCodes, dns.RcodeToString[dns.RcodeRefused]), int64(1); got != want {
+		t.Fatalf("unexpected REFUSED count: got=%d want=%d", got, want)
+	}
+}
+
+func TestResolveDNSMessagePreflightAnyBlockPlugin(t *testing.T) {
+	m := &metrics.Metrics{}
+	pm := plugins.NewPluginManager()
+	pm.Register(anyblock.New(true))
+
+	s := &Server{Metrics: m, PM: pm}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeANY)
+
+	resp, outcome, err := s.resolveDNSMessage(context.Background(), "odoh", req)
+	if err != nil {
+		t.Fatalf("resolveDNSMessage() error = %v", err)
+	}
+	if got, want := outcome, "security_drop_any_query"; got != want {
+		t.Fatalf("unexpected outcome: got=%q want=%q", got, want)
+	}
+	if resp == nil || resp.Rcode != dns.RcodeRefused {
+		t.Fatalf("expected REFUSED response, got %#v", resp)
+	}
+}
+
+func typeCount(items []metrics.TypeCount, value string) int64 {
+	for _, item := range items {
+		if item.Type == value {
+			return item.Count
+		}
+	}
+	return 0
+}
+
+func codeCount(items []metrics.CodeCount, value string) int64 {
+	for _, item := range items {
+		if item.Code == value {
+			return item.Count
+		}
+	}
+	return 0
 }
