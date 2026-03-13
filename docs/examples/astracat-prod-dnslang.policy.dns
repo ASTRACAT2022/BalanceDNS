@@ -1,0 +1,92 @@
+# Production migration of the current Astracat dnsdist_compat policy into DNSlang.
+#
+# Source files stay in /etc/dnsdist/* for now so migration can be done without
+# moving operational data on day one. Later you can relocate them to
+# /etc/astracat/dnslang/* if you want a cleaner layout.
+
+set banned_ips = ipset("/etc/dnsdist/banned_ips.txt")
+set sni_proxy_pool = ippool("/etc/dnsdist/sni_proxy_ips.txt")
+set subdomain_spoof = suffixes("/etc/dnsdist/domains_with_subdomains.txt")
+set custom_spoof = suffixes("/etc/dnsdist/custom.txt")
+set exact_spoof = domains("/etc/dnsdist/domains.txt")
+set compat_hosts = hosts("/etc/dnsdist/hosts.txt")
+set garbage_domains = domains("/etc/dnsdist/garbage.txt")
+set early_drop_suffixes = suffixes([
+  "dhitc.com",
+  "whoami.akamai.net"
+])
+set late_drop_suffixes = suffixes([
+  "googlesyndication.com",
+  "adcolony.com",
+  "hotjar.com",
+  "mouseflow.com",
+  "freshmarketer.com",
+  "luckyorange.com",
+  "bugsnag.com",
+  "samsungads.com",
+  "doubleclick.net",
+  "media.net",
+  "sentry.com",
+  "sentry.io"
+])
+
+rule drop_banned_clients {
+  phase = preflight
+  when = client_ip in banned_ips
+  action = drop
+}
+
+rule block_any {
+  phase = preflight
+  when = qtype == ANY
+  action = drop
+}
+
+rule early_drop_suffix_matches {
+  phase = preflight
+  when = qname suffix in early_drop_suffixes
+  action = drop
+}
+
+rule spoof_domains_with_subdomains {
+  phase = policy
+  when = qname suffix in subdomain_spoof and qtype in [A, AAAA]
+  action = load_balance from sni_proxy_pool ttl 60 strategy round_robin
+}
+
+rule spoof_custom_suffixes {
+  phase = policy
+  when = qname suffix in custom_spoof and qtype in [A, AAAA]
+  action = load_balance from sni_proxy_pool ttl 60 strategy round_robin
+}
+
+rule hosts_a_aaaa {
+  phase = policy
+  when = qname in compat_hosts and qtype in [A, AAAA]
+  action = answer from compat_hosts ttl 60
+}
+
+rule hosts_empty_aaaa {
+  phase = policy
+  when = qname in compat_hosts and qtype == AAAA
+  action = empty
+}
+
+rule spoof_exact_domains {
+  phase = policy
+  when = qname in exact_spoof and qtype in [A, AAAA]
+  action = load_balance from sni_proxy_pool ttl 60 strategy round_robin
+}
+
+rule late_drop_suffix_matches {
+  phase = policy
+  when = qname suffix in late_drop_suffixes
+  action = drop
+}
+
+rule garbage_to_nxdomain {
+  phase = policy
+  when = qname in garbage_domains
+  action = nxdomain
+}
+

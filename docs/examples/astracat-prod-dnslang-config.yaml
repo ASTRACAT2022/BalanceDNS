@@ -1,0 +1,107 @@
+# Example production config migrated from dnsdist_compat_* to DNSlang.
+# This keeps the resolver/runtime settings from the current Astracat production node
+# and moves policy logic into /etc/astracat/dnslang/policy.dns.
+
+listen_addr: "0.0.0.0:53"
+metrics_addr: "0.0.0.0:7070"
+
+admin_addr: ""
+admin_username: ""
+admin_password: ""
+
+dot_addr: "77.239.113.0:853"
+odoh_addr: "77.239.113.0:443"
+cert_file: "/opt/astracatdns/certs/fullchain.pem"
+key_file: "/opt/astracatdns/certs/privkey.pem"
+
+acme_enabled: false
+acme_email: "seo@astracat.ru"
+acme_domains:
+  - "dns.astracat.ru"
+acme_cache_dir: "certs-cache"
+
+max_workers: 1000
+cache_size: 10240
+cache_path: "cache/dns.db"
+cache_min_ttl: 60s
+cache_max_ttl: 1h
+stale_while_revalidate: 1m
+
+resolver_type: "recursor"
+root_anchor_path: "/var/lib/unbound/root.key"
+resolver_workers: 0
+unbound_msg_cache_size: "64m"
+unbound_rrset_cache_size: "128m"
+unbound_key_cache_size: "64m"
+unbound_prefetch: true
+unbound_serve_expired: true
+unbound_disable_cache: false
+
+recursor_root_servers: []
+recursor_cache_entries: 1000000
+recursor_cache_min_ttl: 20s
+recursor_cache_max_ttl: 2h
+dnssec_validate: true
+dnssec_fail_closed: true
+dnssec_trust_anchors: []
+
+attack_protection_enabled: true
+max_global_inflight: 65536
+max_qps_per_ip: 1200
+rate_limit_burst_per_ip: 2400
+max_concurrent_per_ip: 800
+max_questions_per_request: 1
+max_qname_length: 253
+
+# Let DNSlang own ANY handling so all policy stays in one file.
+drop_any_queries: false
+
+policy_engine_enabled: true
+policy_blocked_domains: []
+policy_rewrite_rules: []
+policy_load_balancers: []
+
+dnslang_enabled: true
+dnslang_policy_path: "/etc/astracat/dnslang/policy.dns"
+
+hosts_enabled: true
+hosts_path: "hosts"
+
+adblock_enabled: true
+adblock_list_urls:
+  - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+
+# Disabled after migration to DNSlang.
+dnsdist_compat_enabled: false
+dnsdist_compat_log_all: false
+dnsdist_compat_banned_ips_path: "/etc/dnsdist/banned_ips.txt"
+dnsdist_compat_sni_proxy_ips_path: "/etc/dnsdist/sni_proxy_ips.txt"
+dnsdist_compat_domains_with_subdomains_path: "/etc/dnsdist/domains_with_subdomains.txt"
+dnsdist_compat_custom_path: "/etc/dnsdist/custom.txt"
+dnsdist_compat_domains_path: "/etc/dnsdist/domains.txt"
+dnsdist_compat_hosts_path: "/etc/dnsdist/hosts.txt"
+dnsdist_compat_garbage_path: "/etc/dnsdist/garbage.txt"
+dnsdist_compat_drop_suffixes:
+  - "dhitc.com"
+  - "whoami.akamai.net"
+dnsdist_compat_late_drop_suffixes:
+  - "googlesyndication.com"
+  - "adcolony.com"
+  - "hotjar.com"
+  - "mouseflow.com"
+  - "freshmarketer.com"
+  - "luckyorange.com"
+  - "bugsnag.com"
+  - "samsungads.com"
+  - "doubleclick.net"
+  - "media.net"
+  - "sentry.com"
+  - "sentry.io"
+
+upstream_timeout: 3s
+request_timeout: 6s
+reuse_port: true
+reuse_addr: true
+metrics_top_domains_enabled: false
+cache_ram_size: 5120
+
