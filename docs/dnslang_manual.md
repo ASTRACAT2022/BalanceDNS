@@ -515,3 +515,8 @@ Expected result:
 
 Use [docs/examples/dnslang.policy.dns](/Users/astracat/Downloads/AstracatDNS-main/docs/examples/dnslang.policy.dns) as a base policy for production rollout.
 
+For a direct migration of the current Astracat production-style `dnsdist_compat_*`
+setup, use:
+
+- [docs/examples/astracat-prod-dnslang-config.yaml](/Users/astracat/Downloads/AstracatDNS-main/docs/examples/astracat-prod-dnslang-config.yaml)
+- [docs/examples/astracat-prod-dnslang.policy.dns](/Users/astracat/Downloads/AstracatDNS-main/docs/examples/astracat-prod-dnslang.policy.dns)
