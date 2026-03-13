@@ -5,6 +5,7 @@ import (
 	"net"
 	"testing"
 
+	"dns-resolver/internal/dnslang"
 	"dns-resolver/internal/metrics"
 
 	"github.com/miekg/dns"
@@ -69,7 +70,7 @@ func (w *testResponseWriter) Hijack()                   {}
 
 func TestHandleRequestBlocksANYQueries(t *testing.T) {
 	m := &metrics.Metrics{}
-	s := NewServer("127.0.0.1:0", nil, "127.0.0.1:53", nil, m, true)
+	s := NewServer("127.0.0.1:0", nil, "127.0.0.1:53", nil, m, true, nil)
 	w := &testResponseWriter{}
 
 	req := new(dns.Msg)
@@ -92,6 +93,34 @@ func TestHandleRequestBlocksANYQueries(t *testing.T) {
 	}
 	if got, want := codeCount(snapshot.ResponseCodes, dns.RcodeToString[dns.RcodeRefused]), int64(1); got != want {
 		t.Fatalf("unexpected REFUSED count: got=%d want=%d", got, want)
+	}
+}
+
+func TestHandleRequestAppliesDNSLangPolicy(t *testing.T) {
+	engine, err := dnslang.LoadString("inline", `
+rule local_refuse {
+  phase = policy
+  when = qname suffix "blocked.example" and qtype == A
+  action = refuse
+}
+`)
+	if err != nil {
+		t.Fatalf("LoadString() error = %v", err)
+	}
+
+	m := &metrics.Metrics{}
+	s := NewServer("127.0.0.1:0", nil, "127.0.0.1:53", nil, m, false, engine)
+	w := &testResponseWriter{}
+
+	req := new(dns.Msg)
+	req.SetQuestion("api.blocked.example.", dns.TypeA)
+	s.handleRequest(w, req)
+
+	if w.msg == nil {
+		t.Fatal("expected DNS response")
+	}
+	if got, want := w.msg.Rcode, dns.RcodeRefused; got != want {
+		t.Fatalf("unexpected rcode: got=%d want=%d", got, want)
 	}
 }
 

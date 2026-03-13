@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"dns-resolver/internal/cache"
+	"dns-resolver/internal/dnslang"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
 	"dns-resolver/plugins/anyblock"
@@ -258,6 +259,36 @@ func TestPreflightAnyBlockPluginRunsBeforePolicyCache(t *testing.T) {
 
 	if w.msg != nil {
 		t.Fatalf("expected silent drop for ANY preflight plugin, got response rcode=%d", w.msg.Rcode)
+	}
+}
+
+func TestHandleRequestAppliesDNSLangPolicy(t *testing.T) {
+	engine, err := dnslang.LoadString("inline", `
+rule local_nxdomain {
+  phase = policy
+  when = qname suffix "blocked.example" and qtype == A
+  action = nxdomain
+}
+`)
+	if err != nil {
+		t.Fatalf("LoadString() error = %v", err)
+	}
+
+	opts := DefaultProxyOptions()
+	opts.DNSLang = engine
+
+	p := NewProxyWithOptions("127.0.0.1:0", &testResolver{}, nil, nil, nil, opts)
+	w := &testResponseWriter{}
+
+	req := new(dns.Msg)
+	req.SetQuestion("api.blocked.example.", dns.TypeA)
+	p.handleRequest("udp", w, req)
+
+	if w.msg == nil {
+		t.Fatal("expected DNS response")
+	}
+	if got, want := w.msg.Rcode, dns.RcodeNameError; got != want {
+		t.Fatalf("unexpected rcode: got=%d want=%d", got, want)
 	}
 }
 

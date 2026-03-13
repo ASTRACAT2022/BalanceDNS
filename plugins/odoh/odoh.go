@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"log"
 
+	"dns-resolver/internal/dnslang"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/odoh"
 	"dns-resolver/internal/plugins"
@@ -17,6 +18,7 @@ type Config struct {
 	TLSConfig      *tls.Config // New field for pre-configured TLS
 	DNSProxyAddr   string
 	DropANYQueries bool
+	DNSLang        *dnslang.Engine
 }
 
 // Plugin manages the lifecycle of ODoH server.
@@ -47,7 +49,7 @@ func (p *Plugin) Start() {
 
 	// 2. Start DoH/ODoH server
 	log.Printf("[ODoH Plugin] Starting DoH/ODoH server on %s...", p.config.ODoHAddr)
-	srv, err := odoh.NewServer(p.config.ODoHAddr, p.config.TLSConfig, p.config.DNSProxyAddr, p.pm, p.m, p.config.DropANYQueries)
+	srv, err := odoh.NewServer(p.config.ODoHAddr, p.config.TLSConfig, p.config.DNSProxyAddr, p.pm, p.m, p.config.DropANYQueries, p.config.DNSLang)
 	if err != nil {
 		log.Printf("[ODoH Plugin] Failed to initialize server: %v", err)
 		return

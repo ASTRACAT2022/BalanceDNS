@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"dns-resolver/internal/cache"
+	"dns-resolver/internal/dnslang"
 	"dns-resolver/internal/dnsutil"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
@@ -103,6 +104,7 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 	p.mu.RLock()
 	security := p.security
 	policy := p.policy
+	dnslangEngine := p.opts.DNSLang
 	maxQuestionsPerRequest := p.opts.MaxQuestionsPerRequest
 	maxQNameLength := p.opts.MaxQNameLength
 	dropANYQueries := p.opts.DropANYQueries
@@ -218,6 +220,14 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 		return
 	}
 
+	dnslangCtx := dnslang.EvalContext{Transport: transport, ClientIP: clientIP}
+	if dnslangEngine != nil {
+		if result := dnslangEngine.Apply(dnslang.PhasePreflight, dnslangCtx, r); result.Handled {
+			outcome, rcodeText = p.handleDNSLangResult(transport, w, r, question, result)
+			return
+		}
+	}
+
 	if p.PM != nil {
 		pluginWriter := dnsutil.NewCapturingResponseWriter(w)
 		ctx := &plugins.PluginContext{
@@ -268,6 +278,13 @@ func (p *Proxy) handleRequest(transport string, w dns.ResponseWriter, r *dns.Msg
 				p.Metrics.RecordDNSResponse(question.Name, msg.Rcode)
 			}
 			_ = p.writeResponse(transport, w, r, msg)
+			return
+		}
+	}
+
+	if dnslangEngine != nil {
+		if result := dnslangEngine.Apply(dnslang.PhasePolicy, dnslangCtx, r); result.Handled {
+			outcome, rcodeText = p.handleDNSLangResult(transport, w, r, question, result)
 			return
 		}
 	}
@@ -470,6 +487,35 @@ func extractClientIP(w dns.ResponseWriter) string {
 		}
 	}
 	return "unknown"
+}
+
+func (p *Proxy) handleDNSLangResult(transport string, w dns.ResponseWriter, req *dns.Msg, question dns.Question, result dnslang.Result) (string, string) {
+	if p.Metrics != nil {
+		p.Metrics.RecordPolicyAction("dnslang_" + result.Action)
+	}
+
+	if result.Drop {
+		outcome := "dnslang_drop"
+		if question.Qtype == dns.TypeANY {
+			outcome = "security_drop_any_query"
+			if p.Metrics != nil {
+				p.Metrics.RecordSecurityDrop("any_query", transport)
+			}
+		} else if p.Metrics != nil {
+			p.Metrics.RecordSecurityDrop("dnslang_drop", transport)
+		}
+		return outcome, "DROPPED"
+	}
+
+	rcodeText := dns.RcodeToString[dns.RcodeServerFailure]
+	if result.Response != nil {
+		rcodeText = dns.RcodeToString[result.Response.Rcode]
+		if p.Metrics != nil {
+			p.Metrics.RecordDNSResponse(question.Name, result.Response.Rcode)
+		}
+		_ = p.writeResponse(transport, w, req, result.Response)
+	}
+	return "dnslang_" + result.Action, rcodeText
 }
 
 func buildDecisionCacheKey(qtype uint16, qname string) string {

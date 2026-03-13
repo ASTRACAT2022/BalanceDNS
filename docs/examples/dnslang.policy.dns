@@ -1,0 +1,40 @@
+# Example Astracat DNSlang policy
+
+set banned_ips = ipset("/etc/astracat/dnslang/banned_ips.txt")
+set tracker_suffixes = suffixes([
+  "googlesyndication.com",
+  "doubleclick.net",
+  "hotjar.com"
+])
+set internal_hosts = hosts("/etc/astracat/dnslang/hosts.txt")
+set edge_pool = ippool("/etc/astracat/dnslang/edge_pool.txt")
+
+rule drop_banned_clients {
+  phase = preflight
+  when = client_ip in banned_ips
+  action = drop
+}
+
+rule block_any {
+  phase = preflight
+  when = qtype == ANY
+  action = drop
+}
+
+rule tracker_refused {
+  phase = policy
+  when = qname suffix in tracker_suffixes
+  action = refuse
+}
+
+rule internal_hosts_answers {
+  phase = policy
+  when = qname in internal_hosts and qtype in [A, AAAA]
+  action = answer from internal_hosts ttl 120
+}
+
+rule edge_pool_balancer {
+  phase = policy
+  when = qname suffix "edge.example" and qtype == A
+  action = load_balance from edge_pool ttl 20 strategy round_robin
+}

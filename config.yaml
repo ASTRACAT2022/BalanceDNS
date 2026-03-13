@@ -163,6 +163,25 @@ policy_load_balancers: []
 #         weight: 1
 
 # ------------------------------------------------------------------------------
+# DNSlang Native Policy Layer
+# ------------------------------------------------------------------------------
+# Enables the native Astracat policy DSL. Rules are loaded from dnslang_policy_path
+# during startup. If parsing fails, the server will refuse to boot so you do not
+# run with a half-loaded security policy.
+dnslang_enabled: false
+dnslang_policy_path: "/etc/astracat/dnslang/policy.dns"
+
+# Quick example:
+# rule block_any {
+#   phase = preflight
+#   when = qtype == ANY
+#   action = drop
+# }
+
+# More examples and deployment steps:
+# docs/dnslang_manual.md
+
+# ------------------------------------------------------------------------------
 # Plugins
 # ------------------------------------------------------------------------------
 
