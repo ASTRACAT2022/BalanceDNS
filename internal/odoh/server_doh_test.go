@@ -8,7 +8,10 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"dns-resolver/internal/dnslang"
 	"dns-resolver/internal/metrics"
+	"dns-resolver/internal/plugins"
+	"dns-resolver/plugins/anyblock"
 
 	"github.com/miekg/dns"
 )
@@ -78,7 +81,7 @@ func TestResolveDNSMessageBlocksANYQueries(t *testing.T) {
 	req := new(dns.Msg)
 	req.SetQuestion("example.com.", dns.TypeANY)
 
-	resp, outcome, err := s.resolveDNSMessage(context.Background(), "odoh", req)
+	resp, outcome, err := s.resolveDNSMessage(context.Background(), "odoh", "127.0.0.1", req)
 	if err != nil {
 		t.Fatalf("resolveDNSMessage() error = %v", err)
 	}
@@ -101,6 +104,58 @@ func TestResolveDNSMessageBlocksANYQueries(t *testing.T) {
 	}
 	if got, want := codeCount(snapshot.ResponseCodes, dns.RcodeToString[dns.RcodeRefused]), int64(1); got != want {
 		t.Fatalf("unexpected REFUSED count: got=%d want=%d", got, want)
+	}
+}
+
+func TestResolveDNSMessagePreflightAnyBlockPlugin(t *testing.T) {
+	m := &metrics.Metrics{}
+	pm := plugins.NewPluginManager()
+	pm.Register(anyblock.New(true))
+
+	s := &Server{Metrics: m, PM: pm}
+
+	req := new(dns.Msg)
+	req.SetQuestion("example.com.", dns.TypeANY)
+
+	resp, outcome, err := s.resolveDNSMessage(context.Background(), "odoh", "127.0.0.1", req)
+	if err != nil {
+		t.Fatalf("resolveDNSMessage() error = %v", err)
+	}
+	if got, want := outcome, "security_drop_any_query"; got != want {
+		t.Fatalf("unexpected outcome: got=%q want=%q", got, want)
+	}
+	if resp == nil || resp.Rcode != dns.RcodeRefused {
+		t.Fatalf("expected REFUSED response, got %#v", resp)
+	}
+}
+
+func TestResolveDNSMessageAppliesDNSLangPolicy(t *testing.T) {
+	engine, err := dnslang.LoadString("inline", `
+rule local_nxdomain {
+  phase = policy
+  when = transport == odoh and qname suffix "telemetry.example"
+  action = nxdomain
+}
+`)
+	if err != nil {
+		t.Fatalf("LoadString() error = %v", err)
+	}
+
+	m := &metrics.Metrics{}
+	s := &Server{Metrics: m, DNSLang: engine}
+
+	req := new(dns.Msg)
+	req.SetQuestion("api.telemetry.example.", dns.TypeA)
+
+	resp, outcome, err := s.resolveDNSMessage(context.Background(), "odoh", "198.51.100.2", req)
+	if err != nil {
+		t.Fatalf("resolveDNSMessage() error = %v", err)
+	}
+	if got, want := outcome, "dnslang_nxdomain"; got != want {
+		t.Fatalf("unexpected outcome: got=%q want=%q", got, want)
+	}
+	if resp == nil || resp.Rcode != dns.RcodeNameError {
+		t.Fatalf("expected NXDOMAIN response, got %#v", resp)
 	}
 }
 

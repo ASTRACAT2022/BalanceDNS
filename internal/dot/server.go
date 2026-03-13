@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"dns-resolver/internal/dnslang"
 	"dns-resolver/internal/dnsutil"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
@@ -24,10 +25,11 @@ type Server struct {
 	PM             *plugins.PluginManager
 	Metrics        *metrics.Metrics
 	DropANYQueries bool
+	DNSLang        *dnslang.Engine
 }
 
 // NewServer creates a new DoT server.
-func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.PluginManager, m *metrics.Metrics, dropANYQueries bool) *Server {
+func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.PluginManager, m *metrics.Metrics, dropANYQueries bool, dnslangEngine *dnslang.Engine) *Server {
 	return &Server{
 		Addr:           addr,
 		TLSConfig:      tlsConfig,
@@ -35,6 +37,7 @@ func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.
 		PM:             pm,
 		Metrics:        m,
 		DropANYQueries: dropANYQueries,
+		DNSLang:        dnslangEngine,
 		Client: &dns.Client{
 			Net:     "udp",
 			Timeout: 3 * time.Second,
@@ -99,6 +102,41 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 		s.Metrics.RecordDNSQuery(question)
 	}
 
+	dnslangCtx := dnslang.EvalContext{Transport: "dot", ClientIP: extractClientIP(w)}
+	if s.DNSLang != nil {
+		if result := s.DNSLang.Apply(dnslang.PhasePreflight, dnslangCtx, r); result.Handled {
+			outcome, rcodeText = s.handleDNSLangResult(w, r, question, result)
+			return
+		}
+	}
+
+	if s.PM != nil {
+		pluginWriter := dnsutil.NewCapturingResponseWriter(w)
+		ctx := &plugins.PluginContext{
+			ResponseWriter: pluginWriter,
+			Metrics:        s.Metrics,
+		}
+		if handled := s.PM.ExecutePreflightPlugins(ctx, pluginWriter, r); handled {
+			if pluginWriter.Msg != nil {
+				outcome = "plugin_handled"
+				rcodeText = dns.RcodeToString[pluginWriter.Msg.Rcode]
+				if s.Metrics != nil {
+					s.Metrics.RecordDNSResponse(question.Name, pluginWriter.Msg.Rcode)
+				}
+				return
+			}
+			outcome = "plugin_dropped"
+			rcodeText = "DROPPED"
+			if question.Qtype == dns.TypeANY {
+				outcome = "security_drop_any_query"
+				if s.Metrics != nil {
+					s.Metrics.RecordSecurityDrop("any_query", "dot")
+				}
+			}
+			return
+		}
+	}
+
 	if s.DropANYQueries && question.Qtype == dns.TypeANY {
 		outcome = "security_drop_any_query"
 		rcodeText = dns.RcodeToString[dns.RcodeRefused]
@@ -110,6 +148,13 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 		m.SetRcode(r, dns.RcodeRefused)
 		_ = w.WriteMsg(m)
 		return
+	}
+
+	if s.DNSLang != nil {
+		if result := s.DNSLang.Apply(dnslang.PhasePolicy, dnslangCtx, r); result.Handled {
+			outcome, rcodeText = s.handleDNSLangResult(w, r, question, result)
+			return
+		}
 	}
 
 	// 2. Execute Plugins
@@ -173,6 +218,60 @@ func (s *Server) handleRequest(w dns.ResponseWriter, r *dns.Msg) {
 	}
 
 	_ = w.WriteMsg(resp)
+}
+
+func (s *Server) handleDNSLangResult(w dns.ResponseWriter, req *dns.Msg, question dns.Question, result dnslang.Result) (string, string) {
+	if s.Metrics != nil {
+		s.Metrics.RecordPolicyAction("dnslang_" + result.Action)
+	}
+
+	if result.Drop {
+		outcome := "dnslang_drop"
+		if question.Qtype == dns.TypeANY {
+			outcome = "security_drop_any_query"
+			if s.Metrics != nil {
+				s.Metrics.RecordSecurityDrop("any_query", "dot")
+			}
+		} else if s.Metrics != nil {
+			s.Metrics.RecordSecurityDrop("dnslang_drop", "dot")
+		}
+		return outcome, "DROPPED"
+	}
+
+	rcodeText := dns.RcodeToString[dns.RcodeServerFailure]
+	if result.Response != nil {
+		rcodeText = dns.RcodeToString[result.Response.Rcode]
+		if s.Metrics != nil {
+			s.Metrics.RecordDNSResponse(question.Name, result.Response.Rcode)
+		}
+		_ = w.WriteMsg(result.Response)
+	}
+	return "dnslang_" + result.Action, rcodeText
+}
+
+func extractClientIP(w dns.ResponseWriter) string {
+	if w == nil || w.RemoteAddr() == nil {
+		return "unknown"
+	}
+	addr := w.RemoteAddr()
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		if a.IP != nil {
+			return a.IP.String()
+		}
+	case *net.UDPAddr:
+		if a.IP != nil {
+			return a.IP.String()
+		}
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err == nil {
+		return host
+	}
+	if value := strings.TrimSpace(addr.String()); value != "" {
+		return value
+	}
+	return "unknown"
 }
 
 func (s *Server) exchangeUpstream(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {

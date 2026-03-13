@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"dns-resolver/internal/dnslang"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
 
@@ -33,13 +34,14 @@ type Server struct {
 	PM             *plugins.PluginManager
 	Metrics        *metrics.Metrics
 	DropANYQueries bool
+	DNSLang        *dnslang.Engine
 
 	// ODoH specific
 	KeyPair odoh.ObliviousDoHKeyPair
 }
 
 // NewServer creates a new ODoH server.
-func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.PluginManager, m *metrics.Metrics, dropANYQueries bool) (*Server, error) {
+func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.PluginManager, m *metrics.Metrics, dropANYQueries bool, dnslangEngine *dnslang.Engine) (*Server, error) {
 	if tlsConfig == nil {
 		return nil, fmt.Errorf("tls config is nil")
 	}
@@ -58,6 +60,7 @@ func NewServer(addr string, tlsConfig *tls.Config, upstream string, pm *plugins.
 		PM:             pm,
 		Metrics:        m,
 		DropANYQueries: dropANYQueries,
+		DNSLang:        dnslangEngine,
 		KeyPair:        kp,
 		Client: &dns.Client{
 			Net:     "udp",
@@ -163,7 +166,7 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respMsg, resolveOutcome, err := s.resolveDNSMessage(r.Context(), "doh", reqMsg)
+	respMsg, resolveOutcome, err := s.resolveDNSMessage(r.Context(), "doh", extractHTTPClientIP(r), reqMsg)
 	if err != nil {
 		log.Printf("DoH Upstream Error: %v", err)
 		outcome = resolveOutcome
@@ -270,7 +273,7 @@ func (s *Server) handleODoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respMsg, resolveOutcome, err := s.resolveDNSMessage(r.Context(), "odoh", reqMsg)
+	respMsg, resolveOutcome, err := s.resolveDNSMessage(r.Context(), "odoh", extractHTTPClientIP(r), reqMsg)
 	if err != nil {
 		log.Printf("ODoH Upstream Error: %v", err)
 		outcome = resolveOutcome
@@ -349,7 +352,21 @@ func normalizeContentType(contentType string) string {
 	return contentType
 }
 
-func (s *Server) resolveDNSMessage(ctx context.Context, transport string, reqMsg *dns.Msg) (*dns.Msg, string, error) {
+func extractHTTPClientIP(r *http.Request) string {
+	if r == nil {
+		return "unknown"
+	}
+	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
+	if err == nil && host != "" {
+		return host
+	}
+	if value := strings.TrimSpace(r.RemoteAddr); value != "" {
+		return value
+	}
+	return "unknown"
+}
+
+func (s *Server) resolveDNSMessage(ctx context.Context, transport, clientIP string, reqMsg *dns.Msg) (*dns.Msg, string, error) {
 	if len(reqMsg.Question) == 0 {
 		return nil, "malformed_dns", errors.New("dns message has no question")
 	}
@@ -357,6 +374,37 @@ func (s *Server) resolveDNSMessage(ctx context.Context, transport string, reqMsg
 	question := reqMsg.Question[0]
 	if s.Metrics != nil {
 		s.Metrics.RecordDNSQuery(question)
+	}
+
+	dnslangCtx := dnslang.EvalContext{Transport: transport, ClientIP: clientIP}
+	if s.DNSLang != nil {
+		if result := s.DNSLang.Apply(dnslang.PhasePreflight, dnslangCtx, reqMsg); result.Handled {
+			return s.handleDNSLangResult(transport, question, reqMsg, result)
+		}
+	}
+
+	if s.PM != nil {
+		dummyWriter := &DumbResponseWriter{}
+		ctx := &plugins.PluginContext{
+			ResponseWriter: dummyWriter,
+			Metrics:        s.Metrics,
+		}
+		if handled := s.PM.ExecutePreflightPlugins(ctx, dummyWriter, reqMsg); handled {
+			if dummyWriter.Msg != nil {
+				s.recordResponseCodeMetrics(question.Name, dummyWriter.Msg.Rcode)
+				return dummyWriter.Msg, "plugin_handled", nil
+			}
+			if question.Qtype == dns.TypeANY && s.Metrics != nil {
+				s.Metrics.RecordSecurityDrop("any_query", transport)
+			}
+			refused := new(dns.Msg)
+			refused.SetRcode(reqMsg, dns.RcodeRefused)
+			s.recordResponseCodeMetrics(question.Name, refused.Rcode)
+			if question.Qtype == dns.TypeANY {
+				return refused, "security_drop_any_query", nil
+			}
+			return refused, "plugin_dropped", nil
+		}
 	}
 
 	if s.DropANYQueries && question.Qtype == dns.TypeANY {
@@ -367,6 +415,12 @@ func (s *Server) resolveDNSMessage(ctx context.Context, transport string, reqMsg
 		refused := new(dns.Msg)
 		refused.SetRcode(reqMsg, dns.RcodeRefused)
 		return refused, "security_drop_any_query", nil
+	}
+
+	if s.DNSLang != nil {
+		if result := s.DNSLang.Apply(dnslang.PhasePolicy, dnslangCtx, reqMsg); result.Handled {
+			return s.handleDNSLangResult(transport, question, reqMsg, result)
+		}
 	}
 
 	dummyWriter := &DumbResponseWriter{}
@@ -502,6 +556,35 @@ func (s *Server) recordResponseCodeMetrics(qName string, rcode int) {
 	if rcode == dns.RcodeNameError {
 		s.Metrics.RecordNXDOMAIN(qName)
 	}
+}
+
+func (s *Server) handleDNSLangResult(transport string, question dns.Question, reqMsg *dns.Msg, result dnslang.Result) (*dns.Msg, string, error) {
+	if s.Metrics != nil {
+		s.Metrics.RecordPolicyAction("dnslang_" + result.Action)
+	}
+
+	if result.Drop {
+		outcome := "dnslang_drop"
+		if question.Qtype == dns.TypeANY {
+			outcome = "security_drop_any_query"
+			if s.Metrics != nil {
+				s.Metrics.RecordSecurityDrop("any_query", transport)
+			}
+		} else if s.Metrics != nil {
+			s.Metrics.RecordSecurityDrop("dnslang_drop", transport)
+		}
+		refused := new(dns.Msg)
+		refused.SetRcode(reqMsg, dns.RcodeRefused)
+		s.recordResponseCodeMetrics(question.Name, refused.Rcode)
+		return refused, outcome, nil
+	}
+
+	if result.Response != nil {
+		s.recordResponseCodeMetrics(question.Name, result.Response.Rcode)
+		return result.Response, "dnslang_" + result.Action, nil
+	}
+
+	return nil, "", errors.New("dnslang handled request without response")
 }
 
 func (s *Server) sendEncryptedResponse(w http.ResponseWriter, ctx odoh.ResponseContext, answer *dns.Msg) {

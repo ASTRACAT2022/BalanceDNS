@@ -11,12 +11,14 @@ import (
 	"dns-resolver/internal/admin"
 	"dns-resolver/internal/cache"
 	"dns-resolver/internal/config"
+	"dns-resolver/internal/dnslang"
 	"dns-resolver/internal/dnsproxy"
 	"dns-resolver/internal/dot"
 	"dns-resolver/internal/metrics"
 	"dns-resolver/internal/plugins"
 	"dns-resolver/internal/tlsutil"
 	"dns-resolver/plugins/adblock"
+	"dns-resolver/plugins/anyblock"
 	"dns-resolver/plugins/dnsdistcompat"
 	"dns-resolver/plugins/hosts"
 	"dns-resolver/plugins/odoh"
@@ -65,6 +67,15 @@ func main() {
 		log.Println("No certificate content in environment variables.")
 	}
 
+	var dnslangEngine *dnslang.Engine
+	if cfg.DNSLangEnabled {
+		log.Printf("Loading DNSlang policy from %s", cfg.DNSLangPolicyPath)
+		dnslangEngine, err = dnslang.LoadFile(cfg.DNSLangPolicyPath)
+		if err != nil {
+			log.Fatalf("Failed to load DNSlang policy: %v", err)
+		}
+	}
+
 	// 4. Initialize DNR (Distributed Name Resolver) core
 	resolver, err := newRuntimeResolver(cfg)
 	if err != nil {
@@ -82,6 +93,10 @@ func main() {
 
 	// 6. Initialize Plugin Manager & Plugins
 	pm := plugins.NewPluginManager()
+
+	if cfg.DropANYQueries {
+		pm.Register(anyblock.New(true))
+	}
 
 	if cfg.DNSDistCompatEnabled {
 		pm.Register(dnsdistcompat.New(dnsdistcompat.Config{
@@ -150,7 +165,7 @@ func main() {
 			log.Printf("DoT disabled: tls config unavailable (dot_addr=%s)", cfg.DoTAddr)
 		} else {
 			dropANYQueries := cfg.DropANYQueries && !cfg.DNSDistCompatEnabled
-			dotServer := dot.NewServer(cfg.DoTAddr, tlsConfig, dnsProxyAddr, pm, m, dropANYQueries)
+			dotServer := dot.NewServer(cfg.DoTAddr, tlsConfig, dnsProxyAddr, pm, m, dropANYQueries, dnslangEngine)
 			go func() {
 				if err := dotServer.Start(); err != nil {
 					log.Printf("DoT Server Error: %v", err)
@@ -167,6 +182,7 @@ func main() {
 		TLSConfig:      tlsConfig,
 		DNSProxyAddr:   dnsProxyAddr,
 		DropANYQueries: cfg.DropANYQueries && !cfg.DNSDistCompatEnabled,
+		DNSLang:        dnslangEngine,
 	}
 	odohPlugin := odoh.New(odohConfig, pm, m)
 	odohPlugin.Start()
@@ -183,7 +199,7 @@ func main() {
 
 	// 8. Start Go DNS Proxy
 	log.Printf("DEBUG: Initializing DNS Proxy on %s using DNR core", proxyAddr)
-	proxyOptions := buildProxyOptions(cfg)
+	proxyOptions := buildProxyOptions(cfg, dnslangEngine)
 	dnsProxy := dnsproxy.NewProxyWithOptions(proxyAddr, resolver, pm, m, hybridCache, proxyOptions)
 	go func() {
 		if err := dnsProxy.Start(); err != nil {
@@ -214,7 +230,7 @@ func main() {
 	}
 }
 
-func buildProxyOptions(cfg *config.Config) dnsproxy.ProxyOptions {
+func buildProxyOptions(cfg *config.Config, dnslangEngine *dnslang.Engine) dnsproxy.ProxyOptions {
 	opts := dnsproxy.DefaultProxyOptions()
 	opts.EnableAttackProtection = cfg.AttackProtectionEnabled
 	opts.MaxGlobalInflight = cfg.MaxGlobalInflight
@@ -226,6 +242,7 @@ func buildProxyOptions(cfg *config.Config) dnsproxy.ProxyOptions {
 	opts.DropANYQueries = cfg.DropANYQueries
 	opts.ReusePort = cfg.ReusePort
 	opts.ReuseAddr = cfg.ReuseAddr
+	opts.DNSLang = dnslangEngine
 	if cfg.DNSDistCompatEnabled {
 		// dnsdist compat plugin implements silent DropAction() for ANY.
 		opts.DropANYQueries = false

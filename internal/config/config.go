@@ -79,6 +79,8 @@ type Config struct {
 	PolicyBlockedDomains []string                 `yaml:"policy_blocked_domains"`
 	PolicyRewriteRules   []PolicyRewriteRule      `yaml:"policy_rewrite_rules"`
 	PolicyLoadBalancers  []PolicyLoadBalancerRule `yaml:"policy_load_balancers"`
+	DNSLangEnabled       bool                     `yaml:"dnslang_enabled"`
+	DNSLangPolicyPath    string                   `yaml:"dnslang_policy_path"`
 
 	// Hosts file plugin settings
 	HostsEnabled        bool          `yaml:"hosts_enabled"`
@@ -178,6 +180,8 @@ func NewConfig() *Config {
 		PolicyBlockedDomains:            []string{},
 		PolicyRewriteRules:              []PolicyRewriteRule{},
 		PolicyLoadBalancers:             []PolicyLoadBalancerRule{},
+		DNSLangEnabled:                  false,
+		DNSLangPolicyPath:               "/etc/astracat/dnslang/policy.dns",
 		HostsEnabled:                    true,
 		HostsPath:                       "hosts",
 		HostsURL:                        "https://raw.githubusercontent.com/ASTRACAT2022/host-DNS/refs/heads/main/bypass",

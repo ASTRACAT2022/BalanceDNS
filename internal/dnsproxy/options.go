@@ -1,5 +1,7 @@
 package dnsproxy
 
+import "dns-resolver/internal/dnslang"
+
 type ProxyRewriteRule struct {
 	Domain string
 	Type   string
@@ -39,6 +41,7 @@ type ProxyOptions struct {
 	ReusePort              bool
 	ReuseAddr              bool
 	Policy                 ProxyPolicyOptions
+	DNSLang                *dnslang.Engine
 }
 
 func DefaultProxyOptions() ProxyOptions {
