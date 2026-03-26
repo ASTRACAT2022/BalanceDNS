@@ -11,8 +11,10 @@ pub fn ensure_rustls_crypto_provider() {
 pub fn load_server_config(cert_pem: &Path, key_pem: &Path) -> anyhow::Result<rustls::ServerConfig> {
     ensure_rustls_crypto_provider();
 
-    let certs = load_certs(cert_pem)?;
-    let key = load_private_key(key_pem)?;
+    let certs = load_certs(cert_pem)
+        .map_err(|e| anyhow::anyhow!("failed to read cert {}: {}", cert_pem.display(), e))?;
+    let key = load_private_key(key_pem)
+        .map_err(|e| anyhow::anyhow!("failed to read key {}: {}", key_pem.display(), e))?;
 
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -68,4 +70,3 @@ pub fn server_tls_acceptor(cert_pem: &Path, key_pem: &Path) -> anyhow::Result<to
     let cfg = load_server_config(cert_pem, key_pem)?;
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(cfg)))
 }
-

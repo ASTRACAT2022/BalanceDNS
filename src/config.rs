@@ -177,11 +177,11 @@ fn default_doh_listen() -> SocketAddr {
 }
 
 fn default_tls_cert() -> String {
-    "config/tls/server.crt".to_string()
+    "tls/server.crt".to_string()
 }
 
 fn default_tls_key() -> String {
-    "config/tls/server.key".to_string()
+    "tls/server.key".to_string()
 }
 
 fn default_hosts_refresh_seconds() -> u64 {

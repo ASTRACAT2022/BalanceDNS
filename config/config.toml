@@ -5,8 +5,8 @@ dot_listen = "0.0.0.0:8853"
 doh_listen = "0.0.0.0:8443"
 
 [tls]
-cert_pem = "config/tls/server.crt"
-key_pem = "config/tls/server.key"
+cert_pem = "tls/server.crt"
+key_pem = "tls/server.key"
 
 [balancing]
 algorithm = "round_robin"
