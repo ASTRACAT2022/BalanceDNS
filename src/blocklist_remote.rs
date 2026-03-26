@@ -5,7 +5,11 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use tokio::time;
+use reqwest::{
+    header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED},
+    StatusCode,
+};
+use tokio::{sync::RwLock, time};
 
 use crate::{config::BlocklistRemoteConfig, dns};
 
@@ -14,12 +18,19 @@ pub struct BlocklistRemote {
     url: Arc<str>,
     refresh: Duration,
     rules: Arc<ArcSwap<BlocklistRules>>,
+    validator: Arc<RwLock<CacheValidator>>,
     client: reqwest::Client,
 }
 
 #[derive(Default)]
 pub struct BlocklistRules {
     exact: HashSet<Arc<str>>,
+}
+
+#[derive(Default)]
+struct CacheValidator {
+    etag: Option<String>,
+    last_modified: Option<String>,
 }
 
 impl BlocklistRemote {
@@ -34,46 +45,67 @@ impl BlocklistRemote {
             url: Arc::from(cfg.url),
             refresh,
             rules,
+            validator: Arc::new(RwLock::new(CacheValidator::default())),
             client,
         })
     }
 
     pub async fn start(self: Arc<Self>) {
-        match self.refresh_once().await {
-            Ok(_) => {
-                metrics::counter!("dns_blocklist_refresh_total", "result" => "success").increment(1);
-            }
-            Err(err) => {
-                metrics::counter!("dns_blocklist_refresh_total", "result" => "error").increment(1);
-                tracing::warn!(error = %err, url = %self.url, "blocklist refresh failed");
-            }
+        if let Err(err) = self.refresh_once().await {
+            tracing::warn!(error = %err, url = %self.url, "blocklist refresh failed");
         }
         let mut ticker = time::interval(self.refresh);
         loop {
             ticker.tick().await;
             if let Err(err) = self.refresh_once().await {
-                metrics::counter!("dns_blocklist_refresh_total", "result" => "error").increment(1);
                 tracing::warn!(error = %err, url = %self.url, "blocklist refresh failed");
-            } else {
-                metrics::counter!("dns_blocklist_refresh_total", "result" => "success").increment(1);
             }
         }
     }
 
     pub async fn refresh_once(&self) -> anyhow::Result<()> {
-        let text = self
-            .client
-            .get(self.url.as_ref())
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
+        let validator = self.validator.read().await;
+        let mut req = self.client.get(self.url.as_ref()).timeout(Duration::from_secs(15));
+        if let Some(etag) = &validator.etag {
+            req = req.header(IF_NONE_MATCH, etag);
+        }
+        if let Some(last_modified) = &validator.last_modified {
+            req = req.header(IF_MODIFIED_SINCE, last_modified);
+        }
+        drop(validator);
+
+        let resp = req.send().await?;
+        if resp.status() == StatusCode::NOT_MODIFIED {
+            metrics::counter!("dns_blocklist_refresh_total", "result" => "not_modified").increment(1);
+            return Ok(());
+        }
+        let resp = match resp.error_for_status() {
+            Ok(resp) => resp,
+            Err(err) => {
+                metrics::counter!("dns_blocklist_refresh_total", "result" => "error").increment(1);
+                return Err(err.into());
+            }
+        };
+
+        let mut validator = self.validator.write().await;
+        validator.etag = resp
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned);
+        validator.last_modified = resp
+            .headers()
+            .get(LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned);
+        drop(validator);
+
+        let text = resp.text().await?;
 
         let rules = parse_rules(&text);
         metrics::gauge!("dns_blocklist_domains").set(rules.exact.len() as f64);
         self.rules.store(Arc::new(rules));
+        metrics::counter!("dns_blocklist_refresh_total", "result" => "success").increment(1);
         Ok(())
     }
 
@@ -86,9 +118,8 @@ impl BlocklistRemote {
             return false;
         }
 
-        let name = Arc::<str>::from(name);
         let rules = self.rules.load();
-        rules.exact.contains(&name)
+        rules.exact.contains(name.as_str())
     }
 }
 

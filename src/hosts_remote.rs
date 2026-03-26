@@ -7,7 +7,11 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use tokio::time;
+use reqwest::{
+    header::{ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED},
+    StatusCode,
+};
+use tokio::{sync::RwLock, time};
 
 use crate::{config::HostsRemoteConfig, dns};
 
@@ -17,12 +21,19 @@ pub struct HostsRemote {
     refresh: Duration,
     ttl_seconds: u32,
     table: Arc<ArcSwap<HostsTable>>,
+    validator: Arc<RwLock<CacheValidator>>,
     client: reqwest::Client,
 }
 
 #[derive(Default)]
 pub struct HostsTable {
     by_name: HashMap<Arc<str>, Vec<IpAddr>>,
+}
+
+#[derive(Default)]
+struct CacheValidator {
+    etag: Option<String>,
+    last_modified: Option<String>,
 }
 
 impl HostsRemote {
@@ -39,49 +50,70 @@ impl HostsRemote {
             refresh,
             ttl_seconds: cfg.ttl_seconds.max(1),
             table,
+            validator: Arc::new(RwLock::new(CacheValidator::default())),
             client,
         })
     }
 
     pub async fn start(self: Arc<Self>) {
-        match self.refresh_once().await {
-            Ok(_) => {
-                metrics::counter!("dns_hosts_refresh_total", "result" => "success").increment(1);
-            }
-            Err(err) => {
-                metrics::counter!("dns_hosts_refresh_total", "result" => "error").increment(1);
-                tracing::warn!(error = %err, url = %self.url, "hosts refresh failed");
-            }
+        if let Err(err) = self.refresh_once().await {
+            tracing::warn!(error = %err, url = %self.url, "hosts refresh failed");
         }
 
         let mut ticker = time::interval(self.refresh);
         loop {
             ticker.tick().await;
             if let Err(err) = self.refresh_once().await {
-                metrics::counter!("dns_hosts_refresh_total", "result" => "error").increment(1);
                 tracing::warn!(error = %err, url = %self.url, "hosts refresh failed");
-            } else {
-                metrics::counter!("dns_hosts_refresh_total", "result" => "success").increment(1);
             }
         }
     }
 
     pub async fn refresh_once(&self) -> anyhow::Result<()> {
-        let text = self
-            .client
-            .get(self.url.as_ref())
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?;
+        let validator = self.validator.read().await;
+        let mut req = self.client.get(self.url.as_ref()).timeout(Duration::from_secs(10));
+        if let Some(etag) = &validator.etag {
+            req = req.header(IF_NONE_MATCH, etag);
+        }
+        if let Some(last_modified) = &validator.last_modified {
+            req = req.header(IF_MODIFIED_SINCE, last_modified);
+        }
+        drop(validator);
+
+        let resp = req.send().await?;
+        if resp.status() == StatusCode::NOT_MODIFIED {
+            metrics::counter!("dns_hosts_refresh_total", "result" => "not_modified").increment(1);
+            return Ok(());
+        }
+        let resp = match resp.error_for_status() {
+            Ok(resp) => resp,
+            Err(err) => {
+                metrics::counter!("dns_hosts_refresh_total", "result" => "error").increment(1);
+                return Err(err.into());
+            }
+        };
+
+        let mut validator = self.validator.write().await;
+        validator.etag = resp
+            .headers()
+            .get(ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned);
+        validator.last_modified = resp
+            .headers()
+            .get(LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(ToOwned::to_owned);
+        drop(validator);
+
+        let text = resp.text().await?;
 
         let table = parse_hosts(&text);
         metrics::gauge!("dns_hosts_domains").set(table.by_name.len() as f64);
         let ip_count: usize = table.by_name.values().map(|v| v.len()).sum();
         metrics::gauge!("dns_hosts_ips").set(ip_count as f64);
         self.table.store(Arc::new(table));
+        metrics::counter!("dns_hosts_refresh_total", "result" => "success").increment(1);
         Ok(())
     }
 
@@ -91,22 +123,28 @@ impl HostsRemote {
             return None;
         }
 
-        let name = Arc::<str>::from(name);
         let table = self.table.load();
-        let ips = table.by_name.get(&name)?;
-
-        let mut v4 = Vec::new();
-        let mut v6 = Vec::new();
-        for ip in ips {
-            match ip {
-                IpAddr::V4(v) => v4.push(*v),
-                IpAddr::V6(v) => v6.push(*v),
-            }
-        }
-
         let answers = match qtype {
-            1 => dns::Answers::A(v4),
-            28 => dns::Answers::AAAA(v6),
+            1 => {
+                let ips = table.by_name.get(name.as_str())?;
+                let mut v4 = Vec::with_capacity(ips.len());
+                for ip in ips {
+                    if let IpAddr::V4(v) = ip {
+                        v4.push(*v);
+                    }
+                }
+                dns::Answers::A(v4)
+            }
+            28 => {
+                let ips = table.by_name.get(name.as_str())?;
+                let mut v6 = Vec::with_capacity(ips.len());
+                for ip in ips {
+                    if let IpAddr::V6(v) = ip {
+                        v6.push(*v);
+                    }
+                }
+                dns::Answers::AAAA(v6)
+            }
             _ => return None,
         };
 
