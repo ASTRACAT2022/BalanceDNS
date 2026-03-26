@@ -157,6 +157,11 @@ impl AppConfig {
     }
 
     fn with_defaults(mut self) -> Self {
+        self.security.request_timeout_ms = self
+            .security
+            .request_timeout_ms
+            .max(default_runtime_request_timeout_ms());
+
         if self.upstreams.is_empty() {
             self.upstreams.push(UpstreamConfig {
                 name: "google-8.8.8.8".to_string(),
@@ -278,6 +283,10 @@ fn default_request_timeout_ms() -> u64 {
     1500
 }
 
+fn default_runtime_request_timeout_ms() -> u64 {
+    3500
+}
+
 fn default_dot_listen() -> SocketAddr {
     "0.0.0.0:8853".parse().unwrap()
 }
@@ -324,4 +333,50 @@ fn default_cache_max_size() -> usize {
 
 fn default_cache_ttl_seconds() -> u64 {
     300
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_defaults_raises_runtime_timeout_without_config_changes() {
+        let cfg = AppConfig {
+            server: ServerConfig {
+                udp_listen: "127.0.0.1:5353".parse().unwrap(),
+                tcp_listen: "127.0.0.1:5353".parse().unwrap(),
+                dot_listen: "127.0.0.1:8853".parse().unwrap(),
+                doh_listen: "127.0.0.1:8443".parse().unwrap(),
+            },
+            tls: TlsConfig::default(),
+            cache: CacheConfig::default(),
+            hosts_remote: None,
+            blocklist_remote: None,
+            balancing: BalancingConfig {
+                algorithm: BalancingAlgorithm::RoundRobin,
+            },
+            security: SecurityConfig {
+                deny_any: true,
+                deny_dnskey: true,
+                request_timeout_ms: 1500,
+            },
+            metrics: MetricsConfig {
+                listen: "127.0.0.1:9100".parse().unwrap(),
+            },
+            upstreams: vec![UpstreamConfig {
+                name: "google-8.8.8.8".to_string(),
+                proto: UpstreamProto::Udp,
+                addr: Some("8.8.8.8:53".parse().unwrap()),
+                url: None,
+                server_name: None,
+                tls_insecure: false,
+                pool: "default".to_string(),
+                weight: 1,
+            }],
+        }
+        .with_defaults();
+
+        assert_eq!(cfg.security.request_timeout_ms, 3500);
+        assert_eq!(cfg.upstreams.len(), 1);
+    }
 }

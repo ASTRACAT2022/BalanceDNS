@@ -111,6 +111,10 @@ impl UpstreamSet {
     }
 
     pub fn pick(&self, pool: &str, balancer: &Balancer, client_ip: Option<IpAddr>) -> Option<UpstreamRef> {
+        self.candidates(pool, balancer, client_ip).into_iter().next()
+    }
+
+    pub fn candidates(&self, pool: &str, balancer: &Balancer, client_ip: Option<IpAddr>) -> Vec<UpstreamRef> {
         let mut eligible: Vec<usize> = self
             .upstreams
             .iter()
@@ -131,17 +135,22 @@ impl UpstreamSet {
         }
 
         if eligible.is_empty() {
-            return None;
+            return Vec::new();
         }
 
-        let idx = balancer.pick(&eligible, client_ip);
-        let u = &self.upstreams[idx];
-        Some(UpstreamRef {
-            name: u.name.clone(),
-            pool: u.pool.clone(),
-            endpoint: u.endpoint.as_ref(),
-            transport: self.transport.clone(),
-        })
+        let start_idx = balancer.pick(&eligible, client_ip);
+        let start_pos = eligible
+            .iter()
+            .position(|idx| *idx == start_idx)
+            .unwrap_or(0);
+
+        eligible
+            .iter()
+            .cycle()
+            .skip(start_pos)
+            .take(eligible.len())
+            .map(|idx| self.make_ref(*idx))
+            .collect()
     }
 
     pub fn all_udp(&self) -> Vec<(Arc<str>, SocketAddr)> {
@@ -205,6 +214,18 @@ impl UpstreamEndpoint {
                 url: url.clone(),
                 tls_insecure: *tls_insecure,
             },
+        }
+    }
+}
+
+impl UpstreamSet {
+    fn make_ref(&self, idx: usize) -> UpstreamRef {
+        let u = &self.upstreams[idx];
+        UpstreamRef {
+            name: u.name.clone(),
+            pool: u.pool.clone(),
+            endpoint: u.endpoint.as_ref(),
+            transport: self.transport.clone(),
         }
     }
 }

@@ -569,6 +569,214 @@ async fn udp_proxy_roundtrip_via_dot_upstream_insecure() {
     proxy_task.abort();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_proxy_retries_next_upstream_after_timeout() {
+    init_tracing();
+
+    let stalled = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let stalled_addr = stalled.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            if stalled.recv_from(&mut buf).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let healthy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let healthy_addr = healthy.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            let (n, peer) = match healthy.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut resp = buf[..n].to_vec();
+            if resp.len() >= 4 {
+                let flags = u16::from_be_bytes([resp[2], resp[3]]);
+                let b = (flags | 0x8000).to_be_bytes();
+                resp[2] = b[0];
+                resp[3] = b[1];
+            }
+            let _ = healthy.send_to(&resp, peer).await;
+        }
+    });
+
+    let upstreams = Arc::new(
+        UpstreamSet::new(vec![
+            UpstreamConfig {
+                name: "stalled".to_string(),
+                proto: UpstreamProto::Udp,
+                addr: Some(stalled_addr),
+                url: None,
+                server_name: None,
+                tls_insecure: false,
+                pool: "default".to_string(),
+                weight: 1,
+            },
+            UpstreamConfig {
+                name: "healthy".to_string(),
+                proto: UpstreamProto::Udp,
+                addr: Some(healthy_addr),
+                url: None,
+                server_name: None,
+                tls_insecure: false,
+                pool: "default".to_string(),
+                weight: 1,
+            },
+        ])
+        .unwrap(),
+    );
+    let balancer = Arc::new(Balancer::new(BalancingAlgorithm::RoundRobin));
+    let security = SecurityConfig {
+        deny_any: false,
+        deny_dnskey: false,
+        request_timeout_ms: 150,
+    };
+
+    let proxy = UdpProxy::new(
+        "127.0.0.1:0".parse().unwrap(),
+        upstreams,
+        balancer,
+        security,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let proxy_task = tokio::spawn(async move { proxy.run().await });
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let query = build_query(0x5555, RecordType::A);
+    client.send_to(&query, proxy_addr).await.unwrap();
+
+    let mut buf = [0u8; 4096];
+    let (n, _) = time::timeout(Duration::from_secs(3), client.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let resp = &buf[..n];
+    assert_eq!(dns::read_id(resp), Some(0x5555));
+
+    proxy_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_proxy_falls_back_to_tcp_when_udp_response_is_truncated() {
+    init_tracing();
+
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_addr = tcp_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match tcp_listener.accept().await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            tokio::spawn(async move {
+                loop {
+                    let mut len_buf = [0u8; 2];
+                    if stream.read_exact(&mut len_buf).await.is_err() {
+                        return;
+                    }
+                    let len = u16::from_be_bytes(len_buf) as usize;
+                    let mut msg = vec![0u8; len];
+                    if stream.read_exact(&mut msg).await.is_err() {
+                        return;
+                    }
+                    if msg.len() >= 4 {
+                        let flags = u16::from_be_bytes([msg[2], msg[3]]);
+                        let b = (flags | 0x8000) & !0x0200;
+                        let b = b.to_be_bytes();
+                        msg[2] = b[0];
+                        msg[3] = b[1];
+                    }
+                    let resp_len = (msg.len() as u16).to_be_bytes();
+                    if stream.write_all(&resp_len).await.is_err() {
+                        return;
+                    }
+                    if stream.write_all(&msg).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    let udp_addr: std::net::SocketAddr = format!("127.0.0.1:{}", tcp_addr.port()).parse().unwrap();
+    let udp_sock = UdpSocket::bind(udp_addr).await.unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            let (n, peer) = match udp_sock.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut resp = buf[..n].to_vec();
+            if resp.len() >= 4 {
+                let flags = u16::from_be_bytes([resp[2], resp[3]]);
+                let b = (flags | 0x8000 | 0x0200).to_be_bytes();
+                resp[2] = b[0];
+                resp[3] = b[1];
+            }
+            let _ = udp_sock.send_to(&resp, peer).await;
+        }
+    });
+
+    let upstreams = Arc::new(
+        UpstreamSet::new(vec![UpstreamConfig {
+            name: "udp-with-tcp-fallback".to_string(),
+            proto: UpstreamProto::Udp,
+            addr: Some(tcp_addr),
+            url: None,
+            server_name: None,
+            tls_insecure: false,
+            pool: "default".to_string(),
+            weight: 1,
+        }])
+        .unwrap(),
+    );
+    let balancer = Arc::new(Balancer::new(BalancingAlgorithm::RoundRobin));
+    let security = SecurityConfig {
+        deny_any: false,
+        deny_dnskey: false,
+        request_timeout_ms: 800,
+    };
+
+    let proxy = UdpProxy::new(
+        "127.0.0.1:0".parse().unwrap(),
+        upstreams,
+        balancer,
+        security,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let proxy_task = tokio::spawn(async move { proxy.run().await });
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let query = build_query(0x6666, RecordType::A);
+    client.send_to(&query, proxy_addr).await.unwrap();
+
+    let mut buf = [0u8; 4096];
+    let (n, _) = time::timeout(Duration::from_secs(3), client.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let resp = &buf[..n];
+    assert_eq!(dns::read_id(resp), Some(0x6666));
+    assert!(!dns::is_truncated_response(resp));
+
+    proxy_task.abort();
+}
+
 fn build_query(id: u16, record_type: RecordType) -> Vec<u8> {
     let name = Name::from_ascii("example.com.").unwrap();
     let mut msg = Message::new();

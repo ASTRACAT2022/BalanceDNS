@@ -32,6 +32,14 @@ pub fn read_qname_qtype_qclass(packet: &[u8]) -> Option<(String, u16, u16)> {
     Some((name, qtype, qclass))
 }
 
+pub fn is_truncated_response(packet: &[u8]) -> bool {
+    if packet.len() < 4 {
+        return false;
+    }
+    let flags = u16::from_be_bytes([packet[2], packet[3]]);
+    flags & 0x0200 != 0
+}
+
 #[derive(Clone)]
 pub enum Answers {
     A(Vec<std::net::Ipv4Addr>),

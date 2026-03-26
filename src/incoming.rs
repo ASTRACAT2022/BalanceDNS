@@ -21,9 +21,9 @@ use crate::{
     cache::DnsCache,
     config::{SecurityConfig, TlsConfig},
     hosts_remote::HostsRemote,
-    proxy::maybe_refuse,
+    proxy::{forward_candidates, maybe_refuse},
     tls,
-    upstream::{Balancer, TransportContext, UpstreamEndpointRef, UpstreamSet},
+    upstream::{Balancer, UpstreamSet},
 };
 
 pub struct DotServer {
@@ -256,13 +256,14 @@ async fn handle_dot_conn(
         }
 
         let client_ip = Some(peer.ip());
-        let upstream = upstreams
-            .pick("default", &balancer, client_ip)
-            .ok_or_else(|| anyhow::anyhow!("no upstream"))?;
+        let candidates = upstreams.candidates("default", &balancer, client_ip);
+        if candidates.is_empty() {
+            return Err(anyhow::anyhow!("no upstream"));
+        }
 
         let start = Instant::now();
-        match forward_once(&upstream.transport, &upstream.endpoint, &msg, timeout).await {
-            Ok(resp) => {
+        match forward_candidates(&candidates, &msg, timeout).await {
+            Ok((upstream, resp, _upstream_proto)) => {
                 // Сохраняем в кэш
                 if let Some(cache) = &cache {
                     if let Some((domain, qtype, _qclass)) = crate::dns::read_qname_qtype_qclass(&msg) {
@@ -298,18 +299,16 @@ async fn handle_doh_conn(
     let tls_stream = acceptor.accept(stream).await?;
     let io = TokioIo::new(tls_stream);
 
-    let transport = upstreams.transport();
     let service = service_fn(move |req| {
         let upstreams = upstreams.clone();
         let balancer = balancer.clone();
         let security = security.clone();
-        let transport = transport.clone();
         let hosts = hosts.clone();
         let blocklist = blocklist.clone();
         let cache = cache.clone();
         async move {
             Ok::<_, std::convert::Infallible>(
-                handle_doh_request(req, upstreams, balancer, security, hosts, blocklist, cache, transport, timeout).await,
+                handle_doh_request(req, upstreams, balancer, security, hosts, blocklist, cache, timeout).await,
             )
         }
     });
@@ -330,7 +329,6 @@ async fn handle_doh_request(
     hosts: Option<Arc<HostsRemote>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
-    transport: Arc<TransportContext>,
     timeout: Duration,
 ) -> Response<Full<Bytes>> {
     let (parts, body) = req.into_parts();
@@ -398,13 +396,14 @@ async fn handle_doh_request(
         }
     }
 
-    let Some(upstream) = upstreams.pick("default", &balancer, None) else {
+    let candidates = upstreams.candidates("default", &balancer, None);
+    if candidates.is_empty() {
         return response(StatusCode::BAD_GATEWAY, Bytes::new());
-    };
+    }
 
     let start = Instant::now();
-    match forward_once(&transport, &upstream.endpoint, &query, timeout).await {
-        Ok(resp) => {
+    match forward_candidates(&candidates, &query, timeout).await {
+        Ok((upstream, resp, _upstream_proto)) => {
             // Сохраняем в кэш
             if let Some(cache) = &cache {
                 if let Some((domain, qtype, _qclass)) = crate::dns::read_qname_qtype_qclass(&query) {
@@ -449,15 +448,6 @@ fn observe_latency(proto: &'static str, upstream_name: &Arc<str>, start: Instant
         "upstream" => upstream_label
     )
     .record(latency_ms);
-}
-
-async fn forward_once(
-    transport: &TransportContext,
-    endpoint: &UpstreamEndpointRef,
-    query: &[u8],
-    timeout: Duration,
-) -> anyhow::Result<Vec<u8>> {
-    crate::proxy::forward_once(transport, endpoint, query, timeout).await
 }
 
 /// Извлекает TTL из DNS-ответа
