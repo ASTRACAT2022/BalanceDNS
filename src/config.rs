@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, path::Path, time::Duration};
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AppConfig {
@@ -16,11 +16,15 @@ pub struct AppConfig {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ServerConfig {
+    #[serde(deserialize_with = "deserialize_socket_addr")]
     pub udp_listen: SocketAddr,
+    #[serde(deserialize_with = "deserialize_socket_addr")]
     pub tcp_listen: SocketAddr,
     #[serde(default = "default_dot_listen")]
+    #[serde(deserialize_with = "deserialize_socket_addr")]
     pub dot_listen: SocketAddr,
     #[serde(default = "default_doh_listen")]
+    #[serde(deserialize_with = "deserialize_socket_addr")]
     pub doh_listen: SocketAddr,
 }
 
@@ -81,6 +85,7 @@ pub struct UpstreamConfig {
     pub name: String,
     #[serde(default)]
     pub proto: UpstreamProto,
+    #[serde(default, deserialize_with = "deserialize_opt_socket_addr")]
     pub addr: Option<SocketAddr>,
     pub url: Option<String>,
     pub server_name: Option<String>,
@@ -114,7 +119,7 @@ impl AppConfig {
         let cfg: Self = toml::from_str(&text)
             .map_err(|e| anyhow::anyhow!("failed to parse config {}: {}", path.display(), e))?;
 
-        Ok(cfg.with_defaults().resolve_paths(path))
+        Ok(cfg.with_defaults().resolve_paths(path).normalize_strings())
     }
 
     pub fn request_timeout(&self) -> Duration {
@@ -146,6 +151,21 @@ impl AppConfig {
         self.tls.key_pem = resolve_path(dir, &self.tls.key_pem);
         self
     }
+
+    fn normalize_strings(mut self) -> Self {
+        if let Some(hr) = &mut self.hosts_remote {
+            hr.url = sanitize_url(&hr.url);
+        }
+        for u in &mut self.upstreams {
+            if let Some(url) = &mut u.url {
+                *url = sanitize_url(url);
+            }
+            if let Some(sn) = &mut u.server_name {
+                *sn = sn.trim().to_string();
+            }
+        }
+        self
+    }
 }
 
 fn resolve_path(base_dir: &Path, value: &str) -> String {
@@ -154,6 +174,63 @@ fn resolve_path(base_dir: &Path, value: &str) -> String {
         return value.to_string();
     }
     base_dir.join(p).to_string_lossy().to_string()
+}
+
+fn sanitize_url(value: &str) -> String {
+    value.replace('`', "").trim().to_string()
+}
+
+fn deserialize_socket_addr<'de, D>(deserializer: D) -> Result<SocketAddr, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    parse_socket_addr_loose(&s).map_err(de::Error::custom)
+}
+
+fn deserialize_opt_socket_addr<'de, D>(deserializer: D) -> Result<Option<SocketAddr>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = Option::<String>::deserialize(deserializer)?;
+    match s {
+        None => Ok(None),
+        Some(v) => parse_socket_addr_loose(&v).map(Some).map_err(de::Error::custom),
+    }
+}
+
+fn parse_socket_addr_loose(value: &str) -> Result<SocketAddr, String> {
+    let s = value.trim();
+    if s.is_empty() {
+        return Err("empty socket address".to_string());
+    }
+
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+
+    if let Some(rest) = s.strip_prefix("[:") {
+        if let Some((ip, port)) = rest.rsplit_once(":]:") {
+            let fixed = format!("{}:{}", ip.trim(), port.trim());
+            return fixed
+                .parse::<SocketAddr>()
+                .map_err(|_| format!("invalid socket address syntax: {}", value));
+        }
+    }
+
+    if let Some(inner) = s.strip_prefix('[').and_then(|v| v.split_once(']').map(|(a, b)| (a, b))) {
+        let (inside, tail) = inner;
+        if !inside.contains(':') {
+            if let Some(port) = tail.strip_prefix(':') {
+                let fixed = format!("{}:{}", inside.trim(), port.trim());
+                return fixed
+                    .parse::<SocketAddr>()
+                    .map_err(|_| format!("invalid socket address syntax: {}", value));
+            }
+        }
+    }
+
+    Err(format!("invalid socket address syntax: {}", value))
 }
 
 fn default_deny_any() -> bool {
