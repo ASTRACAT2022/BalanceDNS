@@ -228,7 +228,11 @@ async fn handle_doh_conn(
         let security = security.clone();
         let transport = transport.clone();
         let hosts = hosts.clone();
-        async move { handle_doh_request(req, upstreams, balancer, security, hosts, transport, timeout).await }
+        async move {
+            Ok::<_, std::convert::Infallible>(
+                handle_doh_request(req, upstreams, balancer, security, hosts, transport, timeout).await,
+            )
+        }
     });
 
     hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
@@ -247,53 +251,65 @@ async fn handle_doh_request(
     hosts: Option<Arc<HostsRemote>>,
     transport: Arc<TransportContext>,
     timeout: Duration,
-) -> anyhow::Result<Response<Full<Bytes>>> {
+) -> Response<Full<Bytes>> {
     let (parts, body) = req.into_parts();
     if parts.uri.path() != "/dns-query" {
-        return Ok(response(StatusCode::NOT_FOUND, Bytes::new()));
+        return response(StatusCode::NOT_FOUND, Bytes::new());
     }
 
     let query = match parts.method {
-        Method::POST => {
-            let collected = time::timeout(timeout, body.collect()).await??;
-            collected.to_bytes().to_vec()
-        }
+        Method::POST => match time::timeout(timeout, body.collect()).await {
+            Ok(Ok(collected)) => collected.to_bytes().to_vec(),
+            Ok(Err(_)) => return response(StatusCode::BAD_REQUEST, Bytes::new()),
+            Err(_) => return response(StatusCode::REQUEST_TIMEOUT, Bytes::new()),
+        },
         Method::GET => {
-            let dns_param = parts
+            let Some(dns_param) = parts
                 .uri
                 .query()
                 .and_then(|q| q.split('&').find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == "dns").map(|(_, v)| v)))
-                .ok_or_else(|| anyhow::anyhow!("missing dns param"))?;
-            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(dns_param.as_bytes())
-                .map_err(|_| anyhow::anyhow!("bad base64url"))?;
-            decoded
+            else {
+                return response(StatusCode::BAD_REQUEST, Bytes::new());
+            };
+
+            match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(dns_param.as_bytes()) {
+                Ok(decoded) => decoded,
+                Err(_) => return response(StatusCode::BAD_REQUEST, Bytes::new()),
+            }
         }
-        _ => return Ok(response(StatusCode::METHOD_NOT_ALLOWED, Bytes::new())),
+        _ => return response(StatusCode::METHOD_NOT_ALLOWED, Bytes::new()),
     };
+
+    if query.len() < 12 {
+        return response(StatusCode::BAD_REQUEST, Bytes::new());
+    }
 
     metrics::counter!("dns_requests_total", "proto" => "doh").increment(1);
 
     if let Some(resp) = maybe_refuse(&query, &security) {
         metrics::counter!("dns_denied_total", "proto" => "doh").increment(1);
-        return Ok(response_dns(resp));
+        return response_dns(resp);
     }
 
     if let Some(hosts) = &hosts {
         if let Some(resp) = hosts.maybe_answer(&query) {
             metrics::counter!("dns_hosts_hits_total", "proto" => "doh").increment(1);
-            return Ok(response_dns(resp));
+            return response_dns(resp);
         }
     }
 
-    let upstream = upstreams
-        .pick("default", &balancer, None)
-        .ok_or_else(|| anyhow::anyhow!("no upstream"))?;
+    let Some(upstream) = upstreams.pick("default", &balancer, None) else {
+        return response(StatusCode::BAD_GATEWAY, Bytes::new());
+    };
 
     let start = Instant::now();
-    let resp = forward_once(&transport, &upstream.endpoint, &query, timeout).await?;
-    observe_latency("doh", &upstream.name, start);
-    Ok(response_dns(resp))
+    match forward_once(&transport, &upstream.endpoint, &query, timeout).await {
+        Ok(resp) => {
+            observe_latency("doh", &upstream.name, start);
+            response_dns(resp)
+        }
+        Err(_) => response(StatusCode::BAD_GATEWAY, Bytes::new()),
+    }
 }
 
 fn response(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {

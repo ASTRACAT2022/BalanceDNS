@@ -114,7 +114,7 @@ impl AppConfig {
         let cfg: Self = toml::from_str(&text)
             .map_err(|e| anyhow::anyhow!("failed to parse config {}: {}", path.display(), e))?;
 
-        Ok(cfg.with_defaults())
+        Ok(cfg.with_defaults().resolve_paths(path))
     }
 
     pub fn request_timeout(&self) -> Duration {
@@ -136,6 +136,24 @@ impl AppConfig {
         }
         self
     }
+
+    fn resolve_paths(mut self, config_path: &Path) -> Self {
+        let Some(dir) = config_path.parent() else {
+            return self;
+        };
+
+        self.tls.cert_pem = resolve_path(dir, &self.tls.cert_pem);
+        self.tls.key_pem = resolve_path(dir, &self.tls.key_pem);
+        self
+    }
+}
+
+fn resolve_path(base_dir: &Path, value: &str) -> String {
+    let p = std::path::Path::new(value);
+    if p.is_absolute() {
+        return value.to_string();
+    }
+    base_dir.join(p).to_string_lossy().to_string()
 }
 
 fn default_deny_any() -> bool {
