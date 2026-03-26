@@ -99,6 +99,25 @@ journalctl -u astracat-dns -f
 - `dns_timeouts_total{proto="udp",upstream="..."}`
 - `dns_upstream_latency_ms{proto="udp|tcp",upstream="..."}`
 
+### QPS и полезные PromQL
+
+- Общий QPS (все протоколы):
+  - `sum(rate(dns_requests_total[1m]))`
+- QPS по протоколам:
+  - `sum by (proto) (rate(dns_requests_total[1m]))`
+- Блокировки (QPS блокировок):
+  - `sum(rate(dns_blocked_total[1m]))`
+  - `sum by (proto) (rate(dns_blocked_total[1m]))`
+- Хиты hosts (QPS ответов из hosts):
+  - `sum(rate(dns_hosts_hits_total[1m]))`
+- Ошибки апстрима (включая DoT/DoH):
+  - `sum by (proto) (rate(dns_upstream_errors_total[1m]))`
+- Размеры списков:
+  - `dns_hosts_domains`, `dns_hosts_ips`, `dns_blocklist_domains`
+- Обновления списков:
+  - `sum(rate(dns_hosts_refresh_total[5m]))`
+  - `sum(rate(dns_blocklist_refresh_total[5m]))`
+
 ## Remote hosts (GitHub raw)
 
 Секция `[hosts_remote]` заставляет сервис отвечать локально по правилам из файла в формате `/etc/hosts` (строки `IP hostname`).

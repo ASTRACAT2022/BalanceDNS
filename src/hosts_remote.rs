@@ -44,13 +44,24 @@ impl HostsRemote {
     }
 
     pub async fn start(self: Arc<Self>) {
-        let _ = self.refresh_once().await;
+        match self.refresh_once().await {
+            Ok(_) => {
+                metrics::counter!("dns_hosts_refresh_total", "result" => "success").increment(1);
+            }
+            Err(err) => {
+                metrics::counter!("dns_hosts_refresh_total", "result" => "error").increment(1);
+                tracing::warn!(error = %err, url = %self.url, "hosts refresh failed");
+            }
+        }
 
         let mut ticker = time::interval(self.refresh);
         loop {
             ticker.tick().await;
             if let Err(err) = self.refresh_once().await {
+                metrics::counter!("dns_hosts_refresh_total", "result" => "error").increment(1);
                 tracing::warn!(error = %err, url = %self.url, "hosts refresh failed");
+            } else {
+                metrics::counter!("dns_hosts_refresh_total", "result" => "success").increment(1);
             }
         }
     }
@@ -67,6 +78,9 @@ impl HostsRemote {
             .await?;
 
         let table = parse_hosts(&text);
+        metrics::gauge!("dns_hosts_domains").set(table.by_name.len() as f64);
+        let ip_count: usize = table.by_name.values().map(|v| v.len()).sum();
+        metrics::gauge!("dns_hosts_ips").set(ip_count as f64);
         self.table.store(Arc::new(table));
         Ok(())
     }
@@ -152,4 +166,3 @@ fn normalize_name(host: &str) -> Option<Arc<str>> {
     }
     Some(Arc::from(out))
 }
-

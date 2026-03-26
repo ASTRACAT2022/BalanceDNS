@@ -170,7 +170,17 @@ impl UpstreamSet {
                 _ => false,
             };
             let prev = u.alive.swap(ok, Ordering::Relaxed);
+
+            metrics::gauge!("dns_upstream_alive", "upstream" => u.name.to_string())
+                .set(if ok { 1.0 } else { 0.0 });
+
             if prev != ok {
+                metrics::counter!(
+                    "dns_upstream_health_changes_total",
+                    "upstream" => u.name.to_string(),
+                    "alive" => if ok { "true" } else { "false" }
+                )
+                .increment(1);
                 tracing::warn!(upstream = %u.name, alive = ok, "upstream health changed");
             }
         }

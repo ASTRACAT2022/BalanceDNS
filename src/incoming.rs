@@ -234,11 +234,17 @@ async fn handle_dot_conn(
             .ok_or_else(|| anyhow::anyhow!("no upstream"))?;
 
         let start = Instant::now();
-        let resp = forward_once(&upstream.transport, &upstream.endpoint, &msg, timeout).await?;
-        observe_latency("dot", &upstream.name, start);
-
-        tls.write_all(&(resp.len() as u16).to_be_bytes()).await?;
-        tls.write_all(&resp).await?;
+        match forward_once(&upstream.transport, &upstream.endpoint, &msg, timeout).await {
+            Ok(resp) => {
+                observe_latency("dot", &upstream.name, start);
+                tls.write_all(&(resp.len() as u16).to_be_bytes()).await?;
+                tls.write_all(&resp).await?;
+            }
+            Err(err) => {
+                metrics::counter!("dns_upstream_errors_total", "proto" => "dot").increment(1);
+                return Err(err);
+            }
+        }
     }
 }
 
@@ -354,7 +360,10 @@ async fn handle_doh_request(
             observe_latency("doh", &upstream.name, start);
             response_dns(resp)
         }
-        Err(_) => response(StatusCode::BAD_GATEWAY, Bytes::new()),
+        Err(_) => {
+            metrics::counter!("dns_upstream_errors_total", "proto" => "doh").increment(1);
+            response(StatusCode::BAD_GATEWAY, Bytes::new())
+        }
     }
 }
 

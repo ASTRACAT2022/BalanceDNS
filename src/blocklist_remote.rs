@@ -39,12 +39,23 @@ impl BlocklistRemote {
     }
 
     pub async fn start(self: Arc<Self>) {
-        let _ = self.refresh_once().await;
+        match self.refresh_once().await {
+            Ok(_) => {
+                metrics::counter!("dns_blocklist_refresh_total", "result" => "success").increment(1);
+            }
+            Err(err) => {
+                metrics::counter!("dns_blocklist_refresh_total", "result" => "error").increment(1);
+                tracing::warn!(error = %err, url = %self.url, "blocklist refresh failed");
+            }
+        }
         let mut ticker = time::interval(self.refresh);
         loop {
             ticker.tick().await;
             if let Err(err) = self.refresh_once().await {
+                metrics::counter!("dns_blocklist_refresh_total", "result" => "error").increment(1);
                 tracing::warn!(error = %err, url = %self.url, "blocklist refresh failed");
+            } else {
+                metrics::counter!("dns_blocklist_refresh_total", "result" => "success").increment(1);
             }
         }
     }
@@ -61,6 +72,7 @@ impl BlocklistRemote {
             .await?;
 
         let rules = parse_rules(&text);
+        metrics::gauge!("dns_blocklist_domains").set(rules.exact.len() as f64);
         self.rules.store(Arc::new(rules));
         Ok(())
     }
@@ -171,4 +183,3 @@ fn normalize_name(host: &str) -> Option<Arc<str>> {
     out.push('.');
     Some(Arc::from(out))
 }
-
