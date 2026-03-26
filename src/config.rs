@@ -8,10 +8,18 @@ pub struct AppConfig {
     #[serde(default)]
     pub tls: TlsConfig,
     pub hosts_remote: Option<HostsRemoteConfig>,
+    pub blocklist_remote: Option<BlocklistRemoteConfig>,
     pub balancing: BalancingConfig,
     pub security: SecurityConfig,
     pub metrics: MetricsConfig,
     pub upstreams: Vec<UpstreamConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BlocklistRemoteConfig {
+    pub url: String,
+    #[serde(default = "default_blocklist_refresh_seconds")]
+    pub refresh_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -156,6 +164,9 @@ impl AppConfig {
         if let Some(hr) = &mut self.hosts_remote {
             hr.url = sanitize_url(&hr.url);
         }
+        if let Some(br) = &mut self.blocklist_remote {
+            br.url = sanitize_url(&br.url);
+        }
         for u in &mut self.upstreams {
             if let Some(url) = &mut u.url {
                 *url = sanitize_url(url);
@@ -267,6 +278,10 @@ fn default_hosts_refresh_seconds() -> u64 {
 
 fn default_hosts_ttl_seconds() -> u32 {
     60
+}
+
+fn default_blocklist_refresh_seconds() -> u64 {
+    300
 }
 
 fn default_pool() -> String {

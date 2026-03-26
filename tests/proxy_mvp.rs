@@ -87,6 +87,7 @@ async fn udp_proxy_roundtrip_preserves_id() {
         balancer,
         security,
         None,
+        None,
     )
         .await
         .unwrap();
@@ -149,6 +150,7 @@ async fn udp_proxy_denies_any_with_refused() {
         upstreams,
         balancer,
         security,
+        None,
         None,
     )
         .await
@@ -242,6 +244,7 @@ async fn tcp_proxy_roundtrip_preserves_id() {
         balancer,
         security,
         None,
+        None,
     )
         .await
         .unwrap();
@@ -313,6 +316,7 @@ async fn udp_proxy_roundtrip_ipv6_if_available() {
         upstreams,
         balancer,
         security,
+        None,
         None,
     )
         .await
@@ -433,6 +437,7 @@ async fn udp_proxy_roundtrip_via_doh_upstream() {
         balancer,
         security,
         None,
+        None,
     )
         .await
         .unwrap();
@@ -535,6 +540,7 @@ async fn udp_proxy_roundtrip_via_dot_upstream_insecure() {
         upstreams,
         balancer,
         security,
+        None,
         None,
     )
         .await

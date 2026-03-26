@@ -5,6 +5,7 @@ use tracing::Level;
 
 use crate::{
     config::AppConfig,
+    blocklist_remote::BlocklistRemote,
     hosts_remote::HostsRemote,
     incoming::{DohServer, DotServer},
     metrics_http::MetricsServer,
@@ -35,12 +36,25 @@ pub async fn run() -> anyhow::Result<()> {
         None => None,
     };
 
+    let blocklist = match config.blocklist_remote.clone() {
+        Some(cfg) => {
+            let bl = Arc::new(BlocklistRemote::new(cfg)?);
+            let bg = bl.clone();
+            tokio::spawn(async move {
+                bg.start().await;
+            });
+            Some(bl)
+        }
+        None => None,
+    };
+
     let udp_proxy = UdpProxy::new(
         config.server.udp_listen,
         upstreams.clone(),
         balancer.clone(),
         config.security.clone(),
         hosts.clone(),
+        blocklist.clone(),
     )
     .await?;
 
@@ -50,6 +64,7 @@ pub async fn run() -> anyhow::Result<()> {
         balancer.clone(),
         config.security.clone(),
         hosts.clone(),
+        blocklist.clone(),
     )
     .await?;
 
@@ -62,6 +77,7 @@ pub async fn run() -> anyhow::Result<()> {
         balancer.clone(),
         config.security.clone(),
         hosts.clone(),
+        blocklist.clone(),
     )
     .await?;
     let doh = DohServer::new(
@@ -71,6 +87,7 @@ pub async fn run() -> anyhow::Result<()> {
         balancer.clone(),
         config.security.clone(),
         hosts.clone(),
+        blocklist.clone(),
     )
     .await?;
 

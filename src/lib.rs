@@ -1,5 +1,6 @@
 pub mod config;
 pub mod cli;
+pub mod blocklist_remote;
 pub mod dns;
 pub mod hosts_remote;
 pub mod incoming;

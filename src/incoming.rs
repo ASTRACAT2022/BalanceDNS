@@ -17,6 +17,7 @@ use tokio::{
 };
 
 use crate::{
+    blocklist_remote::BlocklistRemote,
     config::{SecurityConfig, TlsConfig},
     hosts_remote::HostsRemote,
     proxy::maybe_refuse,
@@ -32,6 +33,7 @@ pub struct DotServer {
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    blocklist: Option<Arc<BlocklistRemote>>,
     request_timeout: Duration,
 }
 
@@ -43,6 +45,7 @@ pub struct DohServer {
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    blocklist: Option<Arc<BlocklistRemote>>,
     request_timeout: Duration,
 }
 
@@ -54,6 +57,7 @@ impl DotServer {
         balancer: Arc<Balancer>,
         security: SecurityConfig,
         hosts: Option<Arc<HostsRemote>>,
+        blocklist: Option<Arc<BlocklistRemote>>,
     ) -> anyhow::Result<Self> {
         let request_timeout = Duration::from_millis(security.request_timeout_ms);
         let listener = TcpListener::bind(listen).await?;
@@ -66,6 +70,7 @@ impl DotServer {
             balancer,
             security,
             hosts,
+            blocklist,
             request_timeout,
         })
     }
@@ -89,15 +94,29 @@ impl DotServer {
             let balancer = self.balancer.clone();
             let security = self.security.clone();
             let hosts = self.hosts.clone();
+            let blocklist = self.blocklist.clone();
             let timeout = self.request_timeout;
 
             tokio::spawn(async move {
-                if let Err(err) = handle_dot_conn(stream, peer, acceptor, upstreams, balancer, security, hosts, timeout).await {
+                if let Err(err) = handle_dot_conn(
+                    stream,
+                    peer,
+                    acceptor,
+                    upstreams,
+                    balancer,
+                    security,
+                    hosts,
+                    blocklist,
+                    timeout,
+                )
+                .await
+                {
                     tracing::debug!(peer = %peer, error = %err, "dot conn failed");
                 }
             });
         }
     }
+
 }
 
 impl DohServer {
@@ -108,6 +127,7 @@ impl DohServer {
         balancer: Arc<Balancer>,
         security: SecurityConfig,
         hosts: Option<Arc<HostsRemote>>,
+        blocklist: Option<Arc<BlocklistRemote>>,
     ) -> anyhow::Result<Self> {
         let request_timeout = Duration::from_millis(security.request_timeout_ms);
         let listener = TcpListener::bind(listen).await?;
@@ -120,6 +140,7 @@ impl DohServer {
             balancer,
             security,
             hosts,
+            blocklist,
             request_timeout,
         })
     }
@@ -143,9 +164,10 @@ impl DohServer {
             let balancer = self.balancer.clone();
             let security = self.security.clone();
             let hosts = self.hosts.clone();
+            let blocklist = self.blocklist.clone();
             let timeout = self.request_timeout;
             tokio::spawn(async move {
-                if let Err(err) = handle_doh_conn(stream, peer, acceptor, upstreams, balancer, security, hosts, timeout).await {
+                if let Err(err) = handle_doh_conn(stream, peer, acceptor, upstreams, balancer, security, hosts, blocklist, timeout).await {
                     tracing::debug!(peer = %peer, error = %err, "doh conn failed");
                 }
             });
@@ -161,6 +183,7 @@ async fn handle_dot_conn(
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    blocklist: Option<Arc<BlocklistRemote>>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let mut tls = acceptor.accept(stream).await?;
@@ -194,6 +217,17 @@ async fn handle_dot_conn(
             }
         }
 
+        if let Some(bl) = &blocklist {
+            if bl.is_blocked(&msg) {
+                if let Some(resp) = crate::dns::build_nxdomain_response(&msg) {
+                    metrics::counter!("dns_blocked_total", "proto" => "dot").increment(1);
+                    tls.write_all(&(resp.len() as u16).to_be_bytes()).await?;
+                    tls.write_all(&resp).await?;
+                    continue;
+                }
+            }
+        }
+
         let client_ip = Some(peer.ip());
         let upstream = upstreams
             .pick("default", &balancer, client_ip)
@@ -216,6 +250,7 @@ async fn handle_doh_conn(
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    blocklist: Option<Arc<BlocklistRemote>>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let tls_stream = acceptor.accept(stream).await?;
@@ -228,9 +263,10 @@ async fn handle_doh_conn(
         let security = security.clone();
         let transport = transport.clone();
         let hosts = hosts.clone();
+        let blocklist = blocklist.clone();
         async move {
             Ok::<_, std::convert::Infallible>(
-                handle_doh_request(req, upstreams, balancer, security, hosts, transport, timeout).await,
+                handle_doh_request(req, upstreams, balancer, security, hosts, blocklist, transport, timeout).await,
             )
         }
     });
@@ -249,6 +285,7 @@ async fn handle_doh_request(
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    blocklist: Option<Arc<BlocklistRemote>>,
     transport: Arc<TransportContext>,
     timeout: Duration,
 ) -> Response<Full<Bytes>> {
@@ -295,6 +332,15 @@ async fn handle_doh_request(
         if let Some(resp) = hosts.maybe_answer(&query) {
             metrics::counter!("dns_hosts_hits_total", "proto" => "doh").increment(1);
             return response_dns(resp);
+        }
+    }
+
+    if let Some(bl) = &blocklist {
+        if bl.is_blocked(&query) {
+            if let Some(resp) = crate::dns::build_nxdomain_response(&query) {
+                metrics::counter!("dns_blocked_total", "proto" => "doh").increment(1);
+                return response_dns(resp);
+            }
         }
     }
 

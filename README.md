@@ -108,3 +108,13 @@ journalctl -u astracat-dns -f
 - `url` — ссылка на raw-файл
 - `refresh_seconds` — период обновления (по умолчанию 300)
 - `ttl_seconds` — TTL в ответах (по умолчанию 60)
+
+## Blocklist (anti-ads)
+
+Секция `[blocklist_remote]` загружает список блокировок из URL и отвечает `NXDOMAIN` для доменов из списка.
+Поддерживаются только безопасные для DNS-уровня правила:
+- adblock network filters `||domain^`
+- hosts-формат `0.0.0.0 domain`
+- строки с чистым доменом
+
+Косметические правила вида `domain##selector` игнорируются.

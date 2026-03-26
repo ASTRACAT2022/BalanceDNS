@@ -104,6 +104,37 @@ pub fn build_answer_response(
     msg.to_vec().ok()
 }
 
+pub fn build_nxdomain_response(query: &[u8]) -> Option<Vec<u8>> {
+    use trust_dns_proto::{
+        op::{Message, MessageType, OpCode, Query, ResponseCode},
+        rr::{Name, RecordType},
+    };
+
+    let id = read_id(query)?;
+    let flags = u16::from_be_bytes([*query.get(2)?, *query.get(3)?]);
+    let rd = (flags & 0x0100) != 0;
+    let (qname, qtype, qclass) = read_qname_qtype_qclass(query)?;
+    if qclass != 1 {
+        return None;
+    }
+    let record_type = match qtype {
+        1 => RecordType::A,
+        28 => RecordType::AAAA,
+        _ => RecordType::A,
+    };
+
+    let name = Name::from_ascii(qname).ok()?;
+    let mut msg = Message::new();
+    msg.set_id(id);
+    msg.set_message_type(MessageType::Response);
+    msg.set_op_code(OpCode::Query);
+    msg.set_recursion_desired(rd);
+    msg.set_recursion_available(true);
+    msg.set_response_code(ResponseCode::NXDomain);
+    msg.add_query(Query::query(name, record_type));
+    msg.to_vec().ok()
+}
+
 fn read_u16(packet: &[u8], offset: usize) -> Option<u16> {
     let b0 = *packet.get(offset)?;
     let b1 = *packet.get(offset + 1)?;

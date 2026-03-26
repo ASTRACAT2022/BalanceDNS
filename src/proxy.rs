@@ -16,6 +16,7 @@ use tokio::{
 use tokio_rustls::TlsConnector;
 
 use crate::{
+    blocklist_remote::BlocklistRemote,
     config::SecurityConfig,
     dns,
     hosts_remote::HostsRemote,
@@ -29,6 +30,7 @@ pub struct UdpProxy {
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    blocklist: Option<Arc<BlocklistRemote>>,
     upstream_workers: Vec<Arc<UdpUpstreamWorker>>,
     request_timeout: Duration,
 }
@@ -40,6 +42,7 @@ pub struct TcpProxy {
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    blocklist: Option<Arc<BlocklistRemote>>,
     request_timeout: Duration,
 }
 
@@ -50,6 +53,7 @@ impl UdpProxy {
         balancer: Arc<Balancer>,
         security: SecurityConfig,
         hosts: Option<Arc<HostsRemote>>,
+        blocklist: Option<Arc<BlocklistRemote>>,
     ) -> anyhow::Result<Self> {
         let socket = Arc::new(UdpSocket::bind(listen).await?);
         let listen = socket.local_addr()?;
@@ -67,6 +71,7 @@ impl UdpProxy {
             balancer,
             security,
             hosts,
+            blocklist,
             upstream_workers,
             request_timeout,
         })
@@ -104,6 +109,16 @@ impl UdpProxy {
                     metrics::counter!("dns_hosts_hits_total", "proto" => "udp").increment(1);
                     let _ = self.socket.send_to(&resp, client).await;
                     continue;
+                }
+            }
+
+            if let Some(bl) = &self.blocklist {
+                if bl.is_blocked(packet) {
+                    if let Some(resp) = dns::build_nxdomain_response(packet) {
+                        metrics::counter!("dns_blocked_total", "proto" => "udp").increment(1);
+                        let _ = self.socket.send_to(&resp, client).await;
+                        continue;
+                    }
                 }
             }
 
@@ -170,6 +185,7 @@ impl TcpProxy {
         balancer: Arc<Balancer>,
         security: SecurityConfig,
         hosts: Option<Arc<HostsRemote>>,
+        blocklist: Option<Arc<BlocklistRemote>>,
     ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(listen).await?;
         let listen = listener.local_addr()?;
@@ -181,6 +197,7 @@ impl TcpProxy {
             balancer,
             security,
             hosts,
+            blocklist,
             request_timeout,
         })
     }
@@ -193,10 +210,11 @@ impl TcpProxy {
             let balancer = self.balancer.clone();
             let security = self.security.clone();
             let hosts = self.hosts.clone();
+            let blocklist = self.blocklist.clone();
             let timeout = self.request_timeout;
 
             tokio::spawn(async move {
-                if let Err(err) = handle_tcp_conn(stream, peer, upstreams, balancer, security, hosts, timeout).await {
+                if let Err(err) = handle_tcp_conn(stream, peer, upstreams, balancer, security, hosts, blocklist, timeout).await {
                     tracing::debug!(peer = %peer, error = %err, "tcp conn failed");
                 }
             });
@@ -362,6 +380,7 @@ async fn handle_tcp_conn(
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    blocklist: Option<Arc<BlocklistRemote>>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let client_ip = Some(peer.ip());
@@ -390,6 +409,16 @@ async fn handle_tcp_conn(
                 metrics::counter!("dns_hosts_hits_total", "proto" => "tcp").increment(1);
                 write_tcp_response(&mut client, &resp).await?;
                 continue;
+            }
+        }
+
+        if let Some(bl) = &blocklist {
+            if bl.is_blocked(&msg) {
+                if let Some(resp) = dns::build_nxdomain_response(&msg) {
+                    metrics::counter!("dns_blocked_total", "proto" => "tcp").increment(1);
+                    write_tcp_response(&mut client, &resp).await?;
+                    continue;
+                }
             }
         }
 
