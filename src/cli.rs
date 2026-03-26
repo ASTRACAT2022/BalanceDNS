@@ -4,6 +4,7 @@ use tokio::signal;
 use tracing::Level;
 
 use crate::{
+    cache::DnsCache,
     config::AppConfig,
     blocklist_remote::BlocklistRemote,
     hosts_remote::HostsRemote,
@@ -48,6 +49,21 @@ pub async fn run() -> anyhow::Result<()> {
         None => None,
     };
 
+    let cache = if config.cache.enabled {
+        let c = Arc::new(DnsCache::new(
+            config.cache.max_size,
+            Duration::from_secs(config.cache.ttl_seconds),
+        ));
+        tracing::info!(
+            max_size = config.cache.max_size,
+            ttl_seconds = config.cache.ttl_seconds,
+            "DNS cache enabled"
+        );
+        Some(c)
+    } else {
+        None
+    };
+
     let udp_proxy = UdpProxy::new(
         config.server.udp_listen,
         upstreams.clone(),
@@ -55,6 +71,7 @@ pub async fn run() -> anyhow::Result<()> {
         config.security.clone(),
         hosts.clone(),
         blocklist.clone(),
+        cache.clone(),
     )
     .await?;
 
@@ -65,6 +82,7 @@ pub async fn run() -> anyhow::Result<()> {
         config.security.clone(),
         hosts.clone(),
         blocklist.clone(),
+        cache.clone(),
     )
     .await?;
 
@@ -78,6 +96,7 @@ pub async fn run() -> anyhow::Result<()> {
         config.security.clone(),
         hosts.clone(),
         blocklist.clone(),
+        cache.clone(),
     )
     .await?;
     let doh = DohServer::new(
@@ -88,6 +107,7 @@ pub async fn run() -> anyhow::Result<()> {
         config.security.clone(),
         hosts.clone(),
         blocklist.clone(),
+        cache.clone(),
     )
     .await?;
 

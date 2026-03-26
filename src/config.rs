@@ -7,12 +7,34 @@ pub struct AppConfig {
     pub server: ServerConfig,
     #[serde(default)]
     pub tls: TlsConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
     pub hosts_remote: Option<HostsRemoteConfig>,
     pub blocklist_remote: Option<BlocklistRemoteConfig>,
     pub balancing: BalancingConfig,
     pub security: SecurityConfig,
     pub metrics: MetricsConfig,
     pub upstreams: Vec<UpstreamConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CacheConfig {
+    #[serde(default = "default_cache_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_cache_max_size")]
+    pub max_size: usize,
+    #[serde(default = "default_cache_ttl_seconds")]
+    pub ttl_seconds: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_cache_enabled(),
+            max_size: default_cache_max_size(),
+            ttl_seconds: default_cache_ttl_seconds(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -290,4 +312,16 @@ fn default_pool() -> String {
 
 fn default_weight() -> u32 {
     1
+}
+
+fn default_cache_enabled() -> bool {
+    true
+}
+
+fn default_cache_max_size() -> usize {
+    10_000
+}
+
+fn default_cache_ttl_seconds() -> u64 {
+    300
 }

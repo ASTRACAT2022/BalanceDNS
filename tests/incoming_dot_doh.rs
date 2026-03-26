@@ -71,6 +71,7 @@ async fn incoming_dot_roundtrip() {
         security,
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -153,6 +154,7 @@ async fn incoming_doh_roundtrip() {
         upstreams,
         balancer,
         security,
+        None,
         None,
         None,
     )

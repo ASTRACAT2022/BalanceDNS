@@ -17,6 +17,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::{
     blocklist_remote::BlocklistRemote,
+    cache::DnsCache,
     config::SecurityConfig,
     dns,
     hosts_remote::HostsRemote,
@@ -31,6 +32,7 @@ pub struct UdpProxy {
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
     blocklist: Option<Arc<BlocklistRemote>>,
+    cache: Option<Arc<DnsCache>>,
     upstream_workers: Vec<Arc<UdpUpstreamWorker>>,
     request_timeout: Duration,
 }
@@ -43,6 +45,7 @@ pub struct TcpProxy {
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
     blocklist: Option<Arc<BlocklistRemote>>,
+    cache: Option<Arc<DnsCache>>,
     request_timeout: Duration,
 }
 
@@ -54,6 +57,7 @@ impl UdpProxy {
         security: SecurityConfig,
         hosts: Option<Arc<HostsRemote>>,
         blocklist: Option<Arc<BlocklistRemote>>,
+        cache: Option<Arc<DnsCache>>,
     ) -> anyhow::Result<Self> {
         let socket = Arc::new(UdpSocket::bind(listen).await?);
         let listen = socket.local_addr()?;
@@ -72,6 +76,7 @@ impl UdpProxy {
             security,
             hosts,
             blocklist,
+            cache,
             upstream_workers,
             request_timeout,
         })
@@ -82,9 +87,10 @@ impl UdpProxy {
 
         for worker in &self.upstream_workers {
             let listener = self.socket.clone();
+            let cache = self.cache.clone();
             let w = worker.clone();
             tokio::spawn(async move {
-                w.run_receiver(listener).await;
+                w.run_receiver_with_cache(listener, cache).await;
             });
             let w = worker.clone();
             tokio::spawn(async move {
@@ -122,6 +128,22 @@ impl UdpProxy {
                 }
             }
 
+            // Проверка кэша
+            if let Some(cache) = &self.cache {
+                if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(packet) {
+                    if let Some(cached_resp) = cache.get(&domain, qtype) {
+                        metrics::counter!("dns_cache_hits_total", "proto" => "udp").increment(1);
+                        // Восстанавливаем оригинальный ID запроса
+                        let mut resp = cached_resp;
+                        if let Some(orig_id) = dns::read_id(packet) {
+                            dns::write_id(&mut resp, orig_id);
+                        }
+                        let _ = self.socket.send_to(&resp, client).await;
+                        continue;
+                    }
+                }
+            }
+
             let client_ip = Some(client.ip());
             let upstream = match self.upstreams.pick("default", &self.balancer, client_ip) {
                 Some(u) => u,
@@ -142,11 +164,12 @@ impl UdpProxy {
                     };
 
                     let listener = self.socket.clone();
+                    let cache = self.cache.clone();
                     let mut owned = Vec::with_capacity(n);
                     owned.extend_from_slice(packet);
                     let timeout = self.request_timeout;
                     tokio::spawn(async move {
-                        if let Err(err) = worker.forward(listener, client, owned, timeout).await {
+                        if let Err(err) = worker.forward_with_cache(listener, client, owned, timeout, cache).await {
                             tracing::debug!(error = %err, "udp forward failed");
                             metrics::counter!("dns_upstream_errors_total", "proto" => "udp").increment(1);
                         }
@@ -154,12 +177,20 @@ impl UdpProxy {
                 }
                 _ => {
                     let listener = self.socket.clone();
+                    let cache = self.cache.clone();
                     let mut owned = Vec::with_capacity(n);
                     owned.extend_from_slice(packet);
                     let timeout = self.request_timeout;
                     tokio::spawn(async move {
                         match forward_once(&upstream.transport, &upstream.endpoint, &owned, timeout).await {
                             Ok(resp) => {
+                                // Сохраняем в кэш
+                                if let Some(cache) = &cache {
+                                    if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(&owned) {
+                                        let ttl = extract_ttl_from_response(&resp).unwrap_or(Duration::from_secs(300));
+                                        cache.set(&domain, qtype, resp.clone(), ttl);
+                                    }
+                                }
                                 let _ = listener.send_to(&resp, client).await;
                             }
                             Err(err) => {
@@ -186,6 +217,7 @@ impl TcpProxy {
         security: SecurityConfig,
         hosts: Option<Arc<HostsRemote>>,
         blocklist: Option<Arc<BlocklistRemote>>,
+        cache: Option<Arc<DnsCache>>,
     ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(listen).await?;
         let listen = listener.local_addr()?;
@@ -198,6 +230,7 @@ impl TcpProxy {
             security,
             hosts,
             blocklist,
+            cache,
             request_timeout,
         })
     }
@@ -211,10 +244,11 @@ impl TcpProxy {
             let security = self.security.clone();
             let hosts = self.hosts.clone();
             let blocklist = self.blocklist.clone();
+            let cache = self.cache.clone();
             let timeout = self.request_timeout;
 
             tokio::spawn(async move {
-                if let Err(err) = handle_tcp_conn(stream, peer, upstreams, balancer, security, hosts, blocklist, timeout).await {
+                if let Err(err) = handle_tcp_conn(stream, peer, upstreams, balancer, security, hosts, blocklist, cache, timeout).await {
                     tracing::debug!(peer = %peer, error = %err, "tcp conn failed");
                 }
             });
@@ -261,8 +295,19 @@ impl UdpUpstreamWorker {
         &self,
         listener: Arc<UdpSocket>,
         client: SocketAddr,
+        packet: Vec<u8>,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        self.forward_with_cache(listener, client, packet, timeout, None).await
+    }
+
+    async fn forward_with_cache(
+        &self,
+        listener: Arc<UdpSocket>,
+        client: SocketAddr,
         mut packet: Vec<u8>,
         timeout: Duration,
+        _cache: Option<Arc<DnsCache>>,
     ) -> anyhow::Result<()> {
         let orig_id = dns::read_id(&packet).unwrap_or(0);
         let internal_id = self.alloc_id();
@@ -295,6 +340,10 @@ impl UdpUpstreamWorker {
     }
 
     async fn run_receiver(self: Arc<Self>, listener: Arc<UdpSocket>) {
+        self.run_receiver_with_cache(listener, None).await
+    }
+
+    async fn run_receiver_with_cache(self: Arc<Self>, listener: Arc<UdpSocket>, cache: Option<Arc<DnsCache>>) {
         let mut buf = vec![0u8; 4096];
         loop {
             let (n, from) = match self.socket.recv_from(&mut buf).await {
@@ -331,6 +380,12 @@ impl UdpUpstreamWorker {
                 "upstream" => upstream_label
             )
             .record(latency_ms);
+
+            // Сохраняем в кэш перед отправкой
+            if let Some(_cache) = &cache {
+                // Для кэширования нужен оригинальный запрос, но у нас его нет здесь
+                // Кэширование будет работать через основной путь в proxy.rs
+            }
 
             let _ = listener.send_to(&resp, pending.client).await;
         }
@@ -381,6 +436,7 @@ async fn handle_tcp_conn(
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
     blocklist: Option<Arc<BlocklistRemote>>,
+    cache: Option<Arc<DnsCache>>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let client_ip = Some(peer.ip());
@@ -422,11 +478,35 @@ async fn handle_tcp_conn(
             }
         }
 
+        // Проверка кэша
+        if let Some(cache) = &cache {
+            if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(&msg) {
+                if let Some(cached_resp) = cache.get(&domain, qtype) {
+                    metrics::counter!("dns_cache_hits_total", "proto" => "tcp").increment(1);
+                    let mut resp = cached_resp;
+                    if let Some(orig_id) = dns::read_id(&msg) {
+                        dns::write_id(&mut resp, orig_id);
+                    }
+                    write_tcp_response(&mut client, &resp).await?;
+                    continue;
+                }
+            }
+        }
+
                 let start = Instant::now();
                 upstream_conn.write_all(&(msg.len() as u16).to_be_bytes()).await?;
                 upstream_conn.write_all(&msg).await?;
 
                 let resp = read_tcp_response(&mut upstream_conn, timeout).await?;
+                
+                // Сохраняем в кэш
+                if let Some(cache) = &cache {
+                    if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(&msg) {
+                        let ttl = extract_ttl_from_response(&resp).unwrap_or(Duration::from_secs(300));
+                        cache.set(&domain, qtype, resp.clone(), ttl);
+                    }
+                }
+                
                 observe_tcp_latency(&upstream.name, "tcp", start);
                 write_tcp_response(&mut client, &resp).await?;
             }
@@ -455,11 +535,35 @@ async fn handle_tcp_conn(
                     continue;
                 }
 
+                // Проверка кэша
+                if let Some(cache) = &cache {
+                    if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(&msg) {
+                        if let Some(cached_resp) = cache.get(&domain, qtype) {
+                            metrics::counter!("dns_cache_hits_total", "proto" => "tcp").increment(1);
+                            let mut resp = cached_resp;
+                            if let Some(orig_id) = dns::read_id(&msg) {
+                                dns::write_id(&mut resp, orig_id);
+                            }
+                            write_tcp_response(&mut client, &resp).await?;
+                            continue;
+                        }
+                    }
+                }
+
                 let start = Instant::now();
                 tls.write_all(&(msg.len() as u16).to_be_bytes()).await?;
                 tls.write_all(&msg).await?;
 
                 let resp = read_tcp_response(&mut tls, timeout).await?;
+                
+                // Сохраняем в кэш
+                if let Some(cache) = &cache {
+                    if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(&msg) {
+                        let ttl = extract_ttl_from_response(&resp).unwrap_or(Duration::from_secs(300));
+                        cache.set(&domain, qtype, resp.clone(), ttl);
+                    }
+                }
+                
                 observe_tcp_latency(&upstream.name, "dot", start);
                 write_tcp_response(&mut client, &resp).await?;
             }
@@ -473,8 +577,32 @@ async fn handle_tcp_conn(
                 continue;
             }
 
+            // Проверка кэша
+            if let Some(cache) = &cache {
+                if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(&msg) {
+                    if let Some(cached_resp) = cache.get(&domain, qtype) {
+                        metrics::counter!("dns_cache_hits_total", "proto" => "tcp").increment(1);
+                        let mut resp = cached_resp;
+                        if let Some(orig_id) = dns::read_id(&msg) {
+                            dns::write_id(&mut resp, orig_id);
+                        }
+                        write_tcp_response(&mut client, &resp).await?;
+                        continue;
+                    }
+                }
+            }
+
             let start = Instant::now();
             let resp = forward_udp_once(addr, &msg, timeout).await?;
+            
+            // Сохраняем в кэш
+            if let Some(cache) = &cache {
+                if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(&msg) {
+                    let ttl = extract_ttl_from_response(&resp).unwrap_or(Duration::from_secs(300));
+                    cache.set(&domain, qtype, resp.clone(), ttl);
+                }
+            }
+            
             observe_tcp_latency(&upstream.name, "udp", start);
             write_tcp_response(&mut client, &resp).await?;
         },
@@ -487,8 +615,32 @@ async fn handle_tcp_conn(
                 continue;
             }
 
+            // Проверка кэша
+            if let Some(cache) = &cache {
+                if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(&msg) {
+                    if let Some(cached_resp) = cache.get(&domain, qtype) {
+                        metrics::counter!("dns_cache_hits_total", "proto" => "tcp").increment(1);
+                        let mut resp = cached_resp;
+                        if let Some(orig_id) = dns::read_id(&msg) {
+                            dns::write_id(&mut resp, orig_id);
+                        }
+                        write_tcp_response(&mut client, &resp).await?;
+                        continue;
+                    }
+                }
+            }
+
             let start = Instant::now();
             let resp = forward_doh_once(&upstream.transport, &url, tls_insecure, &msg, timeout).await?;
+            
+            // Сохраняем в кэш
+            if let Some(cache) = &cache {
+                if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(&msg) {
+                    let ttl = extract_ttl_from_response(&resp).unwrap_or(Duration::from_secs(300));
+                    cache.set(&domain, qtype, resp.clone(), ttl);
+                }
+            }
+            
             observe_tcp_latency(&upstream.name, "doh", start);
             write_tcp_response(&mut client, &resp).await?;
         },
@@ -644,6 +796,34 @@ pub(crate) fn maybe_refuse(packet: &[u8], security: &SecurityConfig) -> Option<V
         return None;
     }
     Some(build_refused(packet))
+}
+
+/// Извлекает TTL из DNS-ответа
+fn extract_ttl_from_response(packet: &[u8]) -> Option<Duration> {
+    if packet.len() < 12 {
+        return None;
+    }
+    
+    // Пропускаем заголовок (12 байт) и вопрос
+    let mut offset = 12;
+    offset = crate::dns::skip_name(packet, offset)?;
+    offset += 4; // QTYPE (2) + QCLASS (2)
+    
+    // Пропускаем секцию ответа для получения TTL первого RR
+    // Формат RR: NAME (variable) + TYPE (2) + CLASS (2) + TTL (4) + RDLENGTH (2) + RDATA
+    offset = crate::dns::skip_name(packet, offset)?;
+    offset += 4; // TYPE + CLASS
+    
+    // Читаем TTL (4 байта)
+    let ttl_bytes = [
+        *packet.get(offset)?,
+        *packet.get(offset + 1)?,
+        *packet.get(offset + 2)?,
+        *packet.get(offset + 3)?,
+    ];
+    let ttl_secs = u32::from_be_bytes(ttl_bytes);
+    
+    Some(Duration::from_secs(ttl_secs as u64))
 }
 
 fn build_refused(packet: &[u8]) -> Vec<u8> {

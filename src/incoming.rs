@@ -18,6 +18,7 @@ use tokio::{
 
 use crate::{
     blocklist_remote::BlocklistRemote,
+    cache::DnsCache,
     config::{SecurityConfig, TlsConfig},
     hosts_remote::HostsRemote,
     proxy::maybe_refuse,
@@ -34,6 +35,7 @@ pub struct DotServer {
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
     blocklist: Option<Arc<BlocklistRemote>>,
+    cache: Option<Arc<DnsCache>>,
     request_timeout: Duration,
 }
 
@@ -46,6 +48,7 @@ pub struct DohServer {
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
     blocklist: Option<Arc<BlocklistRemote>>,
+    cache: Option<Arc<DnsCache>>,
     request_timeout: Duration,
 }
 
@@ -58,6 +61,7 @@ impl DotServer {
         security: SecurityConfig,
         hosts: Option<Arc<HostsRemote>>,
         blocklist: Option<Arc<BlocklistRemote>>,
+        cache: Option<Arc<DnsCache>>,
     ) -> anyhow::Result<Self> {
         let request_timeout = Duration::from_millis(security.request_timeout_ms);
         let listener = TcpListener::bind(listen).await?;
@@ -71,6 +75,7 @@ impl DotServer {
             security,
             hosts,
             blocklist,
+            cache,
             request_timeout,
         })
     }
@@ -95,6 +100,7 @@ impl DotServer {
             let security = self.security.clone();
             let hosts = self.hosts.clone();
             let blocklist = self.blocklist.clone();
+            let cache = self.cache.clone();
             let timeout = self.request_timeout;
 
             tokio::spawn(async move {
@@ -107,6 +113,7 @@ impl DotServer {
                     security,
                     hosts,
                     blocklist,
+                    cache,
                     timeout,
                 )
                 .await
@@ -128,6 +135,7 @@ impl DohServer {
         security: SecurityConfig,
         hosts: Option<Arc<HostsRemote>>,
         blocklist: Option<Arc<BlocklistRemote>>,
+        cache: Option<Arc<DnsCache>>,
     ) -> anyhow::Result<Self> {
         let request_timeout = Duration::from_millis(security.request_timeout_ms);
         let listener = TcpListener::bind(listen).await?;
@@ -141,6 +149,7 @@ impl DohServer {
             security,
             hosts,
             blocklist,
+            cache,
             request_timeout,
         })
     }
@@ -165,9 +174,10 @@ impl DohServer {
             let security = self.security.clone();
             let hosts = self.hosts.clone();
             let blocklist = self.blocklist.clone();
+            let cache = self.cache.clone();
             let timeout = self.request_timeout;
             tokio::spawn(async move {
-                if let Err(err) = handle_doh_conn(stream, peer, acceptor, upstreams, balancer, security, hosts, blocklist, timeout).await {
+                if let Err(err) = handle_doh_conn(stream, peer, acceptor, upstreams, balancer, security, hosts, blocklist, cache, timeout).await {
                     tracing::debug!(peer = %peer, error = %err, "doh conn failed");
                 }
             });
@@ -184,6 +194,7 @@ async fn handle_dot_conn(
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
     blocklist: Option<Arc<BlocklistRemote>>,
+    cache: Option<Arc<DnsCache>>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let mut tls = acceptor.accept(stream).await?;
@@ -228,6 +239,22 @@ async fn handle_dot_conn(
             }
         }
 
+        // Проверка кэша
+        if let Some(cache) = &cache {
+            if let Some((domain, qtype, _qclass)) = crate::dns::read_qname_qtype_qclass(&msg) {
+                if let Some(cached_resp) = cache.get(&domain, qtype) {
+                    metrics::counter!("dns_cache_hits_total", "proto" => "dot").increment(1);
+                    let mut resp = cached_resp;
+                    if let Some(orig_id) = crate::dns::read_id(&msg) {
+                        crate::dns::write_id(&mut resp, orig_id);
+                    }
+                    tls.write_all(&(resp.len() as u16).to_be_bytes()).await?;
+                    tls.write_all(&resp).await?;
+                    continue;
+                }
+            }
+        }
+
         let client_ip = Some(peer.ip());
         let upstream = upstreams
             .pick("default", &balancer, client_ip)
@@ -236,6 +263,14 @@ async fn handle_dot_conn(
         let start = Instant::now();
         match forward_once(&upstream.transport, &upstream.endpoint, &msg, timeout).await {
             Ok(resp) => {
+                // Сохраняем в кэш
+                if let Some(cache) = &cache {
+                    if let Some((domain, qtype, _qclass)) = crate::dns::read_qname_qtype_qclass(&msg) {
+                        let ttl = extract_ttl_from_response(&resp).unwrap_or(Duration::from_secs(300));
+                        cache.set(&domain, qtype, resp.clone(), ttl);
+                    }
+                }
+                
                 observe_latency("dot", &upstream.name, start);
                 tls.write_all(&(resp.len() as u16).to_be_bytes()).await?;
                 tls.write_all(&resp).await?;
@@ -257,6 +292,7 @@ async fn handle_doh_conn(
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
     blocklist: Option<Arc<BlocklistRemote>>,
+    cache: Option<Arc<DnsCache>>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let tls_stream = acceptor.accept(stream).await?;
@@ -270,9 +306,10 @@ async fn handle_doh_conn(
         let transport = transport.clone();
         let hosts = hosts.clone();
         let blocklist = blocklist.clone();
+        let cache = cache.clone();
         async move {
             Ok::<_, std::convert::Infallible>(
-                handle_doh_request(req, upstreams, balancer, security, hosts, blocklist, transport, timeout).await,
+                handle_doh_request(req, upstreams, balancer, security, hosts, blocklist, cache, transport, timeout).await,
             )
         }
     });
@@ -292,6 +329,7 @@ async fn handle_doh_request(
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
     blocklist: Option<Arc<BlocklistRemote>>,
+    cache: Option<Arc<DnsCache>>,
     transport: Arc<TransportContext>,
     timeout: Duration,
 ) -> Response<Full<Bytes>> {
@@ -350,6 +388,16 @@ async fn handle_doh_request(
         }
     }
 
+    // Проверка кэша
+    if let Some(cache) = &cache {
+        if let Some((domain, qtype, _qclass)) = crate::dns::read_qname_qtype_qclass(&query) {
+            if let Some(cached_resp) = cache.get(&domain, qtype) {
+                metrics::counter!("dns_cache_hits_total", "proto" => "doh").increment(1);
+                return response_dns(cached_resp);
+            }
+        }
+    }
+
     let Some(upstream) = upstreams.pick("default", &balancer, None) else {
         return response(StatusCode::BAD_GATEWAY, Bytes::new());
     };
@@ -357,6 +405,14 @@ async fn handle_doh_request(
     let start = Instant::now();
     match forward_once(&transport, &upstream.endpoint, &query, timeout).await {
         Ok(resp) => {
+            // Сохраняем в кэш
+            if let Some(cache) = &cache {
+                if let Some((domain, qtype, _qclass)) = crate::dns::read_qname_qtype_qclass(&query) {
+                    let ttl = extract_ttl_from_response(&resp).unwrap_or(Duration::from_secs(300));
+                    cache.set(&domain, qtype, resp.clone(), ttl);
+                }
+            }
+            
             observe_latency("doh", &upstream.name, start);
             response_dns(resp)
         }
@@ -402,4 +458,31 @@ async fn forward_once(
     timeout: Duration,
 ) -> anyhow::Result<Vec<u8>> {
     crate::proxy::forward_once(transport, endpoint, query, timeout).await
+}
+
+/// Извлекает TTL из DNS-ответа
+fn extract_ttl_from_response(packet: &[u8]) -> Option<Duration> {
+    if packet.len() < 12 {
+        return None;
+    }
+    
+    // Пропускаем заголовок (12 байт) и вопрос
+    let offset = 12;
+    let offset = crate::dns::skip_name(packet, offset)?;
+    let offset = offset + 4; // QTYPE (2) + QCLASS (2)
+    
+    // Пропускаем секцию ответа для получения TTL первого RR
+    let offset = crate::dns::skip_name(packet, offset)?;
+    let offset = offset + 4; // TYPE + CLASS
+    
+    // Читаем TTL (4 байта)
+    let ttl_bytes = [
+        *packet.get(offset)?,
+        *packet.get(offset + 1)?,
+        *packet.get(offset + 2)?,
+        *packet.get(offset + 3)?,
+    ];
+    let ttl_secs = u32::from_be_bytes(ttl_bytes);
+    
+    Some(Duration::from_secs(ttl_secs as u64))
 }

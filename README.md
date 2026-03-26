@@ -30,10 +30,27 @@ curl http://127.0.0.1:9100/metrics
 
 Ключевые секции:
 - `[server]` — адреса прослушивания UDP/TCP.
+- `[cache]` — настройки DNS-кэша в оперативной памяти.
 - `[hosts_remote]` — загрузка hosts-правил из URL (обновление каждые 5 минут).
 - `[[upstreams]]` — список апстримов и их протокол.
 - `[security]` — базовые фильтры типов (REFUSED для `ANY`/`DNSKEY`).
 - `[metrics]` — адрес HTTP-эндпоинта `/metrics`.
+
+### `[cache]`
+
+Настройки высокоскоростного DNS-кэша в оперативной памяти:
+
+```toml
+[cache]
+enabled = true          # Включить кэш (по умолчанию true)
+max_size = 10000        # Максимальное количество записей (по умолчанию 10000)
+ttl_seconds = 300       # TTL записей в секундах (по умолчанию 300)
+```
+
+Кэш использует потокобезопасную структуру данных DashMap для минимальных задержек и поддерживает:
+- LRU-подобную политику вытеснения при переполнении
+- Автоматическую очистку устаревших записей по TTL
+- Метрики хитов/промахов/очисток
 
 ### `[[upstreams]]`
 
@@ -98,6 +115,12 @@ journalctl -u astracat-dns -f
 - `dns_upstream_errors_total{proto="udp|tcp"}`
 - `dns_timeouts_total{proto="udp",upstream="..."}`
 - `dns_upstream_latency_ms{proto="udp|tcp",upstream="..."}`
+- `dns_cache_hits_total` — количество попаданий в кэш
+- `dns_cache_misses_total` — количество промахов кэша
+- `dns_cache_expired_total` — количество устаревших записей
+- `dns_cache_evictions_total` — количество вытесненных записей
+- `dns_cache_cleanup_total` — количество записей, удалённых при очистке
+- `dns_cache_size` — текущий размер кэша
 
 ### QPS и полезные PromQL
 
@@ -110,10 +133,18 @@ journalctl -u astracat-dns -f
   - `sum by (proto) (rate(dns_blocked_total[1m]))`
 - Хиты hosts (QPS ответов из hosts):
   - `sum(rate(dns_hosts_hits_total[1m]))`
+- Хиты кэша (QPS попаданий в кэш):
+  - `sum(rate(dns_cache_hits_total[1m]))`
+- Промахи кэша:
+  - `sum(rate(dns_cache_misses_total[1m]))`
+- Hit ratio кэша:
+  - `sum(rate(dns_cache_hits_total[1m])) / (sum(rate(dns_cache_hits_total[1m])) + sum(rate(dns_cache_misses_total[1m])))`
 - Ошибки апстрима (включая DoT/DoH):
   - `sum by (proto) (rate(dns_upstream_errors_total[1m]))`
 - Размеры списков:
   - `dns_hosts_domains`, `dns_hosts_ips`, `dns_blocklist_domains`
+- Размер кэша:
+  - `dns_cache_size`
 - Обновления списков:
   - `sum(rate(dns_hosts_refresh_total[5m]))`
   - `sum(rate(dns_blocklist_refresh_total[5m]))`

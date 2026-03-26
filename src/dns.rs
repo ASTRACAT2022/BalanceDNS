@@ -194,7 +194,7 @@ fn read_name(packet: &[u8], mut offset: usize) -> Option<(String, usize)> {
     }
 }
 
-fn skip_name(packet: &[u8], mut offset: usize) -> Option<usize> {
+pub fn skip_name(packet: &[u8], mut offset: usize) -> Option<usize> {
     let mut jumped = false;
     let mut end_offset = None;
     let mut seen = 0;
