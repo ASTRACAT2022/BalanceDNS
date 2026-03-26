@@ -1,0 +1,39 @@
+[server]
+udp_listen = "0.0.0.0:5353"
+tcp_listen = "0.0.0.0:5353"
+dot_listen = "0.0.0.0:8853"
+doh_listen = "0.0.0.0:8443"
+
+[tls]
+cert_pem = "config/tls/server.crt"
+key_pem = "config/tls/server.key"
+
+[balancing]
+algorithm = "round_robin"
+
+[security]
+deny_any = true
+deny_dnskey = true
+request_timeout_ms = 1500
+
+[metrics]
+listen = "127.0.0.1:9100"
+
+[hosts_remote]
+url = "https://raw.githubusercontent.com/ASTRACAT2022/host-DNS/refs/heads/main/bypass"
+refresh_seconds = 300
+ttl_seconds = 60
+
+[[upstreams]]
+name = "google-8.8.8.8"
+proto = "udp"
+addr = "8.8.8.8:53"
+pool = "default"
+weight = 1
+
+[[upstreams]]
+name = "google-8.8.4.4"
+proto = "udp"
+addr = "8.8.4.4:53"
+pool = "default"
+weight = 1

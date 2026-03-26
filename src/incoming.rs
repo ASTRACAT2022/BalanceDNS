@@ -1,0 +1,334 @@
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use base64::Engine as _;
+use http::{Method, StatusCode};
+use http_body_util::{BodyExt as _, Full};
+use hyper::{body::Bytes, service::service_fn, Request, Response};
+use hyper_util::rt::TokioIo;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    time,
+};
+
+use crate::{
+    config::{SecurityConfig, TlsConfig},
+    hosts_remote::HostsRemote,
+    proxy::maybe_refuse,
+    tls,
+    upstream::{Balancer, TransportContext, UpstreamEndpointRef, UpstreamSet},
+};
+
+pub struct DotServer {
+    listen: SocketAddr,
+    listener: TcpListener,
+    tls: TlsConfig,
+    upstreams: Arc<UpstreamSet>,
+    balancer: Arc<Balancer>,
+    security: SecurityConfig,
+    hosts: Option<Arc<HostsRemote>>,
+    request_timeout: Duration,
+}
+
+pub struct DohServer {
+    listen: SocketAddr,
+    listener: TcpListener,
+    tls: TlsConfig,
+    upstreams: Arc<UpstreamSet>,
+    balancer: Arc<Balancer>,
+    security: SecurityConfig,
+    hosts: Option<Arc<HostsRemote>>,
+    request_timeout: Duration,
+}
+
+impl DotServer {
+    pub async fn new(
+        listen: SocketAddr,
+        tls: TlsConfig,
+        upstreams: Arc<UpstreamSet>,
+        balancer: Arc<Balancer>,
+        security: SecurityConfig,
+        hosts: Option<Arc<HostsRemote>>,
+    ) -> anyhow::Result<Self> {
+        let request_timeout = Duration::from_millis(security.request_timeout_ms);
+        let listener = TcpListener::bind(listen).await?;
+        let listen = listener.local_addr()?;
+        Ok(Self {
+            listen,
+            listener,
+            tls,
+            upstreams,
+            balancer,
+            security,
+            hosts,
+            request_timeout,
+        })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.listen
+    }
+
+    pub async fn run(self) -> anyhow::Result<()> {
+        tracing::info!(listen = %self.listen, "dot listening");
+
+        let acceptor = tls::server_tls_acceptor(
+            &PathBuf::from(self.tls.cert_pem),
+            &PathBuf::from(self.tls.key_pem),
+        )?;
+
+        loop {
+            let (stream, peer) = self.listener.accept().await?;
+            let acceptor = acceptor.clone();
+            let upstreams = self.upstreams.clone();
+            let balancer = self.balancer.clone();
+            let security = self.security.clone();
+            let hosts = self.hosts.clone();
+            let timeout = self.request_timeout;
+
+            tokio::spawn(async move {
+                if let Err(err) = handle_dot_conn(stream, peer, acceptor, upstreams, balancer, security, hosts, timeout).await {
+                    tracing::debug!(peer = %peer, error = %err, "dot conn failed");
+                }
+            });
+        }
+    }
+}
+
+impl DohServer {
+    pub async fn new(
+        listen: SocketAddr,
+        tls: TlsConfig,
+        upstreams: Arc<UpstreamSet>,
+        balancer: Arc<Balancer>,
+        security: SecurityConfig,
+        hosts: Option<Arc<HostsRemote>>,
+    ) -> anyhow::Result<Self> {
+        let request_timeout = Duration::from_millis(security.request_timeout_ms);
+        let listener = TcpListener::bind(listen).await?;
+        let listen = listener.local_addr()?;
+        Ok(Self {
+            listen,
+            listener,
+            tls,
+            upstreams,
+            balancer,
+            security,
+            hosts,
+            request_timeout,
+        })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.listen
+    }
+
+    pub async fn run(self) -> anyhow::Result<()> {
+        tracing::info!(listen = %self.listen, "doh listening");
+
+        let acceptor = tls::server_tls_acceptor(
+            &PathBuf::from(self.tls.cert_pem),
+            &PathBuf::from(self.tls.key_pem),
+        )?;
+
+        loop {
+            let (stream, peer) = self.listener.accept().await?;
+            let acceptor = acceptor.clone();
+            let upstreams = self.upstreams.clone();
+            let balancer = self.balancer.clone();
+            let security = self.security.clone();
+            let hosts = self.hosts.clone();
+            let timeout = self.request_timeout;
+            tokio::spawn(async move {
+                if let Err(err) = handle_doh_conn(stream, peer, acceptor, upstreams, balancer, security, hosts, timeout).await {
+                    tracing::debug!(peer = %peer, error = %err, "doh conn failed");
+                }
+            });
+        }
+    }
+}
+
+async fn handle_dot_conn(
+    stream: TcpStream,
+    peer: SocketAddr,
+    acceptor: tokio_rustls::TlsAcceptor,
+    upstreams: Arc<UpstreamSet>,
+    balancer: Arc<Balancer>,
+    security: SecurityConfig,
+    hosts: Option<Arc<HostsRemote>>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let mut tls = acceptor.accept(stream).await?;
+
+    loop {
+        let mut len_buf = [0u8; 2];
+        if tls.read_exact(&mut len_buf).await.is_err() {
+            return Ok(());
+        }
+        let len = u16::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > 4096 {
+            return Ok(());
+        }
+        let mut msg = vec![0u8; len];
+        tls.read_exact(&mut msg).await?;
+        metrics::counter!("dns_requests_total", "proto" => "dot").increment(1);
+
+        if let Some(resp) = maybe_refuse(&msg, &security) {
+            metrics::counter!("dns_denied_total", "proto" => "dot").increment(1);
+            tls.write_all(&(resp.len() as u16).to_be_bytes()).await?;
+            tls.write_all(&resp).await?;
+            continue;
+        }
+
+        if let Some(hosts) = &hosts {
+            if let Some(resp) = hosts.maybe_answer(&msg) {
+                metrics::counter!("dns_hosts_hits_total", "proto" => "dot").increment(1);
+                tls.write_all(&(resp.len() as u16).to_be_bytes()).await?;
+                tls.write_all(&resp).await?;
+                continue;
+            }
+        }
+
+        let client_ip = Some(peer.ip());
+        let upstream = upstreams
+            .pick("default", &balancer, client_ip)
+            .ok_or_else(|| anyhow::anyhow!("no upstream"))?;
+
+        let start = Instant::now();
+        let resp = forward_once(&upstream.transport, &upstream.endpoint, &msg, timeout).await?;
+        observe_latency("dot", &upstream.name, start);
+
+        tls.write_all(&(resp.len() as u16).to_be_bytes()).await?;
+        tls.write_all(&resp).await?;
+    }
+}
+
+async fn handle_doh_conn(
+    stream: TcpStream,
+    _peer: SocketAddr,
+    acceptor: tokio_rustls::TlsAcceptor,
+    upstreams: Arc<UpstreamSet>,
+    balancer: Arc<Balancer>,
+    security: SecurityConfig,
+    hosts: Option<Arc<HostsRemote>>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let tls_stream = acceptor.accept(stream).await?;
+    let io = TokioIo::new(tls_stream);
+
+    let transport = upstreams.transport();
+    let service = service_fn(move |req| {
+        let upstreams = upstreams.clone();
+        let balancer = balancer.clone();
+        let security = security.clone();
+        let transport = transport.clone();
+        let hosts = hosts.clone();
+        async move { handle_doh_request(req, upstreams, balancer, security, hosts, transport, timeout).await }
+    });
+
+    hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+        .serve_connection(io, service)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    Ok(())
+}
+
+async fn handle_doh_request(
+    req: Request<hyper::body::Incoming>,
+    upstreams: Arc<UpstreamSet>,
+    balancer: Arc<Balancer>,
+    security: SecurityConfig,
+    hosts: Option<Arc<HostsRemote>>,
+    transport: Arc<TransportContext>,
+    timeout: Duration,
+) -> anyhow::Result<Response<Full<Bytes>>> {
+    let (parts, body) = req.into_parts();
+    if parts.uri.path() != "/dns-query" {
+        return Ok(response(StatusCode::NOT_FOUND, Bytes::new()));
+    }
+
+    let query = match parts.method {
+        Method::POST => {
+            let collected = time::timeout(timeout, body.collect()).await??;
+            collected.to_bytes().to_vec()
+        }
+        Method::GET => {
+            let dns_param = parts
+                .uri
+                .query()
+                .and_then(|q| q.split('&').find_map(|kv| kv.split_once('=').filter(|(k, _)| *k == "dns").map(|(_, v)| v)))
+                .ok_or_else(|| anyhow::anyhow!("missing dns param"))?;
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(dns_param.as_bytes())
+                .map_err(|_| anyhow::anyhow!("bad base64url"))?;
+            decoded
+        }
+        _ => return Ok(response(StatusCode::METHOD_NOT_ALLOWED, Bytes::new())),
+    };
+
+    metrics::counter!("dns_requests_total", "proto" => "doh").increment(1);
+
+    if let Some(resp) = maybe_refuse(&query, &security) {
+        metrics::counter!("dns_denied_total", "proto" => "doh").increment(1);
+        return Ok(response_dns(resp));
+    }
+
+    if let Some(hosts) = &hosts {
+        if let Some(resp) = hosts.maybe_answer(&query) {
+            metrics::counter!("dns_hosts_hits_total", "proto" => "doh").increment(1);
+            return Ok(response_dns(resp));
+        }
+    }
+
+    let upstream = upstreams
+        .pick("default", &balancer, None)
+        .ok_or_else(|| anyhow::anyhow!("no upstream"))?;
+
+    let start = Instant::now();
+    let resp = forward_once(&transport, &upstream.endpoint, &query, timeout).await?;
+    observe_latency("doh", &upstream.name, start);
+    Ok(response_dns(resp))
+}
+
+fn response(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("content-length", body.len().to_string())
+        .body(Full::new(body))
+        .unwrap()
+}
+
+fn response_dns(body: Vec<u8>) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/dns-message")
+        .header("content-length", body.len().to_string())
+        .body(Full::new(Bytes::from(body)))
+        .unwrap()
+}
+
+fn observe_latency(proto: &'static str, upstream_name: &Arc<str>, start: Instant) {
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let upstream_label = upstream_name.to_string();
+    metrics::histogram!(
+        "dns_upstream_latency_ms",
+        "proto" => proto,
+        "upstream" => upstream_label
+    )
+    .record(latency_ms);
+}
+
+async fn forward_once(
+    transport: &TransportContext,
+    endpoint: &UpstreamEndpointRef,
+    query: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    crate::proxy::forward_once(transport, endpoint, query, timeout).await
+}
