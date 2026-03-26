@@ -8,6 +8,7 @@ use reqwest::Url;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
+    task::JoinSet,
     time::{self, Instant},
 };
 
@@ -369,14 +370,33 @@ pub(crate) async fn forward_candidates(
     query: &[u8],
     timeout: Duration,
 ) -> anyhow::Result<(UpstreamRef, Vec<u8>, &'static str)> {
+    if candidates.is_empty() {
+        return Err(anyhow::anyhow!("no upstream candidates"));
+    }
+
+    let mut tasks = JoinSet::new();
+    for candidate in candidates.iter().cloned() {
+        let query = query.to_vec();
+        tasks.spawn(async move {
+            let result = forward_candidate(&candidate, &query, timeout).await;
+            (candidate, result)
+        });
+    }
+
     let mut last_error = None;
 
-    for candidate in candidates {
-        match forward_candidate(candidate, query, timeout).await {
-            Ok((resp, upstream_proto)) => return Ok((candidate.clone(), resp, upstream_proto)),
-            Err(err) => {
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((candidate, Ok((resp, upstream_proto)))) => {
+                tasks.abort_all();
+                return Ok((candidate, resp, upstream_proto));
+            }
+            Ok((candidate, Err(err))) => {
                 tracing::debug!(upstream = %candidate.name, error = %err, "upstream attempt failed");
                 last_error = Some(err);
+            }
+            Err(err) => {
+                last_error = Some(anyhow::anyhow!("upstream task failed: {}", err));
             }
         }
     }

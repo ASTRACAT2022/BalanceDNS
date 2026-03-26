@@ -777,6 +777,126 @@ async fn udp_proxy_falls_back_to_tcp_when_udp_response_is_truncated() {
     proxy_task.abort();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_proxy_does_not_wait_for_cumulative_upstream_timeouts() {
+    init_tracing();
+
+    let stalled_one = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let stalled_one_addr = stalled_one.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            if stalled_one.recv_from(&mut buf).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let stalled_two = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let stalled_two_addr = stalled_two.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            if stalled_two.recv_from(&mut buf).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let healthy = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let healthy_addr = healthy.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            let (n, peer) = match healthy.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut resp = buf[..n].to_vec();
+            if resp.len() >= 4 {
+                let flags = u16::from_be_bytes([resp[2], resp[3]]);
+                let b = (flags | 0x8000).to_be_bytes();
+                resp[2] = b[0];
+                resp[3] = b[1];
+            }
+            let _ = healthy.send_to(&resp, peer).await;
+        }
+    });
+
+    let upstreams = Arc::new(
+        UpstreamSet::new(vec![
+            UpstreamConfig {
+                name: "stalled-one".to_string(),
+                proto: UpstreamProto::Udp,
+                addr: Some(stalled_one_addr),
+                url: None,
+                server_name: None,
+                tls_insecure: false,
+                pool: "default".to_string(),
+                weight: 1,
+            },
+            UpstreamConfig {
+                name: "stalled-two".to_string(),
+                proto: UpstreamProto::Udp,
+                addr: Some(stalled_two_addr),
+                url: None,
+                server_name: None,
+                tls_insecure: false,
+                pool: "default".to_string(),
+                weight: 1,
+            },
+            UpstreamConfig {
+                name: "healthy".to_string(),
+                proto: UpstreamProto::Udp,
+                addr: Some(healthy_addr),
+                url: None,
+                server_name: None,
+                tls_insecure: false,
+                pool: "default".to_string(),
+                weight: 1,
+            },
+        ])
+        .unwrap(),
+    );
+    let balancer = Arc::new(Balancer::new(BalancingAlgorithm::RoundRobin));
+    let security = SecurityConfig {
+        deny_any: false,
+        deny_dnskey: false,
+        request_timeout_ms: 250,
+    };
+
+    let proxy = UdpProxy::new(
+        "127.0.0.1:0".parse().unwrap(),
+        upstreams,
+        balancer,
+        security,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let proxy_addr = proxy.local_addr().unwrap();
+    let proxy_task = tokio::spawn(async move { proxy.run().await });
+
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let query = build_query(0x7778, RecordType::A);
+    let start = time::Instant::now();
+    client.send_to(&query, proxy_addr).await.unwrap();
+
+    let mut buf = [0u8; 4096];
+    let (n, _) = time::timeout(Duration::from_secs(3), client.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let elapsed = start.elapsed();
+    let resp = &buf[..n];
+    assert_eq!(dns::read_id(resp), Some(0x7778));
+    assert!(elapsed < Duration::from_millis(400), "response took too long: {elapsed:?}");
+
+    proxy_task.abort();
+}
+
 fn build_query(id: u16, record_type: RecordType) -> Vec<u8> {
     let name = Name::from_ascii("example.com.").unwrap();
     let mut msg = Message::new();
