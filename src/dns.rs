@@ -202,6 +202,34 @@ fn read_name(packet: &[u8], mut offset: usize) -> Option<(String, usize)> {
     }
 }
 
+pub fn extract_min_ttl(packet: &[u8]) -> Option<std::time::Duration> {
+    use trust_dns_proto::op::Message;
+    let msg = Message::from_vec(packet).ok()?;
+
+    let mut min_ttl = None;
+
+    // Check Answers
+    for record in msg.answers() {
+        let ttl = record.ttl();
+        if min_ttl.is_none() || ttl < min_ttl.unwrap() {
+            min_ttl = Some(ttl);
+        }
+    }
+
+    if min_ttl.is_some() {
+        return Some(std::time::Duration::from_secs(min_ttl.unwrap() as u64));
+    }
+
+    // If no answers, check Authority (SOA) for negative caching
+    for record in msg.name_servers() {
+        if record.record_type() == trust_dns_proto::rr::RecordType::SOA {
+            return Some(std::time::Duration::from_secs(record.ttl() as u64));
+        }
+    }
+
+    None
+}
+
 pub fn skip_name(packet: &[u8], mut offset: usize) -> Option<usize> {
     let mut jumped = false;
     let mut end_offset = None;

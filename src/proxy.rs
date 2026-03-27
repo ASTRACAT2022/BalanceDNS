@@ -146,7 +146,7 @@ impl UdpProxy {
                     Ok((upstream, resp, _upstream_proto)) => {
                         if let Some(cache) = &cache {
                             if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(&owned) {
-                                let ttl = extract_ttl_from_response(&resp).unwrap_or(Duration::from_secs(300));
+                                let ttl = dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
                                 cache.set(&domain, qtype, resp.clone(), ttl);
                             }
                         }
@@ -287,7 +287,7 @@ async fn handle_tcp_conn(
         let (upstream, resp, upstream_proto) = forward_candidates(&candidates, &msg, timeout).await?;
         if let Some(cache) = &cache {
             if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(&msg) {
-                let ttl = extract_ttl_from_response(&resp).unwrap_or(Duration::from_secs(300));
+                let ttl = dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
                 cache.set(&domain, qtype, resp.clone(), ttl);
             }
         }
@@ -409,12 +409,17 @@ pub(crate) async fn forward_candidates(
     }
 
     let mut last_error = None;
+    let mut first_negative_resp = None;
 
     while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok((candidate, Ok((resp, upstream_proto)))) => {
-                tasks.abort_all();
-                return Ok((candidate, resp, upstream_proto));
+                if is_positive_response(&resp) {
+                    tasks.abort_all();
+                    return Ok((candidate, resp, upstream_proto));
+                } else if is_valid_response(&resp) && first_negative_resp.is_none() {
+                    first_negative_resp = Some((candidate, resp, upstream_proto));
+                }
             }
             Ok((candidate, Err(err))) => {
                 tracing::debug!(upstream = %candidate.name, error = %err, "upstream attempt failed");
@@ -424,6 +429,10 @@ pub(crate) async fn forward_candidates(
                 last_error = Some(anyhow::anyhow!("upstream task failed: {}", err));
             }
         }
+    }
+
+    if let Some(neg) = first_negative_resp {
+        return Ok(neg);
     }
 
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no upstream candidates")))
@@ -541,32 +550,25 @@ pub(crate) fn maybe_refuse(packet: &[u8], security: &SecurityConfig) -> Option<V
     Some(build_refused(packet))
 }
 
-/// Извлекает TTL из DNS-ответа
-fn extract_ttl_from_response(packet: &[u8]) -> Option<Duration> {
-    if packet.len() < 12 {
-        return None;
+
+fn is_positive_response(packet: &[u8]) -> bool {
+    if packet.len() < 4 {
+        return false;
     }
-    
-    // Пропускаем заголовок (12 байт) и вопрос
-    let mut offset = 12;
-    offset = crate::dns::skip_name(packet, offset)?;
-    offset += 4; // QTYPE (2) + QCLASS (2)
-    
-    // Пропускаем секцию ответа для получения TTL первого RR
-    // Формат RR: NAME (variable) + TYPE (2) + CLASS (2) + TTL (4) + RDLENGTH (2) + RDATA
-    offset = crate::dns::skip_name(packet, offset)?;
-    offset += 4; // TYPE + CLASS
-    
-    // Читаем TTL (4 байта)
-    let ttl_bytes = [
-        *packet.get(offset)?,
-        *packet.get(offset + 1)?,
-        *packet.get(offset + 2)?,
-        *packet.get(offset + 3)?,
-    ];
-    let ttl_secs = u32::from_be_bytes(ttl_bytes);
-    
-    Some(Duration::from_secs(ttl_secs as u64))
+    let rcode = packet[3] & 0x0F;
+    // Only NoError (0) is a terminal success.
+    // NXDomain (3) is valid but might be a result of censorship/filtering,
+    // so we should wait for other upstreams.
+    rcode == 0
+}
+
+fn is_valid_response(packet: &[u8]) -> bool {
+    if packet.len() < 4 {
+        return false;
+    }
+    let rcode = packet[3] & 0x0F;
+    // NoError (0) or NXDomain (3) are "valid" (non-error) responses
+    rcode == 0 || rcode == 3
 }
 
 fn build_refused(packet: &[u8]) -> Vec<u8> {
