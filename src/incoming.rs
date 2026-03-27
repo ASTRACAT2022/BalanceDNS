@@ -279,7 +279,7 @@ async fn handle_dot_conn(
                 // Сохраняем в кэш
                 if let Some(cache) = &cache {
                     if let Some((domain, qtype, _qclass)) = crate::dns::read_qname_qtype_qclass(&msg) {
-                        let ttl = extract_ttl_from_response(&resp).unwrap_or(Duration::from_secs(300));
+                        let ttl = crate::dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
                         cache.set(&domain, qtype, resp.clone(), ttl);
                     }
                 }
@@ -423,7 +423,7 @@ async fn handle_doh_request(
             // Сохраняем в кэш
             if let Some(cache) = &cache {
                 if let Some((domain, qtype, _qclass)) = crate::dns::read_qname_qtype_qclass(&query) {
-                    let ttl = extract_ttl_from_response(&resp).unwrap_or(Duration::from_secs(300));
+                    let ttl = crate::dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
                     cache.set(&domain, qtype, resp.clone(), ttl);
                 }
             }
@@ -488,32 +488,6 @@ fn doh_connection_timeout(request_timeout: Duration) -> Duration {
         .min(MAX_DOH_CONNECTION_TIMEOUT)
 }
 
-/// Извлекает TTL из DNS-ответа
-fn extract_ttl_from_response(packet: &[u8]) -> Option<Duration> {
-    if packet.len() < 12 {
-        return None;
-    }
-    
-    // Пропускаем заголовок (12 байт) и вопрос
-    let offset = 12;
-    let offset = crate::dns::skip_name(packet, offset)?;
-    let offset = offset + 4; // QTYPE (2) + QCLASS (2)
-    
-    // Пропускаем секцию ответа для получения TTL первого RR
-    let offset = crate::dns::skip_name(packet, offset)?;
-    let offset = offset + 4; // TYPE + CLASS
-    
-    // Читаем TTL (4 байта)
-    let ttl_bytes = [
-        *packet.get(offset)?,
-        *packet.get(offset + 1)?,
-        *packet.get(offset + 2)?,
-        *packet.get(offset + 3)?,
-    ];
-    let ttl_secs = u32::from_be_bytes(ttl_bytes);
-    
-    Some(Duration::from_secs(ttl_secs as u64))
-}
 
 #[cfg(test)]
 mod tests {

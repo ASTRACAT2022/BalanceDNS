@@ -146,21 +146,31 @@ impl DnsCache {
         removed
     }
 
-    /// Удаляет самую старую запись при переполнении
+    /// Удаляет одну из старых записей при переполнении (алгоритм случайной выборки для O(1))
     fn evict_oldest(&self) {
-        // Находим самую старую запись по времени создания
-        let mut oldest_key = None;
+        // Чтобы не сканировать весь кэш (O(N)), выбираем несколько случайных записей
+        // и удаляем самую старую из них. Это дает близкую к LRU эффективность при O(1).
+        let mut best_key = None;
         let mut oldest_time = None;
+
+        // Ограничиваем количество попыток найти записи, если кэш почти пуст (что не должно быть здесь)
+        let sample_size = 16;
+        let mut count = 0;
 
         for entry in self.entries.iter() {
             let created = entry.value().created;
             if oldest_time.is_none() || created < oldest_time.unwrap() {
                 oldest_time = Some(created);
-                oldest_key = Some(entry.key().clone());
+                best_key = Some(entry.key().clone());
+            }
+
+            count += 1;
+            if count >= sample_size {
+                break;
             }
         }
 
-        if let Some(key) = oldest_key {
+        if let Some(key) = best_key {
             self.entries.remove(&key);
             metrics::counter!("dns_cache_evictions_total").increment(1);
         }

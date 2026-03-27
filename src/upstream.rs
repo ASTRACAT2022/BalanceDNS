@@ -177,26 +177,45 @@ impl UpstreamSet {
 
     async fn run_healthchecks(&self, timeout: Duration) {
         let query = build_healthcheck_query();
+        let mut tasks = tokio::task::JoinSet::new();
+
         for u in &self.upstreams {
-            let ok = match tokio::time::timeout(timeout, probe(u, &self.transport, &query)).await {
-                Ok(Ok(())) => true,
-                _ => false,
-            };
-            let prev = u.alive.load(Ordering::Relaxed);
-            let (alive, failures) = update_health_state(prev, &u.consecutive_failures, ok);
-            u.alive.store(alive, Ordering::Relaxed);
+            let query = query.clone();
+            let transport = self.transport.clone();
+            let name = u.name.clone();
+            let endpoint = u.endpoint.as_ref();
 
-            metrics::gauge!("dns_upstream_alive", "upstream" => u.name.to_string())
-                .set(if alive { 1.0 } else { 0.0 });
+            tasks.spawn(async move {
+                let ok = match tokio::time::timeout(timeout, probe_endpoint(&endpoint, &transport, &query)).await {
+                    Ok(Ok(())) => true,
+                    _ => false,
+                };
+                (name, ok)
+            });
+        }
 
-            if prev != alive {
-                metrics::counter!(
-                    "dns_upstream_health_changes_total",
-                    "upstream" => u.name.to_string(),
-                    "alive" => if alive { "true" } else { "false" }
-                )
-                .increment(1);
-                tracing::warn!(upstream = %u.name, alive = alive, failures = failures, "upstream health changed");
+        while let Some(res) = tasks.join_next().await {
+            if let Ok((name, ok)) = res {
+                let Some(u) = self.upstreams.iter().find(|u| u.name == name) else {
+                    continue;
+                };
+
+                let prev = u.alive.load(Ordering::Relaxed);
+                let (alive, failures) = update_health_state(prev, &u.consecutive_failures, ok);
+                u.alive.store(alive, Ordering::Relaxed);
+
+                metrics::gauge!("dns_upstream_alive", "upstream" => name.to_string())
+                    .set(if alive { 1.0 } else { 0.0 });
+
+                if prev != alive {
+                    metrics::counter!(
+                        "dns_upstream_health_changes_total",
+                        "upstream" => name.to_string(),
+                        "alive" => if alive { "true" } else { "false" }
+                    )
+                    .increment(1);
+                    tracing::warn!(upstream = %name, alive = alive, failures = failures, "upstream health changed");
+                }
             }
         }
     }
@@ -374,11 +393,15 @@ fn build_insecure_rustls_config() -> anyhow::Result<rustls::ClientConfig> {
     Ok(cfg)
 }
 
-async fn probe(upstream: &Upstream, transport: &TransportContext, query: &[u8]) -> anyhow::Result<()> {
-    match &upstream.endpoint {
-        UpstreamEndpoint::Udp { addr } => probe_udp(*addr, query).await,
-        UpstreamEndpoint::Tcp { addr } => probe_tcp(*addr, query, Duration::from_millis(900)).await,
-        UpstreamEndpoint::Dot {
+async fn probe_endpoint(
+    endpoint: &UpstreamEndpointRef,
+    transport: &TransportContext,
+    query: &[u8],
+) -> anyhow::Result<()> {
+    match endpoint {
+        UpstreamEndpointRef::Udp { addr } => probe_udp(*addr, query).await,
+        UpstreamEndpointRef::Tcp { addr } => probe_tcp(*addr, query, Duration::from_millis(900)).await,
+        UpstreamEndpointRef::Dot {
             addr,
             server_name,
             tls_insecure,
@@ -393,7 +416,7 @@ async fn probe(upstream: &Upstream, transport: &TransportContext, query: &[u8]) 
             )
             .await
         }
-        UpstreamEndpoint::Doh { url, tls_insecure } => {
+        UpstreamEndpointRef::Doh { url, tls_insecure } => {
             probe_doh(url, *tls_insecure, transport, query, Duration::from_millis(1200)).await
         }
     }
