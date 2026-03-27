@@ -365,7 +365,9 @@ impl BalanceDnsRuntime {
                     self.varz.client_queries_expired.inc();
                 } else {
                     self.varz.client_queries_cached.inc();
-                    return self.plugins.apply_post_response(&cache_entry.packet);
+                    let mut cached_packet = cache_entry.packet.clone();
+                    dns::set_tid(&mut cached_packet, normalized_question.tid);
+                    return self.plugins.apply_post_response(&cached_packet);
                 }
             }
         }
