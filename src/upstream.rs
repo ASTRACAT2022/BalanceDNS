@@ -129,7 +129,7 @@ impl UpstreamSet {
     }
 
     pub fn candidates(&self, pool: &str, balancer: &Balancer, client_ip: Option<IpAddr>) -> Vec<UpstreamRef> {
-        let mut eligible: Vec<usize> = self
+        let alive: Vec<usize> = self
             .upstreams
             .iter()
             .enumerate()
@@ -138,33 +138,23 @@ impl UpstreamSet {
             .map(|(idx, _)| idx)
             .collect();
 
-        if eligible.is_empty() {
-            eligible = self
-                .upstreams
-                .iter()
-                .enumerate()
-                .filter(|(_, u)| u.pool.as_ref() == pool)
-                .map(|(idx, _)| idx)
-                .collect();
-        }
+        let unhealthy: Vec<usize> = self
+            .upstreams
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| u.pool.as_ref() == pool)
+            .filter(|(_, u)| !u.alive.load(Ordering::Relaxed))
+            .map(|(idx, _)| idx)
+            .collect();
+
+        let mut eligible = ordered_candidates(&alive, balancer, client_ip);
+        eligible.extend(ordered_candidates(&unhealthy, balancer, client_ip));
 
         if eligible.is_empty() {
             return Vec::new();
         }
 
-        let start_idx = balancer.pick(&eligible, client_ip);
-        let start_pos = eligible
-            .iter()
-            .position(|idx| *idx == start_idx)
-            .unwrap_or(0);
-
-        eligible
-            .iter()
-            .cycle()
-            .skip(start_pos)
-            .take(eligible.len())
-            .map(|idx| self.make_ref(*idx))
-            .collect()
+        eligible.into_iter().map(|idx| self.make_ref(idx)).collect()
     }
 
     pub fn all_udp(&self) -> Vec<(Arc<str>, SocketAddr)> {
@@ -296,6 +286,27 @@ fn update_health_state(prev_alive: bool, failures: &AtomicU64, probe_ok: bool) -
     }
 
     (false, failure_count)
+}
+
+fn ordered_candidates(
+    indices: &[usize],
+    balancer: &Balancer,
+    client_ip: Option<IpAddr>,
+) -> Vec<usize> {
+    if indices.is_empty() {
+        return Vec::new();
+    }
+
+    let start_idx = balancer.pick(indices, client_ip);
+    let start_pos = indices.iter().position(|idx| *idx == start_idx).unwrap_or(0);
+
+    indices
+        .iter()
+        .cycle()
+        .skip(start_pos)
+        .take(indices.len())
+        .copied()
+        .collect()
 }
 
 fn parse_upstream_endpoint(cfg: &UpstreamConfig) -> anyhow::Result<UpstreamEndpoint> {
@@ -501,6 +512,13 @@ mod tests {
         assert_eq!(update_health_state(true, &failures, false), (true, 2));
         assert_eq!(update_health_state(true, &failures, false), (false, 3));
         assert_eq!(update_health_state(false, &failures, true), (true, 0));
+    }
+
+    #[test]
+    fn ordered_candidates_append_unhealthy_after_alive() {
+        let balancer = Balancer::new(BalancingAlgorithm::RoundRobin);
+        assert_eq!(ordered_candidates(&[1, 2], &balancer, None), vec![1, 2]);
+        assert_eq!(ordered_candidates(&[3, 4], &balancer, None), vec![4, 3]);
     }
 }
 
