@@ -26,6 +26,13 @@ use crate::{
     upstream::{Balancer, UpstreamSet},
 };
 
+const MIN_TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_TLS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
+const MIN_DOT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_DOT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const MIN_DOH_CONNECTION_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_DOH_CONNECTION_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub struct DotServer {
     listen: SocketAddr,
     listener: TcpListener,
@@ -197,19 +204,24 @@ async fn handle_dot_conn(
     cache: Option<Arc<DnsCache>>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    let mut tls = acceptor.accept(stream).await?;
+    let mut tls = time::timeout(tls_accept_timeout(timeout), acceptor.accept(stream)).await??;
+    let idle_timeout = dot_idle_timeout(timeout);
 
     loop {
         let mut len_buf = [0u8; 2];
-        if tls.read_exact(&mut len_buf).await.is_err() {
-            return Ok(());
+        match time::timeout(idle_timeout, tls.read_exact(&mut len_buf)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) | Err(_) => return Ok(()),
         }
         let len = u16::from_be_bytes(len_buf) as usize;
         if len == 0 || len > 4096 {
             return Ok(());
         }
         let mut msg = vec![0u8; len];
-        tls.read_exact(&mut msg).await?;
+        match time::timeout(idle_timeout, tls.read_exact(&mut msg)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) | Err(_) => return Ok(()),
+        }
         metrics::counter!("dns_requests_total", "proto" => "dot").increment(1);
 
         if let Some(resp) = maybe_refuse(&msg, &security) {
@@ -296,7 +308,7 @@ async fn handle_doh_conn(
     cache: Option<Arc<DnsCache>>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    let tls_stream = acceptor.accept(stream).await?;
+    let tls_stream = time::timeout(tls_accept_timeout(timeout), acceptor.accept(stream)).await??;
     let io = TokioIo::new(tls_stream);
 
     let service = service_fn(move |req| {
@@ -313,10 +325,14 @@ async fn handle_doh_conn(
         }
     });
 
-    hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-        .serve_connection(io, service)
-        .await
-        .map_err(|e| anyhow::anyhow!(e))?;
+    time::timeout(
+        doh_connection_timeout(timeout),
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .serve_connection(io, service),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("doh connection idle timeout"))?
+    .map_err(|e| anyhow::anyhow!(e))?;
 
     Ok(())
 }
@@ -425,6 +441,7 @@ async fn handle_doh_request(
 fn response(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {
     Response::builder()
         .status(status)
+        .header("connection", "close")
         .header("content-length", body.len().to_string())
         .body(Full::new(body))
         .unwrap()
@@ -433,6 +450,7 @@ fn response(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {
 fn response_dns(body: Vec<u8>) -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::OK)
+        .header("connection", "close")
         .header("content-type", "application/dns-message")
         .header("content-length", body.len().to_string())
         .body(Full::new(Bytes::from(body)))
@@ -448,6 +466,26 @@ fn observe_latency(proto: &'static str, upstream_name: &Arc<str>, start: Instant
         "upstream" => upstream_label
     )
     .record(latency_ms);
+}
+
+fn tls_accept_timeout(request_timeout: Duration) -> Duration {
+    request_timeout
+        .max(MIN_TLS_ACCEPT_TIMEOUT)
+        .min(MAX_TLS_ACCEPT_TIMEOUT)
+}
+
+fn dot_idle_timeout(request_timeout: Duration) -> Duration {
+    request_timeout
+        .saturating_mul(8)
+        .max(MIN_DOT_IDLE_TIMEOUT)
+        .min(MAX_DOT_IDLE_TIMEOUT)
+}
+
+fn doh_connection_timeout(request_timeout: Duration) -> Duration {
+    request_timeout
+        .saturating_mul(20)
+        .max(MIN_DOH_CONNECTION_TIMEOUT)
+        .min(MAX_DOH_CONNECTION_TIMEOUT)
 }
 
 /// Извлекает TTL из DNS-ответа
@@ -475,4 +513,19 @@ fn extract_ttl_from_response(packet: &[u8]) -> Option<Duration> {
     let ttl_secs = u32::from_be_bytes(ttl_bytes);
     
     Some(Duration::from_secs(ttl_secs as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incoming_timeouts_have_safe_bounds() {
+        assert_eq!(tls_accept_timeout(Duration::from_millis(100)), Duration::from_secs(1));
+        assert_eq!(tls_accept_timeout(Duration::from_secs(30)), Duration::from_secs(10));
+        assert_eq!(dot_idle_timeout(Duration::from_millis(200)), Duration::from_secs(5));
+        assert_eq!(dot_idle_timeout(Duration::from_secs(20)), Duration::from_secs(60));
+        assert_eq!(doh_connection_timeout(Duration::from_millis(500)), Duration::from_secs(15));
+        assert_eq!(doh_connection_timeout(Duration::from_secs(10)), Duration::from_secs(120));
+    }
 }
