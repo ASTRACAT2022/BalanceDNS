@@ -37,6 +37,7 @@ struct Upstream {
     pool: Arc<str>,
     endpoint: UpstreamEndpoint,
     alive: AtomicBool,
+    consecutive_failures: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -78,11 +79,23 @@ impl UpstreamSet {
 
         let transport = Arc::new(TransportContext {
             doh: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(3))
                 .http2_adaptive_window(true)
+                .http2_keep_alive_interval(Duration::from_secs(15))
+                .http2_keep_alive_timeout(Duration::from_secs(10))
+                .http2_keep_alive_while_idle(true)
+                .tcp_keepalive(Duration::from_secs(30))
+                .pool_idle_timeout(Duration::from_secs(30))
                 .pool_max_idle_per_host(32)
                 .build()?,
             doh_insecure: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(3))
                 .http2_adaptive_window(true)
+                .http2_keep_alive_interval(Duration::from_secs(15))
+                .http2_keep_alive_timeout(Duration::from_secs(10))
+                .http2_keep_alive_while_idle(true)
+                .tcp_keepalive(Duration::from_secs(30))
+                .pool_idle_timeout(Duration::from_secs(30))
                 .pool_max_idle_per_host(32)
                 .danger_accept_invalid_certs(true)
                 .build()?,
@@ -99,6 +112,7 @@ impl UpstreamSet {
                     pool: Arc::from(c.pool),
                     endpoint,
                     alive: AtomicBool::new(true),
+                    consecutive_failures: AtomicU64::new(0),
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -167,7 +181,7 @@ impl UpstreamSet {
         let mut ticker = time::interval(interval);
         loop {
             ticker.tick().await;
-            self.run_healthchecks(Duration::from_millis(1200)).await;
+            self.run_healthchecks(Duration::from_millis(2500)).await;
         }
     }
 
@@ -178,19 +192,21 @@ impl UpstreamSet {
                 Ok(Ok(())) => true,
                 _ => false,
             };
-            let prev = u.alive.swap(ok, Ordering::Relaxed);
+            let prev = u.alive.load(Ordering::Relaxed);
+            let (alive, failures) = update_health_state(prev, &u.consecutive_failures, ok);
+            u.alive.store(alive, Ordering::Relaxed);
 
             metrics::gauge!("dns_upstream_alive", "upstream" => u.name.to_string())
-                .set(if ok { 1.0 } else { 0.0 });
+                .set(if alive { 1.0 } else { 0.0 });
 
-            if prev != ok {
+            if prev != alive {
                 metrics::counter!(
                     "dns_upstream_health_changes_total",
                     "upstream" => u.name.to_string(),
-                    "alive" => if ok { "true" } else { "false" }
+                    "alive" => if alive { "true" } else { "false" }
                 )
                 .increment(1);
-                tracing::warn!(upstream = %u.name, alive = ok, "upstream health changed");
+                tracing::warn!(upstream = %u.name, alive = alive, failures = failures, "upstream health changed");
             }
         }
     }
@@ -257,15 +273,29 @@ impl Balancer {
 fn build_healthcheck_query() -> Vec<u8> {
     let mut rng = rand::thread_rng();
     let id: u16 = rng.r#gen();
-    let name = Name::from_ascii("status.query.").unwrap_or_else(|_| Name::root());
+    let name = Name::from_ascii("example.com.").unwrap_or_else(|_| Name::root());
 
     let mut msg = Message::new();
     msg.set_id(id);
     msg.set_message_type(MessageType::Query);
     msg.set_op_code(OpCode::Query);
-    msg.add_query(Query::query(name, RecordType::TXT));
+    msg.add_query(Query::query(name, RecordType::A));
     msg.set_recursion_desired(true);
     msg.to_vec().unwrap_or_default()
+}
+
+fn update_health_state(prev_alive: bool, failures: &AtomicU64, probe_ok: bool) -> (bool, u64) {
+    if probe_ok {
+        failures.store(0, Ordering::Relaxed);
+        return (true, 0);
+    }
+
+    let failure_count = failures.fetch_add(1, Ordering::Relaxed) + 1;
+    if prev_alive && failure_count < 3 {
+        return (true, failure_count);
+    }
+
+    (false, failure_count)
 }
 
 fn parse_upstream_endpoint(cfg: &UpstreamConfig) -> anyhow::Result<UpstreamEndpoint> {
@@ -457,6 +487,21 @@ async fn probe_doh(
         return Err(anyhow::anyhow!("short response"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn healthcheck_requires_multiple_failures_before_marking_dead() {
+        let failures = AtomicU64::new(0);
+
+        assert_eq!(update_health_state(true, &failures, false), (true, 1));
+        assert_eq!(update_health_state(true, &failures, false), (true, 2));
+        assert_eq!(update_health_state(true, &failures, false), (false, 3));
+        assert_eq!(update_health_state(false, &failures, true), (true, 0));
+    }
 }
 
 #[derive(Debug)]

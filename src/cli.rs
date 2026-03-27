@@ -15,6 +15,8 @@ use crate::{
     upstream::{Balancer, UpstreamSet},
 };
 
+const HEALTHCHECK_INTERVAL: Duration = Duration::from_secs(15);
+
 pub async fn run() -> anyhow::Result<()> {
     init_tracing();
     tls::ensure_rustls_crypto_provider();
@@ -154,7 +156,7 @@ pub async fn run() -> anyhow::Result<()> {
         _ = signal::ctrl_c() => {
             tracing::info!("shutdown: ctrl-c");
         }
-        _ = upstreams.healthcheck_loop(Duration::from_secs(2)) => {
+        _ = upstreams.healthcheck_loop(HEALTHCHECK_INTERVAL) => {
             tracing::warn!("healthcheck loop terminated");
         }
     }
