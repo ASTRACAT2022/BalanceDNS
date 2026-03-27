@@ -17,8 +17,14 @@ pub struct AppConfig {
     pub blocklist_remote: Option<BlocklistRemoteConfig>,
     pub balancing: BalancingConfig,
     pub security: SecurityConfig,
+    pub plugins: Option<PluginsConfig>,
     pub metrics: MetricsConfig,
     pub upstreams: Vec<UpstreamConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PluginsConfig {
+    pub hooks_library_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -385,6 +391,7 @@ mod tests {
                 deny_dnskey: true,
                 request_timeout_ms: 1500,
             },
+            plugins: None,
             metrics: MetricsConfig {
                 listen: "127.0.0.1:9100".parse().unwrap(),
             },

@@ -90,6 +90,7 @@ async fn udp_proxy_roundtrip_preserves_id() {
         None,
         None,
         None,
+        Arc::new(balnceDNS::hooks::Hooks::new::<String>(None)),
     )
         .await
         .unwrap();
@@ -156,6 +157,7 @@ async fn udp_proxy_denies_any_with_refused() {
         None,
         None,
         None,
+        Arc::new(balnceDNS::hooks::Hooks::new::<String>(None)),
     )
         .await
         .unwrap();
@@ -251,6 +253,7 @@ async fn tcp_proxy_roundtrip_preserves_id() {
         None,
         None,
         None,
+        Arc::new(balnceDNS::hooks::Hooks::new::<String>(None)),
     )
         .await
         .unwrap();
@@ -326,6 +329,7 @@ async fn udp_proxy_roundtrip_ipv6_if_available() {
         None,
         None,
         None,
+        Arc::new(balnceDNS::hooks::Hooks::new::<String>(None)),
     )
         .await
         .unwrap();
@@ -448,6 +452,7 @@ async fn udp_proxy_roundtrip_via_doh_upstream() {
         None,
         None,
         None,
+        Arc::new(balnceDNS::hooks::Hooks::new::<String>(None)),
     )
         .await
         .unwrap();
@@ -554,6 +559,7 @@ async fn udp_proxy_roundtrip_via_dot_upstream_insecure() {
         None,
         None,
         None,
+        Arc::new(balnceDNS::hooks::Hooks::new::<String>(None)),
     )
         .await
         .unwrap();
@@ -651,6 +657,7 @@ async fn udp_proxy_retries_next_upstream_after_timeout() {
         None,
         None,
         None,
+        Arc::new(balnceDNS::hooks::Hooks::new::<String>(None)),
     )
     .await
     .unwrap();
@@ -763,6 +770,7 @@ async fn udp_proxy_falls_back_to_tcp_when_udp_response_is_truncated() {
         None,
         None,
         None,
+        Arc::new(balnceDNS::hooks::Hooks::new::<String>(None)),
     )
     .await
     .unwrap();
@@ -882,6 +890,7 @@ async fn udp_proxy_does_not_wait_for_cumulative_upstream_timeouts() {
         None,
         None,
         None,
+        Arc::new(balnceDNS::hooks::Hooks::new::<String>(None)),
     )
     .await
     .unwrap();

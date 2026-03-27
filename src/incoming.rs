@@ -22,8 +22,10 @@ use crate::{
     coalescing::{PendingQueries, QueryState},
     config::SecurityConfig,
     config::TlsConfig,
+    dns,
+    hooks::{Hooks, Stage},
     hosts_remote::HostsRemote,
-    proxy::{forward_candidates, maybe_refuse, maybe_answer_local},
+    proxy::{maybe_refuse, maybe_answer_local},
     tls,
     upstream::{Balancer, UpstreamSet},
 };
@@ -46,6 +48,7 @@ pub struct DotServer {
     hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
+    hooks: Arc<Hooks>,
     pending: Arc<PendingQueries>,
     request_timeout: Duration,
 }
@@ -61,6 +64,7 @@ pub struct DohServer {
     hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
+    hooks: Arc<Hooks>,
     pending: Arc<PendingQueries>,
     request_timeout: Duration,
 }
@@ -76,6 +80,7 @@ impl DotServer {
         hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
         blocklist: Option<Arc<BlocklistRemote>>,
         cache: Option<Arc<DnsCache>>,
+        hooks: Arc<Hooks>,
     ) -> anyhow::Result<Self> {
         let request_timeout = Duration::from_millis(security.request_timeout_ms);
         let listener = TcpListener::bind(listen).await?;
@@ -92,6 +97,7 @@ impl DotServer {
             hosts_local,
             blocklist,
             cache,
+            hooks,
             pending: Arc::new(PendingQueries::new()),
             request_timeout,
         })
@@ -119,6 +125,7 @@ impl DotServer {
             let hosts_local = self.hosts_local.clone();
             let blocklist = self.blocklist.clone();
             let cache = self.cache.clone();
+            let hooks = self.hooks.clone();
             let pending = self.pending.clone();
             let timeout = self.request_timeout;
 
@@ -134,6 +141,7 @@ impl DotServer {
                     hosts_local,
                     blocklist,
                     cache,
+                    hooks,
                     pending,
                     timeout,
                 )
@@ -158,6 +166,7 @@ impl DohServer {
         hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
         blocklist: Option<Arc<BlocklistRemote>>,
         cache: Option<Arc<DnsCache>>,
+        hooks: Arc<Hooks>,
     ) -> anyhow::Result<Self> {
         let request_timeout = Duration::from_millis(security.request_timeout_ms);
         let listener = TcpListener::bind(listen).await?;
@@ -174,6 +183,7 @@ impl DohServer {
             hosts_local,
             blocklist,
             cache,
+            hooks,
             pending: Arc::new(PendingQueries::new()),
             request_timeout,
         })
@@ -201,10 +211,11 @@ impl DohServer {
             let hosts_local = self.hosts_local.clone();
             let blocklist = self.blocklist.clone();
             let cache = self.cache.clone();
+            let hooks = self.hooks.clone();
             let pending = self.pending.clone();
             let timeout = self.request_timeout;
             tokio::spawn(async move {
-                if let Err(err) = handle_doh_conn(stream, peer, acceptor, upstreams, balancer, security, hosts, hosts_local, blocklist, cache, pending, timeout).await {
+                if let Err(err) = handle_doh_conn(stream, peer, acceptor, upstreams, balancer, security, hosts, hosts_local, blocklist, cache, hooks, pending, timeout).await {
                     tracing::debug!(peer = %peer, error = %err, "doh conn failed");
                 }
             });
@@ -223,6 +234,7 @@ async fn handle_dot_conn(
     hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
+    hooks: Arc<Hooks>,
     pending: Arc<PendingQueries>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
@@ -239,12 +251,18 @@ async fn handle_dot_conn(
         if len == 0 || len > 4096 {
             return Ok(());
         }
-        let mut msg = vec![0u8; len];
-        match time::timeout(idle_timeout, tls.read_exact(&mut msg)).await {
+        let mut raw_msg = vec![0u8; len];
+        match time::timeout(idle_timeout, tls.read_exact(&mut raw_msg)).await {
             Ok(Ok(_)) => {}
             Ok(Err(_)) | Err(_) => return Ok(()),
         }
         metrics::counter!("dns_requests_total", "proto" => "dot").increment(1);
+
+        let msg = if hooks.enabled(Stage::Deliver) {
+            hooks.apply(raw_msg.clone(), Stage::Deliver).unwrap_or(raw_msg)
+        } else {
+            raw_msg
+        };
 
         if let Some(resp) = maybe_refuse(&msg, &security) {
             metrics::counter!("dns_denied_total", "proto" => "dot").increment(1);
@@ -275,7 +293,7 @@ async fn handle_dot_conn(
 
         if let Some(bl) = &blocklist {
             if bl.is_blocked(&msg) {
-                if let Some(resp) = crate::dns::build_nxdomain_response(&msg) {
+                if let Some(resp) = dns::build_nxdomain_response(&msg) {
                     metrics::counter!("dns_blocked_total", "proto" => "dot").increment(1);
                     tls.write_all(&(resp.len() as u16).to_be_bytes()).await?;
                     tls.write_all(&resp).await?;
@@ -284,15 +302,15 @@ async fn handle_dot_conn(
             }
         }
 
-        // Проверка кэша
-        let qinfo = crate::dns::read_qname_qtype_qclass(&msg);
+        // Cache check
+        let qinfo = dns::read_qname_qtype_qclass(&msg);
         if let Some(cache) = &cache {
             if let Some((domain, qtype, _qclass)) = &qinfo {
                 if let Some(cached_resp) = cache.get(domain, *qtype) {
                     metrics::counter!("dns_cache_hits_total", "proto" => "dot").increment(1);
                     let mut resp = cached_resp;
-                    if let Some(orig_id) = crate::dns::read_id(&msg) {
-                        crate::dns::write_id(&mut resp, orig_id);
+                    if let Some(orig_id) = dns::read_id(&msg) {
+                        dns::write_id(&mut resp, orig_id);
                     }
                     let resp_len = resp.len() as u16;
                     tls.write_all(&resp_len.to_be_bytes()).await?;
@@ -318,11 +336,11 @@ async fn handle_dot_conn(
 
         let resp = match pending.get_or_create(&domain, qtype) {
             QueryState::New(tx) => {
-                let res = forward_candidates(&candidates, &msg, timeout, upstreams.clone()).await;
+                let res = upstreams.forward_candidates(&candidates, &msg, timeout).await;
                 let result_packet = match res {
                     Ok((upstream, resp, _upstream_proto)) => {
                         if let Some(cache) = &cache {
-                            let ttl = crate::dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
+                            let ttl = dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
                             cache.set(&domain, qtype, resp.clone(), ttl);
                         }
                         observe_latency("dot", &upstream.name, start);
@@ -344,8 +362,8 @@ async fn handle_dot_conn(
         };
 
         if let Some(mut resp) = resp {
-            if let Some(orig_id) = crate::dns::read_id(&msg) {
-                crate::dns::write_id(&mut resp, orig_id);
+            if let Some(orig_id) = dns::read_id(&msg) {
+                dns::write_id(&mut resp, orig_id);
             }
             let resp_len = resp.len() as u16;
             tls.write_all(&resp_len.to_be_bytes()).await?;
@@ -367,6 +385,7 @@ async fn handle_doh_conn(
     hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
+    hooks: Arc<Hooks>,
     pending: Arc<PendingQueries>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
@@ -381,10 +400,11 @@ async fn handle_doh_conn(
         let hosts_local = hosts_local.clone();
         let blocklist = blocklist.clone();
         let cache = cache.clone();
+        let hooks = hooks.clone();
         let pending = pending.clone();
         async move {
             Ok::<_, std::convert::Infallible>(
-                handle_doh_request(req, upstreams, balancer, security, hosts, hosts_local, blocklist, cache, pending, timeout).await,
+                handle_doh_request(req, upstreams, balancer, security, hosts, hosts_local, blocklist, cache, hooks, pending, timeout).await,
             )
         }
     });
@@ -410,6 +430,7 @@ async fn handle_doh_request(
     hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
+    hooks: Arc<Hooks>,
     pending: Arc<PendingQueries>,
     timeout: Duration,
 ) -> Response<Full<Bytes>> {
@@ -418,7 +439,7 @@ async fn handle_doh_request(
         return response(StatusCode::NOT_FOUND, Bytes::new());
     }
 
-    let query = match parts.method {
+    let raw_query = match parts.method {
         Method::POST => match time::timeout(timeout, body.collect()).await {
             Ok(Ok(collected)) => collected.to_bytes().to_vec(),
             Ok(Err(_)) => return response(StatusCode::BAD_REQUEST, Bytes::new()),
@@ -441,11 +462,17 @@ async fn handle_doh_request(
         _ => return response(StatusCode::METHOD_NOT_ALLOWED, Bytes::new()),
     };
 
-    if query.len() < 12 {
+    if raw_query.len() < 12 {
         return response(StatusCode::BAD_REQUEST, Bytes::new());
     }
 
     metrics::counter!("dns_requests_total", "proto" => "doh").increment(1);
+
+    let query = if hooks.enabled(Stage::Deliver) {
+        hooks.apply(raw_query.clone(), Stage::Deliver).unwrap_or(raw_query)
+    } else {
+        raw_query
+    };
 
     if let Some(resp) = maybe_refuse(&query, &security) {
         metrics::counter!("dns_denied_total", "proto" => "doh").increment(1);
@@ -468,15 +495,15 @@ async fn handle_doh_request(
 
     if let Some(bl) = &blocklist {
         if bl.is_blocked(&query) {
-            if let Some(resp) = crate::dns::build_nxdomain_response(&query) {
+            if let Some(resp) = dns::build_nxdomain_response(&query) {
                 metrics::counter!("dns_blocked_total", "proto" => "doh").increment(1);
                 return response_dns(resp);
             }
         }
     }
 
-    // Проверка кэша
-    let qinfo = crate::dns::read_qname_qtype_qclass(&query);
+    // Cache check
+    let qinfo = dns::read_qname_qtype_qclass(&query);
     if let Some(cache) = &cache {
         if let Some((domain, qtype, _qclass)) = &qinfo {
             if let Some(cached_resp) = cache.get(domain, *qtype) {
@@ -501,11 +528,11 @@ async fn handle_doh_request(
 
     let resp = match pending.get_or_create(&domain, qtype) {
         QueryState::New(tx) => {
-            let res = forward_candidates(&candidates, &query, timeout, upstreams.clone()).await;
+            let res = upstreams.forward_candidates(&candidates, &query, timeout).await;
             let result_packet = match res {
                 Ok((upstream, resp, _upstream_proto)) => {
                     if let Some(cache) = &cache {
-                        let ttl = crate::dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
+                        let ttl = dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
                         cache.set(&domain, qtype, resp.clone(), ttl);
                     }
                     observe_latency("doh", &upstream.name, start);

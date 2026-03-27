@@ -7,6 +7,7 @@ use crate::{
     cache::DnsCache,
     config::AppConfig,
     blocklist_remote::BlocklistRemote,
+    hooks::Hooks,
     hosts_remote::HostsRemote,
     incoming::{DohServer, DotServer},
     metrics_http::MetricsServer,
@@ -35,6 +36,13 @@ pub async fn run() -> anyhow::Result<()> {
     let upstreams = Arc::new(upstreams_obj);
 
     let balancer = Arc::new(Balancer::new(config.balancing.algorithm));
+
+    let hooks = Arc::new(Hooks::new(
+        config
+            .plugins
+            .as_ref()
+            .and_then(|p| p.hooks_library_path.as_ref()),
+    ));
 
     let hosts = match config.hosts_remote.clone() {
         Some(cfg) => {
@@ -89,6 +97,7 @@ pub async fn run() -> anyhow::Result<()> {
         hosts_local.clone(),
         blocklist.clone(),
         cache.clone(),
+        hooks.clone(),
     )
     .await?;
 
@@ -101,6 +110,7 @@ pub async fn run() -> anyhow::Result<()> {
         hosts_local.clone(),
         blocklist.clone(),
         cache.clone(),
+        hooks.clone(),
     )
     .await?;
 
@@ -116,6 +126,7 @@ pub async fn run() -> anyhow::Result<()> {
         hosts_local.clone(),
         blocklist.clone(),
         cache.clone(),
+        hooks.clone(),
     )
     .await?;
     let doh = DohServer::new(
@@ -128,6 +139,7 @@ pub async fn run() -> anyhow::Result<()> {
         hosts_local.clone(),
         blocklist.clone(),
         cache.clone(),
+        hooks.clone(),
     )
     .await?;
 

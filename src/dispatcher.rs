@@ -6,16 +6,16 @@ use std::{
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
-/// Ответственный за сопоставление входящих UDP-ответов с ожидающими запросами.
+/// Responsible for matching incoming UDP responses with pending queries.
 pub struct ResponseDispatcher {
     waiters: Mutex<HashMap<ResponseKey, oneshot::Sender<Vec<u8>>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ResponseKey {
-    /// Индекс сокета в пуле
+    /// Socket index in the pool
     socket_id: usize,
-    /// Адрес апстрима
+    /// Upstream address
     upstream_addr: SocketAddr,
     /// DNS Transaction ID
     tid: u16,
@@ -28,7 +28,7 @@ impl ResponseDispatcher {
         }
     }
 
-    /// Регистрирует ожидание ответа. Возвращает ресивер.
+    /// Registers a waiter for a response. Returns a receiver.
     pub fn register(&self, socket_id: usize, upstream_addr: SocketAddr, tid: u16) -> oneshot::Receiver<Vec<u8>> {
         let (tx, rx) = oneshot::channel();
         let key = ResponseKey {
@@ -41,7 +41,7 @@ impl ResponseDispatcher {
         rx
     }
 
-    /// Обрабатывает входящий пакет. Если найден ожидающий запрос, передает ему данные.
+    /// Processes an incoming packet. If a matching waiter is found, sends the data.
     pub fn dispatch(&self, socket_id: usize, upstream_addr: SocketAddr, packet: &[u8]) -> bool {
         if packet.len() < 2 {
             return false;
@@ -61,7 +61,7 @@ impl ResponseDispatcher {
         false
     }
 
-    /// Удаляет ожидание (например, при таймауте)
+    /// Removes a waiter (e.g., on timeout)
     pub fn unregister(&self, socket_id: usize, upstream_addr: SocketAddr, tid: u16) {
         let key = ResponseKey {
             socket_id,

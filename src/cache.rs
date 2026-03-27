@@ -6,37 +6,37 @@ use clockpro_cache::ClockProCache;
 use coarsetime::{Duration, Instant};
 use parking_lot::Mutex;
 
-/// DNS-кэш на базе алгоритма CLOCK-Pro
+/// DNS cache based on CLOCK-Pro algorithm
 pub struct DnsCache {
-    /// Кэш: ключ = (домен_в_нжнем_регистре, тип_запроса), значение = кэшированный ответ
+    /// Cache: key = (domain_lowercase, qtype), value = cached response
     cache: Mutex<ClockProCache<CacheKey, CacheEntry>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
-    /// Домен в нижнем регистре (бинарное представление для скорости)
+    /// Lowercase domain (binary representation for speed)
     domain: Arc<[u8]>,
-    /// Тип запроса
+    /// Query type
     qtype: u16,
 }
 
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
-    /// Кэшированный DNS-пакет
+    /// Cached DNS packet
     pub response: Vec<u8>,
-    /// Время истечения срока действия
+    /// Expiration instant
     pub expires: Instant,
 }
 
 impl DnsCache {
-    /// Создаёт новый DNS-кэш
+    /// Creates a new DNS cache
     pub fn new(max_size: usize) -> Self {
         Self {
             cache: Mutex::new(ClockProCache::new(max_size).expect("failed to create cache")),
         }
     }
 
-    /// Проверяет наличие валидного кэшированного ответа
+    /// Checks for a valid cached response
     pub fn get(&self, domain: &str, qtype: u16) -> Option<Vec<u8>> {
         let key = CacheKey {
             domain: normalize_domain_bytes(domain).into(),
@@ -49,10 +49,8 @@ impl DnsCache {
                 metrics::counter!("dns_cache_hits_total").increment(1);
                 return Some(entry.response.clone());
             } else {
-                // Истёк TTL - удаляем запись (в ClockProCache get_mut перемещает запись, но мы не можем легко удалить её отсюда если она и стекла без remove)
-                // На самом деле ClockProCache не имеет явного метода удаления по ключу кроме вытеснения,
-                // но мы можем просто игнорировать и она со временем вытеснится, или перезаписать её.
-                // В edgedns они просто возвращают None если истёк.
+                // TTL expired. ClockProCache doesn't have a direct remove by key,
+                // but we can just ignore it and it will eventually be evicted.
                 metrics::counter!("dns_cache_expired_total").increment(1);
             }
         } else {
@@ -61,7 +59,7 @@ impl DnsCache {
         None
     }
 
-    /// Сохраняет DNS-ответ в кэш
+    /// Saves a DNS response to the cache
     pub fn set(&self, domain: &str, qtype: u16, response: Vec<u8>, ttl: std::time::Duration) {
         let key = CacheKey {
             domain: normalize_domain_bytes(domain).into(),
@@ -78,7 +76,7 @@ impl DnsCache {
         let mut cache = self.cache.lock();
         cache.insert(key, entry);
         
-        // Обновляем метрики
+        // Update metrics
         metrics::gauge!("dns_cache_size").set((cache.frequent_len() + cache.recent_len() + cache.test_len()) as f64);
     }
 
@@ -88,7 +86,7 @@ impl DnsCache {
     }
 }
 
-/// Нормализует домен к нижнему регистру (бинарно)
+/// Normalizes domain to lowercase (binary)
 fn normalize_domain_bytes(domain: &str) -> Vec<u8> {
     let mut out = domain.trim().to_ascii_lowercase().into_bytes();
     if !out.ends_with(b".") {

@@ -1,63 +1,62 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
 };
 
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use tokio::sync::watch;
 
-/// Менеджер объединения идентичных DNS-запросов (Query Coalescing)
+/// Manager for combining identical DNS queries (Query Coalescing)
 pub struct PendingQueries {
-    /// Карта активных запросов: ключ -> отправитель результата
-    queries: Mutex<HashMap<QueryKey, watch::Receiver<Option<Vec<u8>>>>>,
+    /// Active queries map: key -> result sender
+    map: RwLock<HashMap<QueryKey, watch::Sender<Option<Vec<u8>>>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct QueryKey {
-    domain: Arc<str>,
+    domain: String,
     qtype: u16,
 }
 
 pub enum QueryState {
-    /// Запрос уже выполняется, нужно ждать результата
+    /// Query is already in progress, wait for the result
     Waiting(watch::Receiver<Option<Vec<u8>>>),
-    /// Мы первые, кто делает этот запрос
+    /// We are the first to make this query
     New(watch::Sender<Option<Vec<u8>>>),
 }
 
 impl PendingQueries {
     pub fn new() -> Self {
         Self {
-            queries: Mutex::new(HashMap::new()),
+            map: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Проверяет, выполняется ли уже такой запрос.
-    /// Если да, возвращает ресивер для ожидания.
-    /// Если нет, создает новый канал и возвращает сендер.
+    /// Checks if the query is already in progress.
+    /// If yes, returns a receiver to wait for the result.
+    /// If no, creates a new channel and returns the sender.
     pub fn get_or_create(&self, domain: &str, qtype: u16) -> QueryState {
         let key = QueryKey {
-            domain: Arc::from(domain),
+            domain: domain.to_ascii_lowercase(),
             qtype,
         };
 
-        let mut queries = self.queries.lock();
-        if let Some(rx) = queries.get(&key) {
-            return QueryState::Waiting(rx.clone());
+        let mut map = self.map.write();
+        if let Some(tx) = map.get(&key) {
+            QueryState::Waiting(tx.subscribe())
+        } else {
+            let (tx, _rx) = watch::channel(None);
+            map.insert(key, tx.clone());
+            QueryState::New(tx)
         }
-
-        let (tx, rx) = watch::channel(None);
-        queries.insert(key, rx);
-        QueryState::New(tx)
     }
 
-    /// Удаляет запрос из списка активных (после завершения)
+    /// Removes the query from the active list (after completion)
     pub fn remove(&self, domain: &str, qtype: u16) {
         let key = QueryKey {
-            domain: Arc::from(domain),
+            domain: domain.to_ascii_lowercase(),
             qtype,
         };
-        let mut queries = self.queries.lock();
-        queries.remove(&key);
+        let mut map = self.map.write();
+        map.remove(&key);
     }
 }

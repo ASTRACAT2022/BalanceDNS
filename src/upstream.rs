@@ -7,11 +7,13 @@ use std::{
     time::Duration,
 };
 
-
 use rand::Rng as _;
 use reqwest::Url;
-use tokio::time;
-use tokio::net::UdpSocket;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpStream, UdpSocket},
+    time,
+};
 use tokio_rustls::TlsConnector;
 use trust_dns_proto::{
     op::{Message, MessageType, OpCode, Query},
@@ -20,6 +22,7 @@ use trust_dns_proto::{
 
 use crate::config::{BalancingAlgorithm, UpstreamConfig, UpstreamProto};
 use crate::dispatcher::ResponseDispatcher;
+use crate::dns;
 
 pub struct UpstreamSet {
     upstreams: Vec<Upstream>,
@@ -183,14 +186,6 @@ impl UpstreamSet {
         }))
     }
 
-    pub fn transport(&self) -> Arc<TransportContext> {
-        self.transport.clone()
-    }
-
-    pub fn pick(&self, pool: &str, balancer: &Balancer, domain: Option<&str>, client_ip: Option<IpAddr>) -> Option<UpstreamRef> {
-        self.candidates(pool, balancer, domain, client_ip).into_iter().next()
-    }
-
     pub fn candidates(&self, pool: &str, balancer: &Balancer, domain: Option<&str>, client_ip: Option<IpAddr>) -> Vec<UpstreamRef> {
         let alive_indices: Vec<usize> = self
             .upstreams
@@ -229,14 +224,67 @@ impl UpstreamSet {
         eligible.into_iter().map(|idx| self.make_ref(idx)).collect()
     }
 
-    pub fn all_udp(&self) -> Vec<(Arc<str>, SocketAddr)> {
-        self.upstreams
-            .iter()
-            .filter_map(|u| match u.endpoint {
-                UpstreamEndpoint::Udp { addr } => Some((u.name.clone(), addr)),
-                _ => None,
-            })
-            .collect()
+    pub async fn forward_candidates(
+        &self,
+        candidates: &[UpstreamRef],
+        query: &[u8],
+        timeout: Duration,
+    ) -> anyhow::Result<(UpstreamRef, Vec<u8>, &'static str)> {
+        if candidates.is_empty() {
+            return Err(anyhow::anyhow!("no upstream candidates"));
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        // EdgeDNS approach: try top candidates
+        for candidate in candidates.iter().take(3).cloned() {
+            let query = query.to_vec();
+            let dispatcher = self.dispatcher.clone();
+            tasks.spawn(async move {
+                let result = forward_candidate(&candidate, &query, timeout, dispatcher).await;
+                (candidate, result)
+            });
+        }
+
+        let mut last_error = None;
+        let mut first_negative_resp = None;
+
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((candidate, Ok((resp, upstream_proto)))) => {
+                    if is_positive_response(&resp) {
+                        tasks.abort_all();
+                        return Ok((candidate, resp, upstream_proto));
+                    } else if is_valid_response(&resp) && first_negative_resp.is_none() {
+                        first_negative_resp = Some((candidate, resp, upstream_proto));
+                    }
+                }
+                Ok((candidate, Err(err))) => {
+                    tracing::debug!(upstream = %candidate.name, error = %err, "upstream attempt failed");
+                    last_error = Some(err);
+                }
+                Err(err) => {
+                    last_error = Some(anyhow::anyhow!("upstream task failed: {}", err));
+                }
+            }
+        }
+
+        if let Some(neg) = first_negative_resp {
+            return Ok(neg);
+        }
+
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no upstream candidates")))
+    }
+
+    fn make_ref(&self, idx: usize) -> UpstreamRef {
+        let u = &self.upstreams[idx];
+        UpstreamRef {
+            name: u.name.clone(),
+            pool: u.pool.clone(),
+            endpoint: u.endpoint.as_ref(),
+            transport: self.transport.clone(),
+            weight: u.weight,
+            udp_socket: self.get_pooled_socket(),
+        }
     }
 
     pub async fn healthcheck_loop(self: Arc<Self>, interval: Duration) {
@@ -293,40 +341,161 @@ impl UpstreamSet {
     }
 }
 
-impl UpstreamEndpoint {
-    fn as_ref(&self) -> UpstreamEndpointRef {
-        match self {
-            UpstreamEndpoint::Udp { addr } => UpstreamEndpointRef::Udp { addr: *addr },
-            UpstreamEndpoint::Tcp { addr } => UpstreamEndpointRef::Tcp { addr: *addr },
-            UpstreamEndpoint::Dot {
-                addr,
-                server_name,
-                tls_insecure,
-            } => UpstreamEndpointRef::Dot {
-                addr: *addr,
-                server_name: server_name.clone(),
-                tls_insecure: *tls_insecure,
-            },
-            UpstreamEndpoint::Doh { url, tls_insecure } => UpstreamEndpointRef::Doh {
-                url: url.clone(),
-                tls_insecure: *tls_insecure,
-            },
+async fn forward_candidate(
+    candidate: &UpstreamRef,
+    query: &[u8],
+    timeout: Duration,
+    dispatcher: Arc<ResponseDispatcher>,
+) -> anyhow::Result<(Vec<u8>, &'static str)> {
+    match &candidate.endpoint {
+        UpstreamEndpointRef::Udp { addr } => {
+            let resp = forward_udp_once(*addr, query, timeout, candidate.udp_socket.clone(), dispatcher).await?;
+            if dns::is_truncated_response(&resp) {
+                let tcp_resp = forward_tcp_once(*addr, query, timeout).await?;
+                return Ok((tcp_resp, "tcp"));
+            }
+            Ok((resp, "udp"))
         }
+        UpstreamEndpointRef::Tcp { addr } => Ok((forward_tcp_once(*addr, query, timeout).await?, "tcp")),
+        UpstreamEndpointRef::Dot {
+            addr,
+            server_name,
+            tls_insecure,
+        } => Ok((
+            forward_dot_once(&candidate.transport, *addr, server_name, *tls_insecure, query, timeout).await?,
+            "dot",
+        )),
+        UpstreamEndpointRef::Doh { url, tls_insecure } => Ok((
+            forward_doh_once(&candidate.transport, url, *tls_insecure, query, timeout).await?,
+            "doh",
+        )),
     }
 }
 
-impl UpstreamSet {
-    fn make_ref(&self, idx: usize) -> UpstreamRef {
-        let u = &self.upstreams[idx];
-        UpstreamRef {
-            name: u.name.clone(),
-            pool: u.pool.clone(),
-            endpoint: u.endpoint.as_ref(),
-            transport: self.transport.clone(),
-            weight: u.weight,
-            udp_socket: self.get_pooled_socket(),
+async fn forward_udp_once(
+    addr: SocketAddr,
+    query: &[u8],
+    timeout: Duration,
+    udp_socket: Option<Arc<PooledSocket>>,
+    dispatcher: Arc<ResponseDispatcher>,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(pooled) = udp_socket {
+        let tid = dns::read_id(query).ok_or_else(|| anyhow::anyhow!("invalid query id"))?;
+        let rx = dispatcher.register(pooled.id, addr, tid);
+        pooled.socket.send_to(query, addr).await?;
+
+        match time::timeout(timeout, rx).await {
+            Ok(Ok(resp)) => return Ok(resp),
+            Ok(Err(_)) => return Err(anyhow::anyhow!("dispatcher error")),
+            Err(_) => {
+                dispatcher.unregister(pooled.id, addr, tid);
+                return Err(anyhow::anyhow!("upstream timeout"));
+            }
         }
     }
+
+    let bind_addr = match addr {
+        SocketAddr::V4(v4) if v4.ip().is_loopback() => "127.0.0.1:0",
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(v6) if v6.ip().is_loopback() => "[::1]:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    let sock = UdpSocket::bind(bind_addr).await?;
+    sock.connect(addr).await?;
+    time::timeout(timeout, sock.send(query)).await??;
+    let mut buf = vec![0u8; 4096];
+    let n = time::timeout(timeout, sock.recv(&mut buf)).await??;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+async fn forward_tcp_once(addr: SocketAddr, query: &[u8], timeout: Duration) -> anyhow::Result<Vec<u8>> {
+    let mut conn = time::timeout(timeout, TcpStream::connect(addr)).await??;
+    conn.write_all(&(query.len() as u16).to_be_bytes()).await?;
+    conn.write_all(query).await?;
+    read_tcp_response(&mut conn, timeout).await
+}
+
+async fn forward_dot_once(
+    transport: &TransportContext,
+    addr: SocketAddr,
+    server_name: &Arc<str>,
+    tls_insecure: bool,
+    query: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let tcp = time::timeout(timeout, TcpStream::connect(addr)).await??;
+    let name = rustls::pki_types::ServerName::try_from(server_name.to_string())?;
+    let connector = if tls_insecure {
+        TlsConnector::from(transport.tls_insecure.clone())
+    } else {
+        TlsConnector::from(transport.tls.clone())
+    };
+    let mut tls = time::timeout(timeout, connector.connect(name, tcp)).await??;
+    tls.write_all(&(query.len() as u16).to_be_bytes()).await?;
+    tls.write_all(query).await?;
+    read_tcp_response(&mut tls, timeout).await
+}
+
+async fn forward_doh_once(
+    transport: &TransportContext,
+    url: &Arc<str>,
+    tls_insecure: bool,
+    query: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    let url = Url::parse(url.as_ref())?;
+    let client = if tls_insecure {
+        &transport.doh_insecure
+    } else {
+        &transport.doh
+    };
+    let resp = time::timeout(
+        timeout,
+        client
+            .post(url)
+            .header("content-type", "application/dns-message")
+            .header("accept", "application/dns-message")
+            .body(query.to_vec())
+            .send(),
+    )
+    .await??;
+    if !resp.status().is_success() {
+        return Err(anyhow::anyhow!("http status {}", resp.status()));
+    }
+    let bytes = time::timeout(timeout, resp.bytes()).await??;
+    Ok(bytes.to_vec())
+}
+
+async fn read_tcp_response<S>(stream: &mut S, timeout: Duration) -> anyhow::Result<Vec<u8>>
+where
+    S: AsyncReadExt + Unpin,
+{
+    let mut resp_len_buf = [0u8; 2];
+    time::timeout(timeout, stream.read_exact(&mut resp_len_buf)).await??;
+    let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
+    if resp_len == 0 || resp_len > 65535 {
+        return Err(anyhow::anyhow!("invalid upstream tcp length"));
+    }
+    let mut resp = vec![0u8; resp_len];
+    time::timeout(timeout, stream.read_exact(&mut resp)).await??;
+    Ok(resp)
+}
+
+fn is_positive_response(packet: &[u8]) -> bool {
+    if packet.len() < 4 {
+        return false;
+    }
+    let rcode = packet[3] & 0x0F;
+    rcode == 0
+}
+
+fn is_valid_response(packet: &[u8]) -> bool {
+    if packet.len() < 4 {
+        return false;
+    }
+    let rcode = packet[3] & 0x0F;
+    rcode == 0 || rcode == 3
 }
 
 pub struct Balancer {
@@ -455,6 +624,28 @@ fn parse_upstream_endpoint(cfg: &UpstreamConfig) -> anyhow::Result<UpstreamEndpo
                 url: Arc::from(url),
                 tls_insecure: cfg.tls_insecure,
             })
+        }
+    }
+}
+
+impl UpstreamEndpoint {
+    fn as_ref(&self) -> UpstreamEndpointRef {
+        match self {
+            UpstreamEndpoint::Udp { addr } => UpstreamEndpointRef::Udp { addr: *addr },
+            UpstreamEndpoint::Tcp { addr } => UpstreamEndpointRef::Tcp { addr: *addr },
+            UpstreamEndpoint::Dot {
+                addr,
+                server_name,
+                tls_insecure,
+            } => UpstreamEndpointRef::Dot {
+                addr: *addr,
+                server_name: server_name.clone(),
+                tls_insecure: *tls_insecure,
+            },
+            UpstreamEndpoint::Doh { url, tls_insecure } => UpstreamEndpointRef::Doh {
+                url: url.clone(),
+                tls_insecure: *tls_insecure,
+            },
         }
     }
 }

@@ -73,6 +73,7 @@ async fn incoming_dot_roundtrip() {
         None,
         None,
         None,
+        Arc::new(balnceDNS::hooks::Hooks::new::<String>(None)),
     )
     .await
     .unwrap();
@@ -159,6 +160,7 @@ async fn incoming_doh_roundtrip() {
         None,
         None,
         None,
+        Arc::new(balnceDNS::hooks::Hooks::new::<String>(None)),
     )
     .await
     .unwrap();
