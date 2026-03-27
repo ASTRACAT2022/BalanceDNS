@@ -388,13 +388,18 @@ impl BalanceDnsRuntime {
     }
 
     fn resolve_via_upstreams(&self, normalized_question: &dns::NormalizedQuestion) -> io::Result<Vec<u8>> {
-        let (query_packet, _) = dns::build_query_packet(normalized_question, false)
+        let (query_packet, upstream_question) = dns::build_query_packet(normalized_question, false)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let upstreams = self.ordered_upstreams();
         let mut last_err = None;
         for upstream in upstreams {
             self.varz.upstream_sent.inc();
-            match self.query_upstream(&upstream, &query_packet, normalized_question) {
+            match self.query_upstream(
+                &upstream,
+                &query_packet,
+                &upstream_question,
+                normalized_question.tid,
+            ) {
                 Ok(response) => {
                     self.varz.upstream_received.inc();
                     return Ok(response);
@@ -417,19 +422,21 @@ impl BalanceDnsRuntime {
         &self,
         upstream: &UpstreamConfig,
         query_packet: &[u8],
-        normalized_question: &dns::NormalizedQuestion,
+        upstream_question: &dns::NormalizedQuestionMinimal,
+        client_tid: u16,
     ) -> io::Result<Vec<u8>> {
-        let response = match upstream.proto {
+        let mut response = match upstream.proto {
             UpstreamProtocol::Udp => self.query_udp_upstream(upstream, query_packet)?,
             UpstreamProtocol::Doh => self.query_doh_upstream(upstream, query_packet)?,
         };
         let normalized_response = dns::normalize(&response, false)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        if normalized_response.qtype != normalized_question.qtype
-            || normalized_response.qclass != normalized_question.qclass
+        if normalized_response.tid != upstream_question.tid
+            || normalized_response.qtype != upstream_question.qtype
+            || normalized_response.qclass != upstream_question.qclass
             || dns::qname_to_fqdn(&normalized_response.qname)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
-                != dns::qname_to_fqdn(&normalized_question.qname)
+                != dns::qname_to_fqdn(&upstream_question.qname)
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
         {
             self.varz.upstream_errors.inc();
@@ -438,6 +445,7 @@ impl BalanceDnsRuntime {
                 format!("Upstream [{}] returned a mismatched response", upstream.name),
             ));
         }
+        dns::set_tid(&mut response, client_tid);
         Ok(response)
     }
 
