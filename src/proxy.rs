@@ -17,10 +17,11 @@ use tokio_rustls::TlsConnector;
 use crate::{
     blocklist_remote::BlocklistRemote,
     cache::DnsCache,
+    coalescing::{PendingQueries, QueryState},
     config::SecurityConfig,
     dns,
     hosts_remote::HostsRemote,
-    upstream::{Balancer, TransportContext, UpstreamEndpointRef, UpstreamRef, UpstreamSet},
+    upstream::{Balancer, TransportContext, UpstreamEndpointRef, UpstreamRef, UpstreamSet, PooledSocket},
 };
 
 const MIN_TCP_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,6 +39,7 @@ pub struct UdpProxy {
     hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
+    pending: Arc<PendingQueries>,
     request_timeout: Duration,
 }
 
@@ -51,6 +53,7 @@ pub struct TcpProxy {
     hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
+    pending: Arc<PendingQueries>,
     request_timeout: Duration,
 }
 
@@ -79,6 +82,7 @@ impl UdpProxy {
             hosts_local,
             blocklist,
             cache,
+            pending: Arc::new(PendingQueries::new()),
             request_timeout,
         })
     }
@@ -125,11 +129,11 @@ impl UdpProxy {
             }
 
             // Проверка кэша
+            let qinfo = dns::read_qname_qtype_qclass(packet);
             if let Some(cache) = &self.cache {
-                if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(packet) {
-                    if let Some(cached_resp) = cache.get(&domain, qtype) {
+                if let Some((domain, qtype, _qclass)) = &qinfo {
+                    if let Some(cached_resp) = cache.get(domain, *qtype) {
                         metrics::counter!("dns_cache_hits_total", "proto" => "udp").increment(1);
-                        // Восстанавливаем оригинальный ID запроса
                         let mut resp = cached_resp;
                         if let Some(orig_id) = dns::read_id(packet) {
                             dns::write_id(&mut resp, orig_id);
@@ -141,7 +145,8 @@ impl UdpProxy {
             }
 
             let client_ip = Some(client.ip());
-            let candidates = self.upstreams.candidates("default", &self.balancer, client_ip);
+            let domain_str = qinfo.as_ref().map(|(d, _, _)| d.as_str());
+            let candidates = self.upstreams.candidates("default", &self.balancer, domain_str, client_ip);
             if candidates.is_empty() {
                 metrics::counter!("dns_upstream_errors_total", "proto" => "udp").increment(1);
                 continue;
@@ -149,26 +154,54 @@ impl UdpProxy {
 
             let listener = self.socket.clone();
             let cache = self.cache.clone();
+            let pending = self.pending.clone();
+            let upstreams = self.upstreams.clone();
             let mut owned = Vec::with_capacity(n);
             owned.extend_from_slice(packet);
             let timeout = self.request_timeout;
             tokio::spawn(async move {
                 let start = Instant::now();
-                match forward_candidates(&candidates, &owned, timeout).await {
-                    Ok((upstream, resp, _upstream_proto)) => {
-                        if let Some(cache) = &cache {
-                            if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(&owned) {
-                                let ttl = dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
-                                cache.set(&domain, qtype, resp.clone(), ttl);
+
+                // Query Coalescing
+                let (domain, qtype) = if let Some((d, t, _)) = dns::read_qname_qtype_qclass(&owned) {
+                    (d, t)
+                } else {
+                    return;
+                };
+
+                let resp = match pending.get_or_create(&domain, qtype) {
+                    QueryState::New(tx) => {
+                        let res = forward_candidates(&candidates, &owned, timeout, upstreams.clone()).await;
+                        let result_packet = match res {
+                            Ok((upstream, resp, _upstream_proto)) => {
+                                if let Some(cache) = &cache {
+                                    let ttl = dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
+                                    cache.set(&domain, qtype, resp.clone(), ttl);
+                                }
+                                observe_udp_latency(&upstream.name, start);
+                                Some(resp)
                             }
-                        }
-                        observe_udp_latency(&upstream.name, start);
-                        let _ = listener.send_to(&resp, client).await;
+                            Err(err) => {
+                                tracing::debug!(error = %err, "udp forward failed");
+                                metrics::counter!("dns_upstream_errors_total", "proto" => "udp").increment(1);
+                                None
+                            }
+                        };
+                        let _ = tx.send(result_packet.clone());
+                        pending.remove(&domain, qtype);
+                        result_packet
                     }
-                    Err(err) => {
-                        tracing::debug!(error = %err, "udp forward failed");
-                        metrics::counter!("dns_upstream_errors_total", "proto" => "udp").increment(1);
+                    QueryState::Waiting(mut rx) => {
+                        let _ = rx.changed().await;
+                        rx.borrow().clone()
                     }
+                };
+
+                if let Some(mut resp) = resp {
+                    if let Some(orig_id) = dns::read_id(&owned) {
+                        dns::write_id(&mut resp, orig_id);
+                    }
+                    let _ = listener.send_to(&resp, client).await;
                 }
             });
         }
@@ -203,6 +236,7 @@ impl TcpProxy {
             hosts_local,
             blocklist,
             cache,
+            pending: Arc::new(PendingQueries::new()),
             request_timeout,
         })
     }
@@ -218,10 +252,11 @@ impl TcpProxy {
             let hosts_local = self.hosts_local.clone();
             let blocklist = self.blocklist.clone();
             let cache = self.cache.clone();
+            let pending = self.pending.clone();
             let timeout = self.request_timeout;
 
             tokio::spawn(async move {
-                if let Err(err) = handle_tcp_conn(stream, peer, upstreams, balancer, security, hosts, hosts_local, blocklist, cache, timeout).await {
+                if let Err(err) = handle_tcp_conn(stream, peer, upstreams, balancer, security, hosts, hosts_local, blocklist, cache, pending, timeout).await {
                     tracing::debug!(peer = %peer, error = %err, "tcp conn failed");
                 }
             });
@@ -243,6 +278,7 @@ async fn handle_tcp_conn(
     hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
+    pending: Arc<PendingQueries>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     metrics::counter!("dns_tcp_connections_total").increment(1);
@@ -287,9 +323,10 @@ async fn handle_tcp_conn(
             }
         }
 
+        let qinfo = dns::read_qname_qtype_qclass(&msg);
         if let Some(cache) = &cache {
-            if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(&msg) {
-                if let Some(cached_resp) = cache.get(&domain, qtype) {
+            if let Some((domain, qtype, _qclass)) = &qinfo {
+                if let Some(cached_resp) = cache.get(domain, *qtype) {
                     metrics::counter!("dns_cache_hits_total", "proto" => "tcp").increment(1);
                     let mut resp = cached_resp;
                     if let Some(orig_id) = dns::read_id(&msg) {
@@ -302,23 +339,55 @@ async fn handle_tcp_conn(
         }
 
         let client_ip = Some(peer.ip());
-        let candidates = upstreams.candidates("default", &balancer, client_ip);
+        let domain_str = qinfo.as_ref().map(|(d, _, _)| d.as_str());
+        let candidates = upstreams.candidates("default", &balancer, domain_str, client_ip);
         if candidates.is_empty() {
             return Err(anyhow::anyhow!("no upstream"));
         }
 
         let start = Instant::now();
-        // For TCP, we use specialized forwarder as it needs new connections
-        let (upstream, resp, upstream_proto) = forward_candidates_tcp(&candidates, &msg, timeout).await?;
-        if let Some(cache) = &cache {
-            if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(&msg) {
-                let ttl = dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
-                cache.set(&domain, qtype, resp.clone(), ttl);
-            }
-        }
 
-        observe_tcp_latency(&upstream.name, upstream_proto, start);
-        time::timeout(client_io_timeout, write_tcp_response(&mut client, &resp)).await??;
+        let (domain, qtype) = if let Some((d, t, _)) = qinfo {
+            (d, t)
+        } else {
+            return Err(anyhow::anyhow!("invalid query"));
+        };
+
+        let resp = match pending.get_or_create(&domain, qtype) {
+            QueryState::New(tx) => {
+                let res = forward_candidates_tcp(&candidates, &msg, timeout, upstreams.clone()).await;
+                let result_packet = match res {
+                    Ok((upstream, resp, upstream_proto)) => {
+                        if let Some(cache) = &cache {
+                            let ttl = dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
+                            cache.set(&domain, qtype, resp.clone(), ttl);
+                        }
+                        observe_tcp_latency(&upstream.name, upstream_proto, start);
+                        Some(resp)
+                    }
+                    Err(err) => {
+                        tracing::debug!(error = %err, "tcp forward failed");
+                        None
+                    }
+                };
+                let _ = tx.send(result_packet.clone());
+                pending.remove(&domain, qtype);
+                result_packet
+            }
+            QueryState::Waiting(mut rx) => {
+                let _ = rx.changed().await;
+                rx.borrow().clone()
+            }
+        };
+
+        if let Some(mut resp) = resp {
+            if let Some(orig_id) = dns::read_id(&msg) {
+                dns::write_id(&mut resp, orig_id);
+            }
+            time::timeout(client_io_timeout, write_tcp_response(&mut client, &resp)).await??;
+        } else {
+            return Err(anyhow::anyhow!("upstream failed"));
+        }
     }
 }
 
@@ -431,9 +500,11 @@ pub(crate) async fn forward_once(
     endpoint: &UpstreamEndpointRef,
     query: &[u8],
     timeout: Duration,
+    udp_socket: Option<Arc<PooledSocket>>,
+    upstreams: Arc<UpstreamSet>,
 ) -> anyhow::Result<Vec<u8>> {
     match endpoint {
-        UpstreamEndpointRef::Udp { addr } => forward_udp_once(*addr, query, timeout).await,
+        UpstreamEndpointRef::Udp { addr } => forward_udp_once(*addr, query, timeout, udp_socket, upstreams).await,
         UpstreamEndpointRef::Tcp { addr } => forward_tcp_once(*addr, query, timeout).await,
         UpstreamEndpointRef::Dot {
             addr,
@@ -452,6 +523,7 @@ pub(crate) async fn forward_candidates(
     candidates: &[UpstreamRef],
     query: &[u8],
     timeout: Duration,
+    upstreams: Arc<UpstreamSet>,
 ) -> anyhow::Result<(UpstreamRef, Vec<u8>, &'static str)> {
     if candidates.is_empty() {
         return Err(anyhow::anyhow!("no upstream candidates"));
@@ -461,8 +533,9 @@ pub(crate) async fn forward_candidates(
     // Limit to top 3 candidates for efficiency
     for candidate in candidates.iter().take(3).cloned() {
         let query = query.to_vec();
+        let upstreams = upstreams.clone();
         tasks.spawn(async move {
-            let result = forward_candidate(&candidate, &query, timeout).await;
+            let result = forward_candidate(&candidate, &query, timeout, upstreams).await;
             (candidate, result)
         });
     }
@@ -501,6 +574,7 @@ pub(crate) async fn forward_candidates_tcp(
     candidates: &[UpstreamRef],
     query: &[u8],
     timeout: Duration,
+    upstreams: Arc<UpstreamSet>,
 ) -> anyhow::Result<(UpstreamRef, Vec<u8>, &'static str)> {
     if candidates.is_empty() {
         return Err(anyhow::anyhow!("no upstream candidates"));
@@ -509,10 +583,11 @@ pub(crate) async fn forward_candidates_tcp(
     let mut tasks = JoinSet::new();
     for candidate in candidates.iter().take(3).cloned() {
         let query = query.to_vec();
+        let upstreams = upstreams.clone();
         tasks.spawn(async move {
             // TCP/DoT/DoH always create new connections or use connection pools,
             // so they don't need shared UDP sockets.
-            let result = forward_candidate_tcp_aware(&candidate, &query, timeout).await;
+            let result = forward_candidate_tcp_aware(&candidate, &query, timeout, upstreams).await;
             (candidate, result)
         });
     }
@@ -551,10 +626,11 @@ async fn forward_candidate(
     candidate: &UpstreamRef,
     query: &[u8],
     timeout: Duration,
+    upstreams: Arc<UpstreamSet>,
 ) -> anyhow::Result<(Vec<u8>, &'static str)> {
     match &candidate.endpoint {
         UpstreamEndpointRef::Udp { addr } => {
-            let resp = forward_udp_once(*addr, query, timeout).await?;
+            let resp = forward_udp_once(*addr, query, timeout, candidate.udp_socket.clone(), upstreams).await?;
             if dns::is_truncated_response(&resp) {
                 let tcp_resp = forward_tcp_once(*addr, query, timeout).await?;
                 return Ok((tcp_resp, "tcp"));
@@ -562,15 +638,15 @@ async fn forward_candidate(
             Ok((resp, "udp"))
         }
         UpstreamEndpointRef::Tcp { .. } => Ok((
-            forward_once(&candidate.transport, &candidate.endpoint, query, timeout).await?,
+            forward_once(&candidate.transport, &candidate.endpoint, query, timeout, None, upstreams).await?,
             "tcp",
         )),
         UpstreamEndpointRef::Dot { .. } => Ok((
-            forward_once(&candidate.transport, &candidate.endpoint, query, timeout).await?,
+            forward_once(&candidate.transport, &candidate.endpoint, query, timeout, None, upstreams).await?,
             "dot",
         )),
         UpstreamEndpointRef::Doh { .. } => Ok((
-            forward_once(&candidate.transport, &candidate.endpoint, query, timeout).await?,
+            forward_once(&candidate.transport, &candidate.endpoint, query, timeout, None, upstreams).await?,
             "doh",
         )),
     }
@@ -580,10 +656,11 @@ async fn forward_candidate_tcp_aware(
     candidate: &UpstreamRef,
     query: &[u8],
     timeout: Duration,
+    upstreams: Arc<UpstreamSet>,
 ) -> anyhow::Result<(Vec<u8>, &'static str)> {
     match &candidate.endpoint {
         UpstreamEndpointRef::Udp { addr } => {
-            let resp = forward_udp_once(*addr, query, timeout).await?;
+            let resp = forward_udp_once(*addr, query, timeout, candidate.udp_socket.clone(), upstreams).await?;
             if dns::is_truncated_response(&resp) {
                 let tcp_resp = forward_tcp_once(*addr, query, timeout).await?;
                 return Ok((tcp_resp, "tcp"));
@@ -607,7 +684,28 @@ async fn forward_candidate_tcp_aware(
 }
 
 
-async fn forward_udp_once(addr: SocketAddr, query: &[u8], timeout: Duration) -> anyhow::Result<Vec<u8>> {
+async fn forward_udp_once(
+    addr: SocketAddr,
+    query: &[u8],
+    timeout: Duration,
+    udp_socket: Option<Arc<PooledSocket>>,
+    upstreams: Arc<UpstreamSet>,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(pooled) = udp_socket {
+        let tid = dns::read_id(query).ok_or_else(|| anyhow::anyhow!("invalid query id"))?;
+        let rx = upstreams.dispatcher.register(pooled.id, addr, tid);
+        pooled.socket.send_to(query, addr).await?;
+
+        match time::timeout(timeout, rx).await {
+            Ok(Ok(resp)) => return Ok(resp),
+            Ok(Err(_)) => return Err(anyhow::anyhow!("dispatcher error")),
+            Err(_) => {
+                upstreams.dispatcher.unregister(pooled.id, addr, tid);
+                return Err(anyhow::anyhow!("upstream timeout"));
+            }
+        }
+    }
+
     let bind_addr = match addr {
         SocketAddr::V4(v4) if v4.ip().is_loopback() => "127.0.0.1:0",
         SocketAddr::V4(_) => "0.0.0.0:0",

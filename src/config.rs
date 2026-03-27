@@ -6,6 +6,8 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 pub struct AppConfig {
     pub server: ServerConfig,
     #[serde(default)]
+    pub network: NetworkConfig,
+    #[serde(default)]
     pub tls: TlsConfig,
     #[serde(default)]
     pub cache: CacheConfig,
@@ -61,6 +63,20 @@ pub struct ServerConfig {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NetworkConfig {
+    #[serde(default = "default_udp_ports")]
+    pub udp_ports: u16,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            udp_ports: default_udp_ports(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TlsConfig {
     #[serde(default = "default_tls_cert")]
     pub cert_pem: String,
@@ -90,6 +106,7 @@ impl Default for TlsConfig {
 #[serde(rename_all = "snake_case")]
 pub enum BalancingAlgorithm {
     RoundRobin,
+    JumpHash,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -337,6 +354,10 @@ fn default_cache_ttl_seconds() -> u64 {
     300
 }
 
+fn default_udp_ports() -> u16 {
+    8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +371,7 @@ mod tests {
                 dot_listen: "127.0.0.1:8853".parse().unwrap(),
                 doh_listen: "127.0.0.1:8443".parse().unwrap(),
             },
+            network: NetworkConfig::default(),
             tls: TlsConfig::default(),
             cache: CacheConfig::default(),
             hosts_remote: None,

@@ -16,15 +16,24 @@ use crate::{
 };
 
 const HEALTHCHECK_INTERVAL: Duration = Duration::from_secs(15);
+const CLOCK_RESOLUTION_MS: u64 = 100;
 
 pub async fn run() -> anyhow::Result<()> {
     init_tracing();
     tls::ensure_rustls_crypto_provider();
 
+    // Start coarsetime updater for efficient TTL logic (used by ClockPro cache)
+    let ct = coarsetime::Updater::new(CLOCK_RESOLUTION_MS)
+        .start()
+        .map_err(|e| anyhow::anyhow!("failed to start coarsetime updater: {}", e))?;
+
     let config_path = parse_config_path();
     let config = AppConfig::load(&config_path)?;
 
-    let upstreams = Arc::new(UpstreamSet::new(config.upstreams.clone())?);
+    let mut upstreams_obj = UpstreamSet::new(config.upstreams.clone())?;
+    upstreams_obj.init_udp_pool(config.network.udp_ports).await?;
+    let upstreams = Arc::new(upstreams_obj);
+
     let balancer = Arc::new(Balancer::new(config.balancing.algorithm));
 
     let hosts = match config.hosts_remote.clone() {
@@ -54,12 +63,11 @@ pub async fn run() -> anyhow::Result<()> {
     let cache = if config.cache.enabled {
         let c = Arc::new(DnsCache::new(
             config.cache.max_size,
-            Duration::from_secs(config.cache.ttl_seconds),
         ));
         tracing::info!(
             max_size = config.cache.max_size,
             ttl_seconds = config.cache.ttl_seconds,
-            "DNS cache enabled"
+            "DNS cache enabled (CLOCK-Pro)"
         );
         Some(c)
     } else {
@@ -129,6 +137,7 @@ pub async fn run() -> anyhow::Result<()> {
         dot_listen = %config.server.dot_listen,
         doh_listen = %config.server.doh_listen,
         metrics_listen = %config.metrics.listen,
+        udp_ports = config.network.udp_ports,
         "balanceDNSt started"
     );
 
@@ -171,6 +180,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
+    ct.stop().map_err(|e| anyhow::anyhow!("failed to stop coarsetime updater: {}", e))?;
     Ok(())
 }
 

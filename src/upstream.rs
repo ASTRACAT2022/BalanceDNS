@@ -1,7 +1,7 @@
 use std::{
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering, AtomicUsize},
         Arc,
     },
     time::Duration,
@@ -11,6 +11,7 @@ use std::{
 use rand::Rng as _;
 use reqwest::Url;
 use tokio::time;
+use tokio::net::UdpSocket;
 use tokio_rustls::TlsConnector;
 use trust_dns_proto::{
     op::{Message, MessageType, OpCode, Query},
@@ -18,10 +19,19 @@ use trust_dns_proto::{
 };
 
 use crate::config::{BalancingAlgorithm, UpstreamConfig, UpstreamProto};
+use crate::dispatcher::ResponseDispatcher;
 
 pub struct UpstreamSet {
     upstreams: Vec<Upstream>,
     transport: Arc<TransportContext>,
+    udp_pool: Vec<PooledSocket>,
+    next_socket: AtomicUsize,
+    pub dispatcher: Arc<ResponseDispatcher>,
+}
+
+pub struct PooledSocket {
+    pub id: usize,
+    pub socket: Arc<UdpSocket>,
 }
 
 #[derive(Clone)]
@@ -31,6 +41,7 @@ pub struct UpstreamRef {
     pub endpoint: UpstreamEndpointRef,
     pub transport: Arc<TransportContext>,
     pub weight: u32,
+    pub udp_socket: Option<Arc<PooledSocket>>,
 }
 
 struct Upstream {
@@ -120,18 +131,67 @@ impl UpstreamSet {
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
 
-        Ok(Self { upstreams, transport })
+        Ok(Self {
+            upstreams,
+            transport,
+            udp_pool: Vec::new(),
+            next_socket: AtomicUsize::new(0),
+            dispatcher: Arc::new(ResponseDispatcher::new()),
+        })
+    }
+
+    pub async fn init_udp_pool(&mut self, count: u16) -> anyhow::Result<()> {
+        let mut pool = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let socket = UdpSocket::bind("0.0.0.0:0").await?;
+            let socket = Arc::new(socket);
+            pool.push(PooledSocket {
+                id: i as usize,
+                socket: socket.clone(),
+            });
+
+            // Spawn listener task for this socket
+            let dispatcher = self.dispatcher.clone();
+            let socket_id = i as usize;
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match socket.recv_from(&mut buf).await {
+                        Ok((n, addr)) => {
+                            dispatcher.dispatch(socket_id, addr, &buf[..n]);
+                        }
+                        Err(e) => {
+                            tracing::error!("UDP pool socket error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        self.udp_pool = pool;
+        Ok(())
+    }
+
+    pub fn get_pooled_socket(&self) -> Option<Arc<PooledSocket>> {
+        if self.udp_pool.is_empty() {
+            return None;
+        }
+        let idx = self.next_socket.fetch_add(1, Ordering::Relaxed) % self.udp_pool.len();
+        Some(Arc::new(PooledSocket {
+            id: self.udp_pool[idx].id,
+            socket: self.udp_pool[idx].socket.clone(),
+        }))
     }
 
     pub fn transport(&self) -> Arc<TransportContext> {
         self.transport.clone()
     }
 
-    pub fn pick(&self, pool: &str, balancer: &Balancer, client_ip: Option<IpAddr>) -> Option<UpstreamRef> {
-        self.candidates(pool, balancer, client_ip).into_iter().next()
+    pub fn pick(&self, pool: &str, balancer: &Balancer, domain: Option<&str>, client_ip: Option<IpAddr>) -> Option<UpstreamRef> {
+        self.candidates(pool, balancer, domain, client_ip).into_iter().next()
     }
 
-    pub fn candidates(&self, pool: &str, balancer: &Balancer, client_ip: Option<IpAddr>) -> Vec<UpstreamRef> {
+    pub fn candidates(&self, pool: &str, balancer: &Balancer, domain: Option<&str>, client_ip: Option<IpAddr>) -> Vec<UpstreamRef> {
         let alive_indices: Vec<usize> = self
             .upstreams
             .iter()
@@ -154,12 +214,12 @@ impl UpstreamSet {
 
         if !alive_indices.is_empty() {
             let weights: Vec<u32> = alive_indices.iter().map(|&i| self.upstreams[i].weight).collect();
-            eligible.extend(ordered_candidates_weighted(&alive_indices, &weights, balancer, client_ip));
+            eligible.extend(ordered_candidates_weighted(&alive_indices, &weights, balancer, domain, client_ip));
         }
 
         if !unhealthy_indices.is_empty() {
             let weights: Vec<u32> = unhealthy_indices.iter().map(|&i| self.upstreams[i].weight).collect();
-            eligible.extend(ordered_candidates_weighted(&unhealthy_indices, &weights, balancer, client_ip));
+            eligible.extend(ordered_candidates_weighted(&unhealthy_indices, &weights, balancer, domain, client_ip));
         }
 
         if eligible.is_empty() {
@@ -264,6 +324,7 @@ impl UpstreamSet {
             endpoint: u.endpoint.as_ref(),
             transport: self.transport.clone(),
             weight: u.weight,
+            udp_socket: self.get_pooled_socket(),
         }
     }
 }
@@ -271,6 +332,7 @@ impl UpstreamSet {
 pub struct Balancer {
     algorithm: BalancingAlgorithm,
     rr: AtomicU64,
+    jumphasher: jumphash::JumpHasher,
 }
 
 impl Balancer {
@@ -278,10 +340,11 @@ impl Balancer {
         Self {
             algorithm,
             rr: AtomicU64::new(0),
+            jumphasher: jumphash::JumpHasher::new(),
         }
     }
 
-    pub fn pick_weighted(&self, indices: &[usize], weights: &[u32]) -> usize {
+    pub fn pick_weighted(&self, indices: &[usize], weights: &[u32], domain: Option<&str>) -> usize {
         match self.algorithm {
             BalancingAlgorithm::RoundRobin => {
                 let total_weight: u32 = weights.iter().sum();
@@ -298,6 +361,11 @@ impl Balancer {
                     val -= weight;
                 }
                 indices[0]
+            }
+            BalancingAlgorithm::JumpHash => {
+                let key = domain.unwrap_or("");
+                let idx = self.jumphasher.slot(&key, indices.len() as u32) as usize;
+                indices[idx]
             }
         }
     }
@@ -335,13 +403,14 @@ fn ordered_candidates_weighted(
     indices: &[usize],
     weights: &[u32],
     balancer: &Balancer,
+    domain: Option<&str>,
     _client_ip: Option<IpAddr>,
 ) -> Vec<usize> {
     if indices.is_empty() {
         return Vec::new();
     }
 
-    let start_idx = balancer.pick_weighted(indices, weights);
+    let start_idx = balancer.pick_weighted(indices, weights, domain);
     let start_pos = indices.iter().position(|idx| *idx == start_idx).unwrap_or(0);
 
     indices
@@ -563,10 +632,10 @@ mod tests {
     }
 
     #[test]
-    fn ordered_candidates_append_unhealthy_after_alive() {
+    fn ordered_candidates_weighted_uses_balancer() {
         let balancer = Balancer::new(BalancingAlgorithm::RoundRobin);
-        assert_eq!(ordered_candidates_weighted(&[1, 2], &[1, 1], &balancer, None), vec![1, 2]);
-        assert_eq!(ordered_candidates_weighted(&[3, 4], &[1, 1], &balancer, None), vec![4, 3]);
+        assert_eq!(ordered_candidates_weighted(&[1, 2], &[1, 1], &balancer, None, None), vec![1, 2]);
+        assert_eq!(ordered_candidates_weighted(&[3, 4], &[1, 1], &balancer, None, None), vec![4, 3]);
     }
 }
 
