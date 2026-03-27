@@ -573,8 +573,7 @@ pub fn set_ttl(packet: &mut [u8], ttl: u32) -> Result<(), &'static str> {
             return Err("Short packet");
         }
         let qtype = ((packet[offset] as u16) << 8) | packet[offset + 1] as u16;
-        let qclass = ((packet[offset + 2] as u16) << 8) | packet[offset + 3] as u16;
-        if qtype != DNS_TYPE_OPT || qclass != DNS_CLASS_IN {
+        if qtype != DNS_TYPE_OPT {
             packet[offset + 4] = (ttl >> 24) as u8;
             packet[offset + 5] = (ttl >> 16) as u8;
             packet[offset + 6] = (ttl >> 8) as u8;
