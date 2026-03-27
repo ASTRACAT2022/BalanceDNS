@@ -7,13 +7,17 @@ edition = "2024"
 anyhow = "1"
 arc-swap = "1"
 bytes = "1"
+clockpro-cache = "0.1"
+coarsetime = "0.1"
 dashmap = "6"
 http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+jumphash = "0.1"
 metrics = "0.22"
 metrics-exporter-prometheus = "0.14"
+parking_lot = "0.12"
 rand = "0.8"
 base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
@@ -21,6 +25,7 @@ rustls = { version = "0.23", features = ["ring"] }
 rustls-native-certs = "0.7"
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
+slab = "0.4"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 toml = "0.8"

@@ -1,7 +1,9 @@
 pub mod cache;
+pub mod coalescing;
 pub mod config;
 pub mod cli;
 pub mod blocklist_remote;
+pub mod dispatcher;
 pub mod dns;
 pub mod hosts_remote;
 pub mod incoming;

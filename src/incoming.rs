@@ -19,7 +19,9 @@ use tokio::{
 use crate::{
     blocklist_remote::BlocklistRemote,
     cache::DnsCache,
-    config::{SecurityConfig, TlsConfig},
+    coalescing::{PendingQueries, QueryState},
+    config::SecurityConfig,
+    config::TlsConfig,
     hosts_remote::HostsRemote,
     proxy::{forward_candidates, maybe_refuse, maybe_answer_local},
     tls,
@@ -44,6 +46,7 @@ pub struct DotServer {
     hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
+    pending: Arc<PendingQueries>,
     request_timeout: Duration,
 }
 
@@ -58,6 +61,7 @@ pub struct DohServer {
     hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
+    pending: Arc<PendingQueries>,
     request_timeout: Duration,
 }
 
@@ -88,6 +92,7 @@ impl DotServer {
             hosts_local,
             blocklist,
             cache,
+            pending: Arc::new(PendingQueries::new()),
             request_timeout,
         })
     }
@@ -114,6 +119,7 @@ impl DotServer {
             let hosts_local = self.hosts_local.clone();
             let blocklist = self.blocklist.clone();
             let cache = self.cache.clone();
+            let pending = self.pending.clone();
             let timeout = self.request_timeout;
 
             tokio::spawn(async move {
@@ -128,6 +134,7 @@ impl DotServer {
                     hosts_local,
                     blocklist,
                     cache,
+                    pending,
                     timeout,
                 )
                 .await
@@ -167,6 +174,7 @@ impl DohServer {
             hosts_local,
             blocklist,
             cache,
+            pending: Arc::new(PendingQueries::new()),
             request_timeout,
         })
     }
@@ -193,9 +201,10 @@ impl DohServer {
             let hosts_local = self.hosts_local.clone();
             let blocklist = self.blocklist.clone();
             let cache = self.cache.clone();
+            let pending = self.pending.clone();
             let timeout = self.request_timeout;
             tokio::spawn(async move {
-                if let Err(err) = handle_doh_conn(stream, peer, acceptor, upstreams, balancer, security, hosts, hosts_local, blocklist, cache, timeout).await {
+                if let Err(err) = handle_doh_conn(stream, peer, acceptor, upstreams, balancer, security, hosts, hosts_local, blocklist, cache, pending, timeout).await {
                     tracing::debug!(peer = %peer, error = %err, "doh conn failed");
                 }
             });
@@ -214,6 +223,7 @@ async fn handle_dot_conn(
     hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
+    pending: Arc<PendingQueries>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let mut tls = time::timeout(tls_accept_timeout(timeout), acceptor.accept(stream)).await??;
@@ -275,9 +285,10 @@ async fn handle_dot_conn(
         }
 
         // Проверка кэша
+        let qinfo = crate::dns::read_qname_qtype_qclass(&msg);
         if let Some(cache) = &cache {
-            if let Some((domain, qtype, _qclass)) = crate::dns::read_qname_qtype_qclass(&msg) {
-                if let Some(cached_resp) = cache.get(&domain, qtype) {
+            if let Some((domain, qtype, _qclass)) = &qinfo {
+                if let Some(cached_resp) = cache.get(domain, *qtype) {
                     metrics::counter!("dns_cache_hits_total", "proto" => "dot").increment(1);
                     let mut resp = cached_resp;
                     if let Some(orig_id) = crate::dns::read_id(&msg) {
@@ -292,31 +303,55 @@ async fn handle_dot_conn(
         }
 
         let client_ip = Some(peer.ip());
-        let candidates = upstreams.candidates("default", &balancer, client_ip);
+        let domain_str = qinfo.as_ref().map(|(d, _, _)| d.as_str());
+        let candidates = upstreams.candidates("default", &balancer, domain_str, client_ip);
         if candidates.is_empty() {
             return Err(anyhow::anyhow!("no upstream"));
         }
 
         let start = Instant::now();
-        match forward_candidates(&candidates, &msg, timeout).await {
-            Ok((upstream, resp, _upstream_proto)) => {
-                // Сохраняем в кэш
-                if let Some(cache) = &cache {
-                    if let Some((domain, qtype, _qclass)) = crate::dns::read_qname_qtype_qclass(&msg) {
-                        let ttl = crate::dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
-                        cache.set(&domain, qtype, resp.clone(), ttl);
+        let (domain, qtype) = if let Some((d, t, _)) = qinfo {
+            (d, t)
+        } else {
+            return Err(anyhow::anyhow!("invalid query"));
+        };
+
+        let resp = match pending.get_or_create(&domain, qtype) {
+            QueryState::New(tx) => {
+                let res = forward_candidates(&candidates, &msg, timeout, upstreams.clone()).await;
+                let result_packet = match res {
+                    Ok((upstream, resp, _upstream_proto)) => {
+                        if let Some(cache) = &cache {
+                            let ttl = crate::dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
+                            cache.set(&domain, qtype, resp.clone(), ttl);
+                        }
+                        observe_latency("dot", &upstream.name, start);
+                        Some(resp)
                     }
-                }
-                
-                observe_latency("dot", &upstream.name, start);
-                let resp_len = resp.len() as u16;
-                tls.write_all(&resp_len.to_be_bytes()).await?;
-                tls.write_all(&resp).await?;
+                    Err(_) => {
+                        metrics::counter!("dns_upstream_errors_total", "proto" => "dot").increment(1);
+                        None
+                    }
+                };
+                let _ = tx.send(result_packet.clone());
+                pending.remove(&domain, qtype);
+                result_packet
             }
-            Err(err) => {
-                metrics::counter!("dns_upstream_errors_total", "proto" => "dot").increment(1);
-                return Err(err);
+            QueryState::Waiting(mut rx) => {
+                let _ = rx.changed().await;
+                rx.borrow().clone()
             }
+        };
+
+        if let Some(mut resp) = resp {
+            if let Some(orig_id) = crate::dns::read_id(&msg) {
+                crate::dns::write_id(&mut resp, orig_id);
+            }
+            let resp_len = resp.len() as u16;
+            tls.write_all(&resp_len.to_be_bytes()).await?;
+            tls.write_all(&resp).await?;
+        } else {
+            return Err(anyhow::anyhow!("upstream failed"));
         }
     }
 }
@@ -332,6 +367,7 @@ async fn handle_doh_conn(
     hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
+    pending: Arc<PendingQueries>,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let tls_stream = time::timeout(tls_accept_timeout(timeout), acceptor.accept(stream)).await??;
@@ -345,9 +381,10 @@ async fn handle_doh_conn(
         let hosts_local = hosts_local.clone();
         let blocklist = blocklist.clone();
         let cache = cache.clone();
+        let pending = pending.clone();
         async move {
             Ok::<_, std::convert::Infallible>(
-                handle_doh_request(req, upstreams, balancer, security, hosts, hosts_local, blocklist, cache, timeout).await,
+                handle_doh_request(req, upstreams, balancer, security, hosts, hosts_local, blocklist, cache, pending, timeout).await,
             )
         }
     });
@@ -373,6 +410,7 @@ async fn handle_doh_request(
     hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
+    pending: Arc<PendingQueries>,
     timeout: Duration,
 ) -> Response<Full<Bytes>> {
     let (parts, body) = req.into_parts();
@@ -438,38 +476,60 @@ async fn handle_doh_request(
     }
 
     // Проверка кэша
+    let qinfo = crate::dns::read_qname_qtype_qclass(&query);
     if let Some(cache) = &cache {
-        if let Some((domain, qtype, _qclass)) = crate::dns::read_qname_qtype_qclass(&query) {
-            if let Some(cached_resp) = cache.get(&domain, qtype) {
+        if let Some((domain, qtype, _qclass)) = &qinfo {
+            if let Some(cached_resp) = cache.get(domain, *qtype) {
                 metrics::counter!("dns_cache_hits_total", "proto" => "doh").increment(1);
                 return response_dns(cached_resp);
             }
         }
     }
 
-    let candidates = upstreams.candidates("default", &balancer, None);
+    let domain_str = qinfo.as_ref().map(|(d, _, _)| d.as_str());
+    let candidates = upstreams.candidates("default", &balancer, domain_str, None);
     if candidates.is_empty() {
         return response(StatusCode::BAD_GATEWAY, Bytes::new());
     }
 
     let start = Instant::now();
-    match forward_candidates(&candidates, &query, timeout).await {
-        Ok((upstream, resp, _upstream_proto)) => {
-            // Сохраняем в кэш
-            if let Some(cache) = &cache {
-                if let Some((domain, qtype, _qclass)) = crate::dns::read_qname_qtype_qclass(&query) {
-                    let ttl = crate::dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
-                    cache.set(&domain, qtype, resp.clone(), ttl);
+    let (domain, qtype) = if let Some((d, t, _)) = qinfo {
+        (d, t)
+    } else {
+        return response(StatusCode::BAD_REQUEST, Bytes::new());
+    };
+
+    let resp = match pending.get_or_create(&domain, qtype) {
+        QueryState::New(tx) => {
+            let res = forward_candidates(&candidates, &query, timeout, upstreams.clone()).await;
+            let result_packet = match res {
+                Ok((upstream, resp, _upstream_proto)) => {
+                    if let Some(cache) = &cache {
+                        let ttl = crate::dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
+                        cache.set(&domain, qtype, resp.clone(), ttl);
+                    }
+                    observe_latency("doh", &upstream.name, start);
+                    Some(resp)
                 }
-            }
-            
-            observe_latency("doh", &upstream.name, start);
-            response_dns(resp)
+                Err(_) => {
+                    metrics::counter!("dns_upstream_errors_total", "proto" => "doh").increment(1);
+                    None
+                }
+            };
+            let _ = tx.send(result_packet.clone());
+            pending.remove(&domain, qtype);
+            result_packet
         }
-        Err(_) => {
-            metrics::counter!("dns_upstream_errors_total", "proto" => "doh").increment(1);
-            response(StatusCode::BAD_GATEWAY, Bytes::new())
+        QueryState::Waiting(mut rx) => {
+            let _ = rx.changed().await;
+            rx.borrow().clone()
         }
+    };
+
+    if let Some(resp) = resp {
+        response_dns(resp)
+    } else {
+        response(StatusCode::BAD_GATEWAY, Bytes::new())
     }
 }
 

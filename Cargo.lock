@@ -85,13 +85,17 @@ dependencies = [
  "arc-swap",
  "base64",
  "bytes",
+ "clockpro-cache",
+ "coarsetime",
  "dashmap",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "jumphash",
  "metrics",
  "metrics-exporter-prometheus",
+ "parking_lot",
  "rand 0.8.5",
  "rcgen",
  "reqwest",
@@ -99,6 +103,7 @@ dependencies = [
  "rustls-native-certs",
  "rustls-pemfile",
  "serde",
+ "slab",
  "tokio",
  "tokio-rustls",
  "toml",
@@ -157,12 +162,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
+name = "clockpro-cache"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2009f347448d6c03472ac84e51a390c77ac8c1926c5a606ea18095b34d9c4e04"
+dependencies = [
+ "bitflags",
+ "slabigator",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75443c44cd6b379beb8c5b45d85d0773baf31cce901fe7bb252f4eff3008ef7d"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "coarsetime"
+version = "0.1.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e58eb270476aa4fc7843849f8a35063e8743b4dbcdf6dd0f8ea0886980c204c2"
+dependencies = [
+ "libc",
+ "wasix",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -768,6 +794,16 @@ checksum = "b49715b7073f385ba4bc528e5747d02e66cb39c6146efb66b781f131f0fb399c"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jumphash"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6cb1d4856e6c1b02aea6b85073b45daa15af1ba17f1750f8ca8772068915da0"
+dependencies = [
+ "rand 0.8.5",
+ "siphasher",
 ]
 
 [[package]]
@@ -1586,6 +1622,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "siphasher"
+version = "0.3.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38b58827f4464d87d377d175e90bf58eb00fd8716ff0a62f80356b5e61555d0d"
+
+[[package]]
 name = "sketches-ddsketch"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1596,6 +1638,12 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "slabigator"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "420cf8ae97042519eb6eceb15ab3a454c216dcd7655d4e14522488928793821f"
 
 [[package]]
 name = "smallvec"
@@ -2114,6 +2162,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5428f8bf88ea5ddc08faddef2ac4a67e390b88186c703ce6dbd955e1c145aca5"
 dependencies = [
  "wit-bindgen",
+]
+
+[[package]]
+name = "wasix"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1757e0d1f8456693c7e5c6c629bdb54884e032aa0bb53c155f6a39f94440d332"
+dependencies = [
+ "wasi",
 ]
 
 [[package]]
