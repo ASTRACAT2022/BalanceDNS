@@ -23,6 +23,11 @@ use crate::{
     upstream::{Balancer, TransportContext, UpstreamEndpointRef, UpstreamRef, UpstreamSet},
 };
 
+const MIN_TCP_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_TCP_CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const MIN_TCP_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_TCP_CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub struct UdpProxy {
     listen: SocketAddr,
     socket: Arc<UdpSocket>,
@@ -225,19 +230,25 @@ async fn handle_tcp_conn(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     metrics::counter!("dns_tcp_connections_total").increment(1);
+    let client_idle_timeout = tcp_client_idle_timeout(timeout);
+    let client_io_timeout = tcp_client_io_timeout(timeout);
     loop {
-        let msg = read_tcp_query(&mut client).await?;
+        let msg = match time::timeout(client_idle_timeout, read_tcp_query(&mut client)).await {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(err)) => return Err(err),
+            Err(_) => return Ok(()),
+        };
         metrics::counter!("dns_requests_total", "proto" => "tcp").increment(1);
         if let Some(resp) = maybe_refuse(&msg, &security) {
             metrics::counter!("dns_denied_total", "proto" => "tcp").increment(1);
-            write_tcp_response(&mut client, &resp).await?;
+            time::timeout(client_io_timeout, write_tcp_response(&mut client, &resp)).await??;
             continue;
         }
 
         if let Some(hosts) = &hosts {
             if let Some(resp) = hosts.maybe_answer(&msg) {
                 metrics::counter!("dns_hosts_hits_total", "proto" => "tcp").increment(1);
-                write_tcp_response(&mut client, &resp).await?;
+                time::timeout(client_io_timeout, write_tcp_response(&mut client, &resp)).await??;
                 continue;
             }
         }
@@ -246,7 +257,7 @@ async fn handle_tcp_conn(
             if bl.is_blocked(&msg) {
                 if let Some(resp) = dns::build_nxdomain_response(&msg) {
                     metrics::counter!("dns_blocked_total", "proto" => "tcp").increment(1);
-                    write_tcp_response(&mut client, &resp).await?;
+                    time::timeout(client_io_timeout, write_tcp_response(&mut client, &resp)).await??;
                     continue;
                 }
             }
@@ -260,7 +271,7 @@ async fn handle_tcp_conn(
                     if let Some(orig_id) = dns::read_id(&msg) {
                         dns::write_id(&mut resp, orig_id);
                     }
-                    write_tcp_response(&mut client, &resp).await?;
+                    time::timeout(client_io_timeout, write_tcp_response(&mut client, &resp)).await??;
                     continue;
                 }
             }
@@ -282,7 +293,7 @@ async fn handle_tcp_conn(
         }
 
         observe_tcp_latency(&upstream.name, upstream_proto, start);
-        write_tcp_response(&mut client, &resp).await?;
+        time::timeout(client_io_timeout, write_tcp_response(&mut client, &resp)).await??;
     }
 }
 
@@ -307,6 +318,20 @@ fn observe_udp_latency(upstream_name: &Arc<str>, start: Instant) {
         "upstream" => upstream_label
     )
     .record(latency_ms);
+}
+
+fn tcp_client_idle_timeout(request_timeout: Duration) -> Duration {
+    request_timeout
+        .saturating_mul(8)
+        .max(MIN_TCP_CLIENT_IDLE_TIMEOUT)
+        .min(MAX_TCP_CLIENT_IDLE_TIMEOUT)
+}
+
+fn tcp_client_io_timeout(request_timeout: Duration) -> Duration {
+    request_timeout
+        .saturating_mul(2)
+        .max(MIN_TCP_CLIENT_IO_TIMEOUT)
+        .min(MAX_TCP_CLIENT_IO_TIMEOUT)
 }
 
 async fn read_tcp_query(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
@@ -565,4 +590,17 @@ fn build_refused(packet: &[u8]) -> Vec<u8> {
     resp[10] = 0;
     resp[11] = 0;
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tcp_timeouts_have_safe_bounds() {
+        assert_eq!(tcp_client_idle_timeout(Duration::from_millis(100)), Duration::from_secs(5));
+        assert_eq!(tcp_client_idle_timeout(Duration::from_secs(20)), Duration::from_secs(60));
+        assert_eq!(tcp_client_io_timeout(Duration::from_millis(100)), Duration::from_secs(2));
+        assert_eq!(tcp_client_io_timeout(Duration::from_secs(20)), Duration::from_secs(15));
+    }
 }
