@@ -21,7 +21,7 @@ use crate::{
     cache::DnsCache,
     config::{SecurityConfig, TlsConfig},
     hosts_remote::HostsRemote,
-    proxy::{forward_candidates, maybe_refuse},
+    proxy::{forward_candidates, maybe_refuse, maybe_answer_local},
     tls,
     upstream::{Balancer, UpstreamSet},
 };
@@ -41,6 +41,7 @@ pub struct DotServer {
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
     request_timeout: Duration,
@@ -54,6 +55,7 @@ pub struct DohServer {
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
     request_timeout: Duration,
@@ -67,12 +69,14 @@ impl DotServer {
         balancer: Arc<Balancer>,
         security: SecurityConfig,
         hosts: Option<Arc<HostsRemote>>,
+        hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
         blocklist: Option<Arc<BlocklistRemote>>,
         cache: Option<Arc<DnsCache>>,
     ) -> anyhow::Result<Self> {
         let request_timeout = Duration::from_millis(security.request_timeout_ms);
         let listener = TcpListener::bind(listen).await?;
         let listen = listener.local_addr()?;
+
         Ok(Self {
             listen,
             listener,
@@ -81,6 +85,7 @@ impl DotServer {
             balancer,
             security,
             hosts,
+            hosts_local,
             blocklist,
             cache,
             request_timeout,
@@ -106,6 +111,7 @@ impl DotServer {
             let balancer = self.balancer.clone();
             let security = self.security.clone();
             let hosts = self.hosts.clone();
+            let hosts_local = self.hosts_local.clone();
             let blocklist = self.blocklist.clone();
             let cache = self.cache.clone();
             let timeout = self.request_timeout;
@@ -119,6 +125,7 @@ impl DotServer {
                     balancer,
                     security,
                     hosts,
+                    hosts_local,
                     blocklist,
                     cache,
                     timeout,
@@ -141,12 +148,14 @@ impl DohServer {
         balancer: Arc<Balancer>,
         security: SecurityConfig,
         hosts: Option<Arc<HostsRemote>>,
+        hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
         blocklist: Option<Arc<BlocklistRemote>>,
         cache: Option<Arc<DnsCache>>,
     ) -> anyhow::Result<Self> {
         let request_timeout = Duration::from_millis(security.request_timeout_ms);
         let listener = TcpListener::bind(listen).await?;
         let listen = listener.local_addr()?;
+
         Ok(Self {
             listen,
             listener,
@@ -155,6 +164,7 @@ impl DohServer {
             balancer,
             security,
             hosts,
+            hosts_local,
             blocklist,
             cache,
             request_timeout,
@@ -180,11 +190,12 @@ impl DohServer {
             let balancer = self.balancer.clone();
             let security = self.security.clone();
             let hosts = self.hosts.clone();
+            let hosts_local = self.hosts_local.clone();
             let blocklist = self.blocklist.clone();
             let cache = self.cache.clone();
             let timeout = self.request_timeout;
             tokio::spawn(async move {
-                if let Err(err) = handle_doh_conn(stream, peer, acceptor, upstreams, balancer, security, hosts, blocklist, cache, timeout).await {
+                if let Err(err) = handle_doh_conn(stream, peer, acceptor, upstreams, balancer, security, hosts, hosts_local, blocklist, cache, timeout).await {
                     tracing::debug!(peer = %peer, error = %err, "doh conn failed");
                 }
             });
@@ -200,6 +211,7 @@ async fn handle_dot_conn(
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
     timeout: Duration,
@@ -231,10 +243,21 @@ async fn handle_dot_conn(
             continue;
         }
 
+        if let Some(hl) = &hosts_local {
+            if let Some(resp) = maybe_answer_local(&msg, hl) {
+                metrics::counter!("dns_hosts_hits_total", "proto" => "dot", "source" => "local").increment(1);
+                let resp_len = resp.len() as u16;
+                tls.write_all(&resp_len.to_be_bytes()).await?;
+                tls.write_all(&resp).await?;
+                continue;
+            }
+        }
+
         if let Some(hosts) = &hosts {
             if let Some(resp) = hosts.maybe_answer(&msg) {
-                metrics::counter!("dns_hosts_hits_total", "proto" => "dot").increment(1);
-                tls.write_all(&(resp.len() as u16).to_be_bytes()).await?;
+                metrics::counter!("dns_hosts_hits_total", "proto" => "dot", "source" => "remote").increment(1);
+                let resp_len = resp.len() as u16;
+                tls.write_all(&resp_len.to_be_bytes()).await?;
                 tls.write_all(&resp).await?;
                 continue;
             }
@@ -260,7 +283,8 @@ async fn handle_dot_conn(
                     if let Some(orig_id) = crate::dns::read_id(&msg) {
                         crate::dns::write_id(&mut resp, orig_id);
                     }
-                    tls.write_all(&(resp.len() as u16).to_be_bytes()).await?;
+                    let resp_len = resp.len() as u16;
+                    tls.write_all(&resp_len.to_be_bytes()).await?;
                     tls.write_all(&resp).await?;
                     continue;
                 }
@@ -285,7 +309,8 @@ async fn handle_dot_conn(
                 }
                 
                 observe_latency("dot", &upstream.name, start);
-                tls.write_all(&(resp.len() as u16).to_be_bytes()).await?;
+                let resp_len = resp.len() as u16;
+                tls.write_all(&resp_len.to_be_bytes()).await?;
                 tls.write_all(&resp).await?;
             }
             Err(err) => {
@@ -304,6 +329,7 @@ async fn handle_doh_conn(
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
     timeout: Duration,
@@ -316,11 +342,12 @@ async fn handle_doh_conn(
         let balancer = balancer.clone();
         let security = security.clone();
         let hosts = hosts.clone();
+        let hosts_local = hosts_local.clone();
         let blocklist = blocklist.clone();
         let cache = cache.clone();
         async move {
             Ok::<_, std::convert::Infallible>(
-                handle_doh_request(req, upstreams, balancer, security, hosts, blocklist, cache, timeout).await,
+                handle_doh_request(req, upstreams, balancer, security, hosts, hosts_local, blocklist, cache, timeout).await,
             )
         }
     });
@@ -343,6 +370,7 @@ async fn handle_doh_request(
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
     timeout: Duration,
@@ -386,9 +414,16 @@ async fn handle_doh_request(
         return response_dns(resp);
     }
 
+    if let Some(hl) = &hosts_local {
+        if let Some(resp) = maybe_answer_local(&query, hl) {
+            metrics::counter!("dns_hosts_hits_total", "proto" => "doh", "source" => "local").increment(1);
+            return response_dns(resp);
+        }
+    }
+
     if let Some(hosts) = &hosts {
         if let Some(resp) = hosts.maybe_answer(&query) {
-            metrics::counter!("dns_hosts_hits_total", "proto" => "doh").increment(1);
+            metrics::counter!("dns_hosts_hits_total", "proto" => "doh", "source" => "remote").increment(1);
             return response_dns(resp);
         }
     }

@@ -89,6 +89,7 @@ async fn udp_proxy_roundtrip_preserves_id() {
         None,
         None,
         None,
+        None,
     )
         .await
         .unwrap();
@@ -151,6 +152,7 @@ async fn udp_proxy_denies_any_with_refused() {
         upstreams,
         balancer,
         security,
+        None,
         None,
         None,
         None,
@@ -248,6 +250,7 @@ async fn tcp_proxy_roundtrip_preserves_id() {
         None,
         None,
         None,
+        None,
     )
         .await
         .unwrap();
@@ -319,6 +322,7 @@ async fn udp_proxy_roundtrip_ipv6_if_available() {
         upstreams,
         balancer,
         security,
+        None,
         None,
         None,
         None,
@@ -443,6 +447,7 @@ async fn udp_proxy_roundtrip_via_doh_upstream() {
         None,
         None,
         None,
+        None,
     )
         .await
         .unwrap();
@@ -548,6 +553,7 @@ async fn udp_proxy_roundtrip_via_dot_upstream_insecure() {
         None,
         None,
         None,
+        None,
     )
         .await
         .unwrap();
@@ -641,6 +647,7 @@ async fn udp_proxy_retries_next_upstream_after_timeout() {
         upstreams,
         balancer,
         security,
+        None,
         None,
         None,
         None,
@@ -752,6 +759,7 @@ async fn udp_proxy_falls_back_to_tcp_when_udp_response_is_truncated() {
         upstreams,
         balancer,
         security,
+        None,
         None,
         None,
         None,
@@ -870,6 +878,7 @@ async fn udp_proxy_does_not_wait_for_cumulative_upstream_timeouts() {
         upstreams,
         balancer,
         security,
+        None,
         None,
         None,
         None,
