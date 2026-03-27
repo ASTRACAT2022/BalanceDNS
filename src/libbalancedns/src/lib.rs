@@ -122,6 +122,15 @@ pub struct BalanceDNS;
 
 impl BalanceDNS {
     fn privileges_drop(config: &Config) {
+        let is_root = nix::unistd::geteuid() == 0;
+        if !is_root {
+            if config.user.is_some() || config.group.is_some() || config.chroot_dir.is_some() {
+                warn!(
+                    "Skipping internal privilege drop because the process is already running as an unprivileged user"
+                );
+            }
+            return;
+        }
         let mut pd = PrivDrop::default();
         if let Some(ref user) = config.user {
             pd = pd.user(user).expect("User not found");
