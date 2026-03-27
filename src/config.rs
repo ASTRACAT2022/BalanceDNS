@@ -10,6 +10,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub cache: CacheConfig,
     pub hosts_remote: Option<HostsRemoteConfig>,
+    #[serde(default)]
+    pub hosts_local: std::collections::HashMap<String, String>,
     pub blocklist_remote: Option<BlocklistRemoteConfig>,
     pub balancing: BalancingConfig,
     pub security: SecurityConfig,
@@ -351,6 +353,7 @@ mod tests {
             tls: TlsConfig::default(),
             cache: CacheConfig::default(),
             hosts_remote: None,
+            hosts_local: std::collections::HashMap::new(),
             blocklist_remote: None,
             balancing: BalancingConfig {
                 algorithm: BalancingAlgorithm::RoundRobin,

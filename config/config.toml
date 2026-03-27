@@ -14,10 +14,19 @@ algorithm = "round_robin"
 [security]
 deny_any = true
 deny_dnskey = true
-request_timeout_ms = 1500
+request_timeout_ms = 3000
+
+[cache]
+enabled = true
+max_size = 20000
+ttl_seconds = 600
 
 [metrics]
 listen = "127.0.0.1:9100"
+
+[hosts_local]
+# Local overrides can be added here, e.g.:
+# "example.com." = "1.2.3.4"
 
 [hosts_remote]
 url = "https://raw.githubusercontent.com/ASTRACAT2022/host-DNS/refs/heads/main/bypass"
@@ -29,15 +38,29 @@ url = "https://raw.githubusercontent.com/Zalexanninev15/NoADS_RU/main/ads_list.t
 refresh_seconds = 300
 
 [[upstreams]]
-name = "google-8.8.8.8"
+name = "cloudflare-doh"
+proto = "doh"
+url = "https://1.1.1.1/dns-query"
+pool = "default"
+weight = 5
+
+[[upstreams]]
+name = "google-doh"
+proto = "doh"
+url = "https://8.8.8.8/dns-query"
+pool = "default"
+weight = 5
+
+[[upstreams]]
+name = "cloudflare-udp"
 proto = "udp"
-addr = "8.8.8.8:53"
+addr = "1.1.1.1:53"
 pool = "default"
 weight = 1
 
 [[upstreams]]
-name = "google-8.8.4.4"
+name = "google-udp"
 proto = "udp"
-addr = "8.8.4.4:53"
+addr = "8.8.8.8:53"
 pool = "default"
 weight = 1

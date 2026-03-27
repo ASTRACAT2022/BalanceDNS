@@ -30,6 +30,7 @@ pub struct UpstreamRef {
     pub pool: Arc<str>,
     pub endpoint: UpstreamEndpointRef,
     pub transport: Arc<TransportContext>,
+    pub weight: u32,
 }
 
 struct Upstream {
@@ -38,6 +39,7 @@ struct Upstream {
     endpoint: UpstreamEndpoint,
     alive: AtomicBool,
     consecutive_failures: AtomicU64,
+    weight: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +115,7 @@ impl UpstreamSet {
                     endpoint,
                     alive: AtomicBool::new(true),
                     consecutive_failures: AtomicU64::new(0),
+                    weight: c.weight.max(1),
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -129,7 +132,7 @@ impl UpstreamSet {
     }
 
     pub fn candidates(&self, pool: &str, balancer: &Balancer, client_ip: Option<IpAddr>) -> Vec<UpstreamRef> {
-        let alive: Vec<usize> = self
+        let alive_indices: Vec<usize> = self
             .upstreams
             .iter()
             .enumerate()
@@ -138,7 +141,7 @@ impl UpstreamSet {
             .map(|(idx, _)| idx)
             .collect();
 
-        let unhealthy: Vec<usize> = self
+        let unhealthy_indices: Vec<usize> = self
             .upstreams
             .iter()
             .enumerate()
@@ -147,8 +150,17 @@ impl UpstreamSet {
             .map(|(idx, _)| idx)
             .collect();
 
-        let mut eligible = ordered_candidates(&alive, balancer, client_ip);
-        eligible.extend(ordered_candidates(&unhealthy, balancer, client_ip));
+        let mut eligible = Vec::with_capacity(alive_indices.len() + unhealthy_indices.len());
+
+        if !alive_indices.is_empty() {
+            let weights: Vec<u32> = alive_indices.iter().map(|&i| self.upstreams[i].weight).collect();
+            eligible.extend(ordered_candidates_weighted(&alive_indices, &weights, balancer, client_ip));
+        }
+
+        if !unhealthy_indices.is_empty() {
+            let weights: Vec<u32> = unhealthy_indices.iter().map(|&i| self.upstreams[i].weight).collect();
+            eligible.extend(ordered_candidates_weighted(&unhealthy_indices, &weights, balancer, client_ip));
+        }
 
         if eligible.is_empty() {
             return Vec::new();
@@ -251,6 +263,7 @@ impl UpstreamSet {
             pool: u.pool.clone(),
             endpoint: u.endpoint.as_ref(),
             transport: self.transport.clone(),
+            weight: u.weight,
         }
     }
 }
@@ -268,12 +281,23 @@ impl Balancer {
         }
     }
 
-    pub fn pick(&self, eligible_indices: &[usize], _client_ip: Option<IpAddr>) -> usize {
+    pub fn pick_weighted(&self, indices: &[usize], weights: &[u32]) -> usize {
         match self.algorithm {
             BalancingAlgorithm::RoundRobin => {
-                let n = eligible_indices.len() as u64;
-                let idx = self.rr.fetch_add(1, Ordering::Relaxed) % n;
-                eligible_indices[idx as usize]
+                let total_weight: u32 = weights.iter().sum();
+                if total_weight == 0 {
+                    return indices[0];
+                }
+                let count = self.rr.fetch_add(1, Ordering::Relaxed);
+                let mut val = (count % total_weight as u64) as u32;
+
+                for (i, &weight) in weights.iter().enumerate() {
+                    if val < weight {
+                        return indices[i];
+                    }
+                    val -= weight;
+                }
+                indices[0]
             }
         }
     }
@@ -307,16 +331,17 @@ fn update_health_state(prev_alive: bool, failures: &AtomicU64, probe_ok: bool) -
     (false, failure_count)
 }
 
-fn ordered_candidates(
+fn ordered_candidates_weighted(
     indices: &[usize],
+    weights: &[u32],
     balancer: &Balancer,
-    client_ip: Option<IpAddr>,
+    _client_ip: Option<IpAddr>,
 ) -> Vec<usize> {
     if indices.is_empty() {
         return Vec::new();
     }
 
-    let start_idx = balancer.pick(indices, client_ip);
+    let start_idx = balancer.pick_weighted(indices, weights);
     let start_pos = indices.iter().position(|idx| *idx == start_idx).unwrap_or(0);
 
     indices
@@ -540,8 +565,8 @@ mod tests {
     #[test]
     fn ordered_candidates_append_unhealthy_after_alive() {
         let balancer = Balancer::new(BalancingAlgorithm::RoundRobin);
-        assert_eq!(ordered_candidates(&[1, 2], &balancer, None), vec![1, 2]);
-        assert_eq!(ordered_candidates(&[3, 4], &balancer, None), vec![4, 3]);
+        assert_eq!(ordered_candidates_weighted(&[1, 2], &[1, 1], &balancer, None), vec![1, 2]);
+        assert_eq!(ordered_candidates_weighted(&[3, 4], &[1, 1], &balancer, None), vec![4, 3]);
     }
 }
 

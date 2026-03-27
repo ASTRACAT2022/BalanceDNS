@@ -66,12 +66,19 @@ pub async fn run() -> anyhow::Result<()> {
         None
     };
 
+    let hosts_local = if config.hosts_local.is_empty() {
+        None
+    } else {
+        Some(Arc::new(config.hosts_local.clone()))
+    };
+
     let udp_proxy = UdpProxy::new(
         config.server.udp_listen,
         upstreams.clone(),
         balancer.clone(),
         config.security.clone(),
         hosts.clone(),
+        hosts_local.clone(),
         blocklist.clone(),
         cache.clone(),
     )
@@ -83,6 +90,7 @@ pub async fn run() -> anyhow::Result<()> {
         balancer.clone(),
         config.security.clone(),
         hosts.clone(),
+        hosts_local.clone(),
         blocklist.clone(),
         cache.clone(),
     )
@@ -97,6 +105,7 @@ pub async fn run() -> anyhow::Result<()> {
         balancer.clone(),
         config.security.clone(),
         hosts.clone(),
+        hosts_local.clone(),
         blocklist.clone(),
         cache.clone(),
     )
@@ -108,6 +117,7 @@ pub async fn run() -> anyhow::Result<()> {
         balancer.clone(),
         config.security.clone(),
         hosts.clone(),
+        hosts_local.clone(),
         blocklist.clone(),
         cache.clone(),
     )

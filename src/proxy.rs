@@ -35,6 +35,7 @@ pub struct UdpProxy {
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
     request_timeout: Duration,
@@ -47,6 +48,7 @@ pub struct TcpProxy {
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
     request_timeout: Duration,
@@ -59,6 +61,7 @@ impl UdpProxy {
         balancer: Arc<Balancer>,
         security: SecurityConfig,
         hosts: Option<Arc<HostsRemote>>,
+        hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
         blocklist: Option<Arc<BlocklistRemote>>,
         cache: Option<Arc<DnsCache>>,
     ) -> anyhow::Result<Self> {
@@ -73,6 +76,7 @@ impl UdpProxy {
             balancer,
             security,
             hosts,
+            hosts_local,
             blocklist,
             cache,
             request_timeout,
@@ -94,9 +98,17 @@ impl UdpProxy {
                 continue;
             }
 
+            if let Some(hl) = &self.hosts_local {
+                if let Some(resp) = maybe_answer_local(packet, hl) {
+                    metrics::counter!("dns_hosts_hits_total", "proto" => "udp", "source" => "local").increment(1);
+                    let _ = self.socket.send_to(&resp, client).await;
+                    continue;
+                }
+            }
+
             if let Some(hosts) = &self.hosts {
                 if let Some(resp) = hosts.maybe_answer(packet) {
-                    metrics::counter!("dns_hosts_hits_total", "proto" => "udp").increment(1);
+                    metrics::counter!("dns_hosts_hits_total", "proto" => "udp", "source" => "remote").increment(1);
                     let _ = self.socket.send_to(&resp, client).await;
                     continue;
                 }
@@ -174,6 +186,7 @@ impl TcpProxy {
         balancer: Arc<Balancer>,
         security: SecurityConfig,
         hosts: Option<Arc<HostsRemote>>,
+        hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
         blocklist: Option<Arc<BlocklistRemote>>,
         cache: Option<Arc<DnsCache>>,
     ) -> anyhow::Result<Self> {
@@ -187,6 +200,7 @@ impl TcpProxy {
             balancer,
             security,
             hosts,
+            hosts_local,
             blocklist,
             cache,
             request_timeout,
@@ -201,12 +215,13 @@ impl TcpProxy {
             let balancer = self.balancer.clone();
             let security = self.security.clone();
             let hosts = self.hosts.clone();
+            let hosts_local = self.hosts_local.clone();
             let blocklist = self.blocklist.clone();
             let cache = self.cache.clone();
             let timeout = self.request_timeout;
 
             tokio::spawn(async move {
-                if let Err(err) = handle_tcp_conn(stream, peer, upstreams, balancer, security, hosts, blocklist, cache, timeout).await {
+                if let Err(err) = handle_tcp_conn(stream, peer, upstreams, balancer, security, hosts, hosts_local, blocklist, cache, timeout).await {
                     tracing::debug!(peer = %peer, error = %err, "tcp conn failed");
                 }
             });
@@ -225,6 +240,7 @@ async fn handle_tcp_conn(
     balancer: Arc<Balancer>,
     security: SecurityConfig,
     hosts: Option<Arc<HostsRemote>>,
+    hosts_local: Option<Arc<std::collections::HashMap<String, String>>>,
     blocklist: Option<Arc<BlocklistRemote>>,
     cache: Option<Arc<DnsCache>>,
     timeout: Duration,
@@ -245,9 +261,17 @@ async fn handle_tcp_conn(
             continue;
         }
 
+        if let Some(hl) = &hosts_local {
+            if let Some(resp) = maybe_answer_local(&msg, hl) {
+                metrics::counter!("dns_hosts_hits_total", "proto" => "tcp", "source" => "local").increment(1);
+                time::timeout(client_io_timeout, write_tcp_response(&mut client, &resp)).await??;
+                continue;
+            }
+        }
+
         if let Some(hosts) = &hosts {
             if let Some(resp) = hosts.maybe_answer(&msg) {
-                metrics::counter!("dns_hosts_hits_total", "proto" => "tcp").increment(1);
+                metrics::counter!("dns_hosts_hits_total", "proto" => "tcp", "source" => "remote").increment(1);
                 time::timeout(client_io_timeout, write_tcp_response(&mut client, &resp)).await??;
                 continue;
             }
@@ -284,7 +308,8 @@ async fn handle_tcp_conn(
         }
 
         let start = Instant::now();
-        let (upstream, resp, upstream_proto) = forward_candidates(&candidates, &msg, timeout).await?;
+        // For TCP, we use specialized forwarder as it needs new connections
+        let (upstream, resp, upstream_proto) = forward_candidates_tcp(&candidates, &msg, timeout).await?;
         if let Some(cache) = &cache {
             if let Some((domain, qtype, _qclass)) = dns::read_qname_qtype_qclass(&msg) {
                 let ttl = dns::extract_min_ttl(&resp).unwrap_or(Duration::from_secs(300));
@@ -307,6 +332,39 @@ fn observe_tcp_latency(upstream_name: &Arc<str>, upstream_proto: &'static str, s
         "upstream_proto" => upstream_proto
     )
     .record(latency_ms);
+}
+
+pub(crate) fn maybe_answer_local(
+    query: &[u8],
+    hosts_local: &std::collections::HashMap<String, String>,
+) -> Option<Vec<u8>> {
+    let (name, qtype, qclass) = dns::read_qname_qtype_qclass(query)?;
+    if qclass != 1 {
+        return None;
+    }
+
+    let ip_str = hosts_local.get(name.as_str())?;
+    let ip = ip_str.parse::<std::net::IpAddr>().ok()?;
+
+    let answers = match qtype {
+        1 => {
+            if let std::net::IpAddr::V4(v4) = ip {
+                dns::Answers::A(vec![v4])
+            } else {
+                return None;
+            }
+        }
+        28 => {
+            if let std::net::IpAddr::V6(v6) = ip {
+                dns::Answers::AAAA(vec![v6])
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    dns::build_answer_response(query, &name, qtype, answers, 60)
 }
 
 fn observe_udp_latency(upstream_name: &Arc<str>, start: Instant) {
@@ -400,10 +458,61 @@ pub(crate) async fn forward_candidates(
     }
 
     let mut tasks = JoinSet::new();
-    for candidate in candidates.iter().cloned() {
+    // Limit to top 3 candidates for efficiency
+    for candidate in candidates.iter().take(3).cloned() {
         let query = query.to_vec();
         tasks.spawn(async move {
             let result = forward_candidate(&candidate, &query, timeout).await;
+            (candidate, result)
+        });
+    }
+
+    let mut last_error = None;
+    let mut first_negative_resp = None;
+
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((candidate, Ok((resp, upstream_proto)))) => {
+                if is_positive_response(&resp) {
+                    tasks.abort_all();
+                    return Ok((candidate, resp, upstream_proto));
+                } else if is_valid_response(&resp) && first_negative_resp.is_none() {
+                    first_negative_resp = Some((candidate, resp, upstream_proto));
+                }
+            }
+            Ok((candidate, Err(err))) => {
+                tracing::debug!(upstream = %candidate.name, error = %err, "upstream attempt failed");
+                last_error = Some(err);
+            }
+            Err(err) => {
+                last_error = Some(anyhow::anyhow!("upstream task failed: {}", err));
+            }
+        }
+    }
+
+    if let Some(neg) = first_negative_resp {
+        return Ok(neg);
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no upstream candidates")))
+}
+
+pub(crate) async fn forward_candidates_tcp(
+    candidates: &[UpstreamRef],
+    query: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<(UpstreamRef, Vec<u8>, &'static str)> {
+    if candidates.is_empty() {
+        return Err(anyhow::anyhow!("no upstream candidates"));
+    }
+
+    let mut tasks = JoinSet::new();
+    for candidate in candidates.iter().take(3).cloned() {
+        let query = query.to_vec();
+        tasks.spawn(async move {
+            // TCP/DoT/DoH always create new connections or use connection pools,
+            // so they don't need shared UDP sockets.
+            let result = forward_candidate_tcp_aware(&candidate, &query, timeout).await;
             (candidate, result)
         });
     }
@@ -466,6 +575,37 @@ async fn forward_candidate(
         )),
     }
 }
+
+async fn forward_candidate_tcp_aware(
+    candidate: &UpstreamRef,
+    query: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<(Vec<u8>, &'static str)> {
+    match &candidate.endpoint {
+        UpstreamEndpointRef::Udp { addr } => {
+            let resp = forward_udp_once(*addr, query, timeout).await?;
+            if dns::is_truncated_response(&resp) {
+                let tcp_resp = forward_tcp_once(*addr, query, timeout).await?;
+                return Ok((tcp_resp, "tcp"));
+            }
+            Ok((resp, "udp"))
+        }
+        UpstreamEndpointRef::Tcp { addr } => Ok((forward_tcp_once(*addr, query, timeout).await?, "tcp")),
+        UpstreamEndpointRef::Dot {
+            addr,
+            server_name,
+            tls_insecure,
+        } => Ok((
+            forward_dot_once(&candidate.transport, *addr, server_name, *tls_insecure, query, timeout).await?,
+            "dot",
+        )),
+        UpstreamEndpointRef::Doh { url, tls_insecure } => Ok((
+            forward_doh_once(&candidate.transport, url, *tls_insecure, query, timeout).await?,
+            "doh",
+        )),
+    }
+}
+
 
 async fn forward_udp_once(addr: SocketAddr, query: &[u8], timeout: Duration) -> anyhow::Result<Vec<u8>> {
     let bind_addr = match addr {
