@@ -13,6 +13,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration as StdDuration;
 use url::Url;
@@ -102,32 +103,59 @@ impl BalanceDnsRuntime {
 
     fn spawn_udp_listener(self: &Arc<Self>, listen_addr: String) -> io::Result<thread::JoinHandle<()>> {
         let socket = UdpSocket::bind(&listen_addr)?;
+        let sender_socket = socket.try_clone()?;
+        let default_workers = thread::available_parallelism()
+            .map(|parallelism| parallelism.get())
+            .unwrap_or(4)
+            .min(8);
+        let worker_count = if self.config.udp_acceptor_threads > 1 {
+            self.config.udp_acceptor_threads
+        } else {
+            default_workers.max(2)
+        };
+        let (tx, rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>();
+        let rx = Arc::new(Mutex::new(rx));
+        for worker_id in 0..worker_count {
+            let runtime = self.clone();
+            let socket = sender_socket.try_clone()?;
+            let rx = rx.clone();
+            thread::Builder::new()
+                .name(format!("balancedns_udp_worker_{}", worker_id))
+                .spawn(move || loop {
+                    let (addr, packet) = match rx.lock().recv() {
+                        Ok(job) => job,
+                        Err(_) => break,
+                    };
+                    runtime.varz.client_queries.inc();
+                    runtime.varz.client_queries_udp.inc();
+                    match runtime.process_query(&packet) {
+                        Ok(response) => {
+                            let _ = socket.send_to(&response, addr);
+                        }
+                        Err(err) => {
+                            runtime.varz.client_queries_errors.inc();
+                            debug!("UDP query failed from {}: {}", addr, err);
+                        }
+                    }
+                })
+                .unwrap();
+        }
         info!("UDP listener is ready on {}", listen_addr);
         thread::Builder::new()
             .name("balancedns_udp".to_string())
-            .spawn({
-                let runtime = self.clone();
-                move || {
-                    let mut buf = [0u8; 65535];
-                    loop {
-                        match socket.recv_from(&mut buf) {
-                            Ok((len, addr)) => {
-                                runtime.varz.client_queries.inc();
-                                runtime.varz.client_queries_udp.inc();
-                                let response = runtime.process_query(&buf[..len]);
-                                match response {
-                                    Ok(response) => {
-                                        let _ = socket.send_to(&response, addr);
-                                    }
-                                    Err(err) => {
-                                        runtime.varz.client_queries_errors.inc();
-                                        debug!("UDP query failed from {}: {}", addr, err);
-                                    }
-                                }
+            .spawn(move || {
+                let mut buf = [0u8; 65535];
+                loop {
+                    match socket.recv_from(&mut buf) {
+                        Ok((len, addr)) => {
+                            let packet = buf[..len].to_vec();
+                            if tx.send((addr, packet)).is_err() {
+                                error!("UDP worker queue unexpectedly closed on {}", listen_addr);
+                                break;
                             }
-                            Err(err) => {
-                                error!("UDP listener error on {}: {}", listen_addr, err);
-                            }
+                        }
+                        Err(err) => {
+                            error!("UDP listener error on {}: {}", listen_addr, err);
                         }
                     }
                 }
