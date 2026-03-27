@@ -34,7 +34,6 @@ extern crate rustls;
 extern crate rustls_pemfile;
 extern crate siphasher;
 extern crate slab;
-extern crate socket_priority;
 extern crate tokio_core;
 #[macro_use]
 extern crate tokio_io;

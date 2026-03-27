@@ -699,7 +699,6 @@ dependencies = [
  "rustls-pemfile",
  "siphasher 0.3.0",
  "slab 0.4.2",
- "socket-priority",
  "tokio-core",
  "tokio-io",
  "tokio-timer 0.1.2",
@@ -1429,15 +1428,6 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
-
-[[package]]
-name = "socket-priority"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9fe703d8a26b22004ba862f96ff8022dd90db992eb9508b63e16354b5fd4e7ba"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "spin"
