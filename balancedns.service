@@ -1,0 +1,13 @@
+[Unit]
+Description=BalanceDNS DNS proxy
+After=network.target
+Before=nss-lookup.target
+
+[Install]
+WantedBy=multi-user.target
+
+[Service]
+Type=simple
+Restart=always
+
+ExecStart=/usr/sbin/balancedns --config /etc/balancedns.toml
