@@ -167,6 +167,13 @@ impl Varz {
             .unwrap(),
         }
     }
+
+    pub fn snapshot(&self) {
+        let StartInstant(start_instant) = self.start_instant;
+        self.uptime.set(start_instant.elapsed().as_secs() as f64);
+        let client_queries = self.client_queries_udp.get() + self.client_queries_tcp.get();
+        self.client_queries.set(client_queries);
+    }
 }
 
 impl Default for Varz {

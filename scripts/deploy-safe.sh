@@ -17,6 +17,8 @@ RESTART_SERVICE="${RESTART_SERVICE:-1}"
 PREVIOUS_HEAD=""
 ROLLBACK_DIR=""
 DEPLOY_PHASE="prepare"
+PLUGIN_NAMES=()
+PLUGIN_MANIFESTS=()
 
 log() {
     printf '[deploy] %s\n' "$*"
@@ -46,6 +48,15 @@ ensure_clean_repo() {
     fi
 }
 
+register_plugin() {
+    local plugin_name="$1"
+    local manifest_path="$2"
+    if [ -f "${manifest_path}" ]; then
+        PLUGIN_NAMES+=("${plugin_name}")
+        PLUGIN_MANIFESTS+=("${manifest_path}")
+    fi
+}
+
 rollback() {
     if [ "${DEPLOY_PHASE}" != "install" ] || [ -z "${ROLLBACK_DIR}" ] || [ ! -d "${ROLLBACK_DIR}" ]; then
         return
@@ -57,7 +68,7 @@ rollback() {
         rm -f "${BINARY_PATH}"
     fi
     mkdir -p "${PLUGIN_DIR}"
-    for plugin_name in libbalancedns_remote_hosts_plugin libbalancedns_adblock_plugin; do
+    for plugin_name in "${PLUGIN_NAMES[@]}"; do
         if [ -f "${ROLLBACK_DIR}/${plugin_name}.previous" ]; then
             install -m 0644 "${ROLLBACK_DIR}/${plugin_name}.previous" "${PLUGIN_DIR}/${plugin_name}.${LIB_EXT}"
         else
@@ -91,6 +102,9 @@ LIB_EXT="$(detect_lib_ext)"
 [ -d "${REPO_DIR}" ] || fail "repo dir not found: ${REPO_DIR}"
 [ -f "${REPO_DIR}/Cargo.toml" ] || fail "Cargo.toml not found in ${REPO_DIR}"
 
+register_plugin "libbalancedns_remote_hosts_plugin" "${REPO_DIR}/plugins/remote-hosts-plugin/Cargo.toml"
+register_plugin "libbalancedns_adblock_plugin" "${REPO_DIR}/plugins/adblock-plugin/Cargo.toml"
+
 PREVIOUS_HEAD="$(git -C "${REPO_DIR}" rev-parse --verify HEAD 2>/dev/null || true)"
 
 ensure_clean_repo
@@ -110,8 +124,9 @@ log "building release binary"
 cargo build --release --manifest-path "${REPO_DIR}/Cargo.toml"
 
 log "building plugins"
-cargo build --release --manifest-path "${REPO_DIR}/plugins/remote-hosts-plugin/Cargo.toml"
-cargo build --release --manifest-path "${REPO_DIR}/plugins/adblock-plugin/Cargo.toml"
+for manifest_path in "${PLUGIN_MANIFESTS[@]}"; do
+    cargo build --release --manifest-path "${manifest_path}"
+done
 
 if [ "${RUN_TESTS}" = "1" ]; then
     log "running tests"
@@ -125,7 +140,7 @@ if [ -f "${BINARY_PATH}" ]; then
 fi
 
 mkdir -p "${PLUGIN_DIR}"
-for plugin_name in libbalancedns_remote_hosts_plugin libbalancedns_adblock_plugin; do
+for plugin_name in "${PLUGIN_NAMES[@]}"; do
     if [ -f "${PLUGIN_DIR}/${plugin_name}.${LIB_EXT}" ]; then
         cp -p "${PLUGIN_DIR}/${plugin_name}.${LIB_EXT}" "${ROLLBACK_DIR}/${plugin_name}.previous"
     fi
@@ -142,19 +157,12 @@ install -m 0755 "${REPO_DIR}/target/release/balancedns" "${BINARY_PATH}.new"
 mv -f "${BINARY_PATH}.new" "${BINARY_PATH}"
 
 log "installing plugins"
-install -m 0644 \
-    "${REPO_DIR}/plugins/remote-hosts-plugin/target/release/libbalancedns_remote_hosts_plugin.${LIB_EXT}" \
-    "${PLUGIN_DIR}/libbalancedns_remote_hosts_plugin.${LIB_EXT}.new"
-mv -f \
-    "${PLUGIN_DIR}/libbalancedns_remote_hosts_plugin.${LIB_EXT}.new" \
-    "${PLUGIN_DIR}/libbalancedns_remote_hosts_plugin.${LIB_EXT}"
-
-install -m 0644 \
-    "${REPO_DIR}/plugins/adblock-plugin/target/release/libbalancedns_adblock_plugin.${LIB_EXT}" \
-    "${PLUGIN_DIR}/libbalancedns_adblock_plugin.${LIB_EXT}.new"
-mv -f \
-    "${PLUGIN_DIR}/libbalancedns_adblock_plugin.${LIB_EXT}.new" \
-    "${PLUGIN_DIR}/libbalancedns_adblock_plugin.${LIB_EXT}"
+for plugin_name in "${PLUGIN_NAMES[@]}"; do
+    plugin_output="$(find "${REPO_DIR}/plugins" -path "*/target/release/${plugin_name}.${LIB_EXT}" -print -quit)"
+    [ -n "${plugin_output}" ] || fail "built plugin not found: ${plugin_name}.${LIB_EXT}"
+    install -m 0644 "${plugin_output}" "${PLUGIN_DIR}/${plugin_name}.${LIB_EXT}.new"
+    mv -f "${PLUGIN_DIR}/${plugin_name}.${LIB_EXT}.new" "${PLUGIN_DIR}/${plugin_name}.${LIB_EXT}"
+done
 
 if [ "${DEPLOY_CONFIG}" = "1" ]; then
     [ -f "${CONFIG_SOURCE}" ] || fail "config source not found: ${CONFIG_SOURCE}"

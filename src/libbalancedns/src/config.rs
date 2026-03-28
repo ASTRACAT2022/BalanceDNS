@@ -1,11 +1,17 @@
 use coarsetime::Duration;
-use resolver::LoadBalancingMode;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
 use toml;
+
+#[derive(Clone, Copy, Debug)]
+pub enum LoadBalancingMode {
+    Fallback,
+    Uniform,
+    P2,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UpstreamProtocol {

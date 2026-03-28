@@ -1,10 +1,13 @@
 use base64;
+use base64::Engine;
 use cache::Cache;
 use config::{Config, UpstreamConfig, UpstreamProtocol};
 use dns;
 use parking_lot::{Mutex, RwLock};
 use plugins::{PacketAction, PluginManager};
 use prometheus::{Encoder, TextEncoder};
+use reqwest::blocking::Client;
+use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use rustls::{Certificate, PrivateKey, ServerConfig, ServerConnection, StreamOwned};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use std::collections::{HashMap, HashSet};
@@ -28,6 +31,7 @@ pub struct BalanceDnsRuntime {
     plugins: PluginManager,
     rr_counter: AtomicUsize,
     varz: Arc<Varz>,
+    http_client: Client,
 }
 
 impl BalanceDnsRuntime {
@@ -37,6 +41,10 @@ impl BalanceDnsRuntime {
             .iter()
             .filter_map(|(name, ip)| ip.parse().ok().map(|ip| (name.clone(), ip)))
             .collect::<HashMap<String, IpAddr>>();
+        let http_client = Client::builder()
+            .timeout(StdDuration::from_millis(config.request_timeout_ms))
+            .build()
+            .expect("Unable to initialize HTTP client");
         Arc::new(BalanceDnsRuntime {
             cache: Mutex::new(Cache::new(config.clone())),
             config: config.clone(),
@@ -46,6 +54,7 @@ impl BalanceDnsRuntime {
             plugins: PluginManager::from_paths(&config.plugin_libraries),
             rr_counter: AtomicUsize::new(0),
             varz,
+            http_client,
         })
     }
 
@@ -259,15 +268,17 @@ impl BalanceDnsRuntime {
                 move || loop {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
-                            runtime.update_cache_metrics();
-                            let mut metrics = Vec::new();
-                            let encoder = TextEncoder::new();
-                            let status = match encoder.encode(&prometheus::gather(), &mut metrics) {
-                                Ok(_) => ("200 OK", metrics),
-                                Err(err) => ("500 Internal Server Error", err.to_string().into_bytes()),
-                            };
-                            let content_type = encoder.format_type();
-                            let _ = write_http_response(&mut stream, status.0, content_type, &status.1);
+                            if let Err(err) = runtime.handle_metrics_session(&mut stream) {
+                                if err.kind() != io::ErrorKind::UnexpectedEof {
+                                    debug!("Metrics session failed on {}: {}", listen_addr, err);
+                                    let _ = write_http_response(
+                                        &mut stream,
+                                        "400 Bad Request",
+                                        "text/plain; charset=utf-8",
+                                        err.to_string().as_bytes(),
+                                    );
+                                }
+                            }
                         }
                         Err(err) => error!("Metrics accept error on {}: {}", listen_addr, err),
                     }
@@ -305,6 +316,15 @@ impl BalanceDnsRuntime {
 
     fn handle_doh_session<S: Read + Write>(&self, stream: &mut S) -> io::Result<()> {
         let request = read_http_request(stream)?;
+        if http_target_path(&request.target)? != "/dns-query" {
+            write_http_response(
+                stream,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                b"not found",
+            )?;
+            return Ok(());
+        }
         let body = match request.method.as_str() {
             "GET" => parse_doh_get_request(&request.target)?,
             "POST" => {
@@ -417,6 +437,46 @@ impl BalanceDnsRuntime {
         Ok(response)
     }
 
+    fn handle_metrics_session<S: Read + Write>(&self, stream: &mut S) -> io::Result<()> {
+        let request = read_http_request(stream)?;
+        if request.method != "GET" && request.method != "HEAD" {
+            write_http_response(
+                stream,
+                "405 Method Not Allowed",
+                "text/plain; charset=utf-8",
+                b"method not allowed",
+            )?;
+            return Ok(());
+        }
+        if http_target_path(&request.target)? != "/metrics" {
+            write_http_response(
+                stream,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                b"not found",
+            )?;
+            return Ok(());
+        }
+        self.snapshot_metrics();
+        let mut metrics = Vec::new();
+        let encoder = TextEncoder::new();
+        match encoder.encode(&prometheus::gather(), &mut metrics) {
+            Ok(_) => {
+                if request.method == "HEAD" {
+                    write_http_response(stream, "200 OK", encoder.format_type(), b"")
+                } else {
+                    write_http_response(stream, "200 OK", encoder.format_type(), &metrics)
+                }
+            }
+            Err(err) => write_http_response(
+                stream,
+                "500 Internal Server Error",
+                "text/plain; charset=utf-8",
+                err.to_string().as_bytes(),
+            ),
+        }
+    }
+
     fn resolve_via_upstreams(&self, normalized_question: &dns::NormalizedQuestion) -> io::Result<Vec<u8>> {
         let (query_packet, upstream_question) = dns::build_query_packet(normalized_question, false)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -505,16 +565,19 @@ impl BalanceDnsRuntime {
             .url
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing upstream url"))?;
-        let response = ureq::post(url)
-            .timeout(StdDuration::from_millis(self.config.request_timeout_ms))
-            .set("accept", "application/dns-message")
-            .set("content-type", "application/dns-message")
-            .send_bytes(query_packet)
+        let response = self
+            .http_client
+            .post(url)
+            .header(ACCEPT, "application/dns-message")
+            .header(CONTENT_TYPE, "application/dns-message")
+            .body(query_packet.to_vec())
+            .send()
+            .and_then(|response| response.error_for_status())
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
-        let mut reader = response.into_reader();
-        let mut body = Vec::new();
-        reader.read_to_end(&mut body)?;
-        Ok(body)
+        response
+            .bytes()
+            .map(|body| body.to_vec())
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
     }
 
     fn ordered_upstreams(&self) -> Vec<UpstreamConfig> {
@@ -564,7 +627,7 @@ impl BalanceDnsRuntime {
             None => return,
         };
         loop {
-            match fetch_text(&config.url, self.config.request_timeout_ms) {
+            match fetch_text(&self.http_client, &config.url) {
                 Ok(body) => {
                     let hosts = parse_hosts_mapping(&body);
                     *self.remote_hosts.write() = hosts;
@@ -582,7 +645,7 @@ impl BalanceDnsRuntime {
             None => return,
         };
         loop {
-            match fetch_text(&config.url, self.config.request_timeout_ms) {
+            match fetch_text(&self.http_client, &config.url) {
                 Ok(body) => {
                     let entries = parse_blocklist(&body);
                     *self.remote_blocklist.write() = entries;
@@ -602,6 +665,11 @@ impl BalanceDnsRuntime {
         self.varz.cache_test_len.set(stats.test_len as f64);
         self.varz.cache_inserted.set(stats.inserted as f64);
         self.varz.cache_evicted.set(stats.evicted as f64);
+    }
+
+    fn snapshot_metrics(&self) {
+        self.varz.snapshot();
+        self.update_cache_metrics();
     }
 }
 
@@ -677,12 +745,13 @@ fn normalize_domain(value: &str) -> String {
     normalized
 }
 
-fn fetch_text(url: &str, timeout_ms: u64) -> io::Result<String> {
-    ureq::get(url)
-        .timeout(StdDuration::from_millis(timeout_ms))
-        .call()
+fn fetch_text(client: &Client, url: &str) -> io::Result<String> {
+    client
+        .get(url)
+        .send()
+        .and_then(|response| response.error_for_status())
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?
-        .into_string()
+        .text()
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
 }
 
@@ -794,18 +863,19 @@ fn read_http_request<S: Read>(stream: &mut S) -> io::Result<HttpRequest> {
 fn parse_doh_get_request(target: &str) -> io::Result<Vec<u8>> {
     let url = Url::parse(&format!("https://placeholder{}", target))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid DoH target"))?;
-    if url.path() != "/dns-query" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Unsupported DoH path",
-        ));
-    }
     let dns_param = url
         .query_pairs()
         .find_map(|(key, value)| if key == "dns" { Some(value.into_owned()) } else { None })
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing dns parameter"))?;
-    base64::decode_config(dns_param.as_bytes(), base64::URL_SAFE_NO_PAD)
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(dns_param.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid DoH dns parameter"))
+}
+
+fn http_target_path(target: &str) -> io::Result<String> {
+    Url::parse(&format!("https://placeholder{}", target))
+        .map(|url| url.path().to_owned())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid HTTP target"))
 }
 
 fn write_http_response<S: Write>(

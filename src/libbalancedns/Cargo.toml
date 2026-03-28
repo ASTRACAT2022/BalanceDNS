@@ -4,40 +4,22 @@ version = "0.3.0"
 authors = ["Frank Denis <github@pureftpd.org>"]
 publish = false
 
-[features]
-webservice = ["hyper"]
-
 [dependencies]
 base64 = "*"
-bpf = "*"
-byteorder = "*"
-bytes = "*"
 clippy = {version = "*", optional = true}
 clockpro-cache = "0.1.12"
 coarsetime = "0.1.10"
-dnstap = "*"
-env_logger = "0.11"
-futures = "*"
-hyper = {version = "0.11", optional = true, default-features = false}
-jumphash = "*"
-lazy_static = "*"
 libloading = "0.8"
 log = "0.4"
-net2 = "*"
 nix = "~0.8 "
 parking_lot = "*"
 privdrop = "*"
 prometheus = "*"
 rand = "0.5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "http2"] }
 rustls = "0.21"
 rustls-pemfile = "1"
-siphasher = "*"
-slab = "*"
-tokio-core = "*"
-tokio-io = "*"
-tokio-timer = "0.1"
 toml = "*"
-ureq = "*"
 url = "*"
 
 [profile.release]
