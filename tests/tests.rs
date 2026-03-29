@@ -128,4 +128,22 @@ threads_tcp = 1
         assert_eq!(config.cache_size, 100);
         assert_eq!(config.max_ttl, 300);
     }
+
+    #[test]
+    fn balancedns_timeout_defaults_to_1500ms() {
+        let cfg = r#"
+[server]
+udp_listen = "127.0.0.1:5353"
+
+[[upstreams]]
+name = "cloudflare-udp"
+proto = "udp"
+addr = "1.1.1.1:53"
+pool = "default"
+weight = 1
+"#;
+
+        let config = Config::from_string(cfg).unwrap();
+        assert_eq!(config.request_timeout_ms, 1500);
+    }
 }

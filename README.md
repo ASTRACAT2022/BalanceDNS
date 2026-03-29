@@ -61,7 +61,7 @@ algorithm = "round_robin"
 [security]
 deny_any = true
 deny_dnskey = true
-request_timeout_ms = 3000
+request_timeout_ms = 1500
 
 [cache]
 enabled = true

@@ -69,12 +69,7 @@ impl Cache {
         }
     }
 
-    pub fn insert(
-        &mut self,
-        normalized_question_key: NormalizedQuestionKey,
-        packet: Vec<u8>,
-        ttl: u32,
-    ) -> bool {
+    pub fn insert(&self, normalized_question_key: NormalizedQuestionKey, packet: Vec<u8>, ttl: u32) -> bool {
         debug_assert!(packet.len() >= dns::DNS_HEADER_SIZE);
         if packet.len() < dns::DNS_HEADER_SIZE {
             return false;
@@ -87,7 +82,7 @@ impl Cache {
         cache.insert(normalized_question_key, cache_entry)
     }
 
-    pub fn get(&mut self, normalized_question_key: &NormalizedQuestionKey) -> Option<CacheEntry> {
+    pub fn get(&self, normalized_question_key: &NormalizedQuestionKey) -> Option<CacheEntry> {
         let mut cache = self.arc_mx.lock();
         cache
             .get_mut(normalized_question_key)
@@ -108,7 +103,7 @@ impl Cache {
     /// We are not checking additional cache entries for now. Both to be minimize
     /// possible incompatibilities with RFC 8020, and for speed.
     /// This might be revisited later.
-    pub fn get2(&mut self, normalized_question: &NormalizedQuestion) -> Option<CacheEntry> {
+    pub fn get2(&self, normalized_question: &NormalizedQuestion) -> Option<CacheEntry> {
         if let Some(special_packet) = self.handle_special_queries(normalized_question) {
             Some(CacheEntry {
                 expiration: Instant::recent() + Duration::from_secs(self.config.max_ttl as u64),

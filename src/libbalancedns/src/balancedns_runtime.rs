@@ -24,7 +24,7 @@ use varz::Varz;
 
 pub struct BalanceDnsRuntime {
     config: Config,
-    cache: Mutex<Cache>,
+    cache: Cache,
     local_hosts: HashMap<String, IpAddr>,
     remote_hosts: RwLock<HashMap<String, IpAddr>>,
     remote_blocklist: RwLock<HashSet<String>>,
@@ -42,11 +42,15 @@ impl BalanceDnsRuntime {
             .filter_map(|(name, ip)| ip.parse().ok().map(|ip| (name.clone(), ip)))
             .collect::<HashMap<String, IpAddr>>();
         let http_client = Client::builder()
+            .connect_timeout(StdDuration::from_millis((config.request_timeout_ms / 2).max(500)))
+            .pool_max_idle_per_host(16)
+            .pool_idle_timeout(Some(StdDuration::from_secs(90)))
+            .tcp_keepalive(Some(StdDuration::from_secs(30)))
             .timeout(StdDuration::from_millis(config.request_timeout_ms))
             .build()
             .expect("Unable to initialize HTTP client");
         Arc::new(BalanceDnsRuntime {
-            cache: Mutex::new(Cache::new(config.clone())),
+            cache: Cache::new(config.clone()),
             config: config.clone(),
             local_hosts,
             remote_hosts: RwLock::new(HashMap::new()),
@@ -183,6 +187,7 @@ impl BalanceDnsRuntime {
                         Ok((stream, addr)) => {
                             let runtime = runtime.clone();
                             thread::spawn(move || {
+                                let _ = stream.set_nodelay(true);
                                 if let Err(err) = runtime.handle_tcp_session(stream) {
                                     debug!("TCP session closed for {}: {}", addr, err);
                                 }
@@ -196,7 +201,10 @@ impl BalanceDnsRuntime {
 
     fn spawn_dot_listener(self: &Arc<Self>, listen_addr: String) -> io::Result<thread::JoinHandle<()>> {
         let listener = TcpListener::bind(&listen_addr)?;
-        let tls_config = Arc::new(load_tls_server_config(&self.config)?);
+        let tls_config = Arc::new(load_tls_server_config(
+            &self.config,
+            TlsApplicationProtocol::Dns,
+        )?);
         info!("DoT listener is ready on {}", listen_addr);
         thread::Builder::new()
             .name("balancedns_dot".to_string())
@@ -208,6 +216,7 @@ impl BalanceDnsRuntime {
                             let runtime = runtime.clone();
                             let tls_config = tls_config.clone();
                             thread::spawn(move || {
+                                let _ = stream.set_nodelay(true);
                                 let connection = ServerConnection::new(tls_config).map_err(io::Error::other);
                                 match connection {
                                     Ok(connection) => {
@@ -228,7 +237,10 @@ impl BalanceDnsRuntime {
 
     fn spawn_doh_listener(self: &Arc<Self>, listen_addr: String) -> io::Result<thread::JoinHandle<()>> {
         let listener = TcpListener::bind(&listen_addr)?;
-        let tls_config = Arc::new(load_tls_server_config(&self.config)?);
+        let tls_config = Arc::new(load_tls_server_config(
+            &self.config,
+            TlsApplicationProtocol::Http11,
+        )?);
         info!("DoH listener is ready on https://{}/dns-query", listen_addr);
         thread::Builder::new()
             .name("balancedns_doh".to_string())
@@ -240,6 +252,7 @@ impl BalanceDnsRuntime {
                             let runtime = runtime.clone();
                             let tls_config = tls_config.clone();
                             thread::spawn(move || {
+                                let _ = stream.set_nodelay(true);
                                 let connection = ServerConnection::new(tls_config).map_err(io::Error::other);
                                 match connection {
                                     Ok(connection) => {
@@ -404,10 +417,7 @@ impl BalanceDnsRuntime {
         }
 
         if self.config.cache_enabled {
-            let cache_entry = {
-                let mut cache = self.cache.lock();
-                cache.get2(&normalized_question)
-            };
+            let cache_entry = self.cache.get2(&normalized_question);
             if let Some(cache_entry) = cache_entry {
                 if cache_entry.is_expired() {
                     self.varz.client_queries_expired.inc();
@@ -430,8 +440,9 @@ impl BalanceDnsRuntime {
                 self.config.cache_ttl_seconds,
             )
             .unwrap_or(self.config.cache_ttl_seconds);
-            let mut cache = self.cache.lock();
-            let _ = cache.insert(normalized_question.key(), response.clone(), ttl);
+            let _ = self
+                .cache
+                .insert(normalized_question.key(), response.clone(), ttl);
         }
         self.update_cache_metrics();
         Ok(response)
@@ -481,14 +492,26 @@ impl BalanceDnsRuntime {
         let (query_packet, upstream_question) = dns::build_query_packet(normalized_question, false)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let upstreams = self.ordered_upstreams();
+        let total_timeout = StdDuration::from_millis(self.config.request_timeout_ms);
+        let started_at = std::time::Instant::now();
         let mut last_err = None;
         for upstream in upstreams {
+            let elapsed = started_at.elapsed();
+            if elapsed >= total_timeout {
+                last_err = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Overall upstream resolution timed out",
+                ));
+                break;
+            }
+            let remaining_timeout = total_timeout.saturating_sub(elapsed);
             self.varz.upstream_sent.inc();
             match self.query_upstream(
                 &upstream,
                 &query_packet,
                 &upstream_question,
                 normalized_question.tid,
+                remaining_timeout,
             ) {
                 Ok(response) => {
                     self.varz.upstream_received.inc();
@@ -514,10 +537,11 @@ impl BalanceDnsRuntime {
         query_packet: &[u8],
         upstream_question: &dns::NormalizedQuestionMinimal,
         client_tid: u16,
+        timeout: StdDuration,
     ) -> io::Result<Vec<u8>> {
         let mut response = match upstream.proto {
-            UpstreamProtocol::Udp => self.query_udp_upstream(upstream, query_packet)?,
-            UpstreamProtocol::Doh => self.query_doh_upstream(upstream, query_packet)?,
+            UpstreamProtocol::Udp => self.query_udp_upstream(upstream, query_packet, timeout)?,
+            UpstreamProtocol::Doh => self.query_doh_upstream(upstream, query_packet, timeout)?,
         };
         let normalized_response = dns::normalize(&response, false)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -539,7 +563,12 @@ impl BalanceDnsRuntime {
         Ok(response)
     }
 
-    fn query_udp_upstream(&self, upstream: &UpstreamConfig, query_packet: &[u8]) -> io::Result<Vec<u8>> {
+    fn query_udp_upstream(
+        &self,
+        upstream: &UpstreamConfig,
+        query_packet: &[u8],
+        timeout: StdDuration,
+    ) -> io::Result<Vec<u8>> {
         let remote_addr: SocketAddr = upstream
             .addr
             .as_ref()
@@ -551,7 +580,6 @@ impl BalanceDnsRuntime {
             SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
         };
         let socket = UdpSocket::bind(bind_addr)?;
-        let timeout = StdDuration::from_millis(self.config.request_timeout_ms);
         socket.set_read_timeout(Some(timeout))?;
         socket.set_write_timeout(Some(timeout))?;
         socket.send_to(query_packet, remote_addr)?;
@@ -560,7 +588,12 @@ impl BalanceDnsRuntime {
         Ok(buf[..len].to_vec())
     }
 
-    fn query_doh_upstream(&self, upstream: &UpstreamConfig, query_packet: &[u8]) -> io::Result<Vec<u8>> {
+    fn query_doh_upstream(
+        &self,
+        upstream: &UpstreamConfig,
+        query_packet: &[u8],
+        timeout: StdDuration,
+    ) -> io::Result<Vec<u8>> {
         let url = upstream
             .url
             .as_ref()
@@ -570,6 +603,7 @@ impl BalanceDnsRuntime {
             .post(url)
             .header(ACCEPT, "application/dns-message")
             .header(CONTENT_TYPE, "application/dns-message")
+            .timeout(timeout)
             .body(query_packet.to_vec())
             .send()
             .and_then(|response| response.error_for_status())
@@ -658,8 +692,7 @@ impl BalanceDnsRuntime {
     }
 
     fn update_cache_metrics(&self) {
-        let cache = self.cache.lock();
-        let stats = cache.stats();
+        let stats = self.cache.stats();
         self.varz.cache_frequent_len.set(stats.frequent_len as f64);
         self.varz.cache_recent_len.set(stats.recent_len as f64);
         self.varz.cache_test_len.set(stats.test_len as f64);
@@ -755,7 +788,15 @@ fn fetch_text(client: &Client, url: &str) -> io::Result<String> {
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
 }
 
-fn load_tls_server_config(config: &Config) -> io::Result<ServerConfig> {
+enum TlsApplicationProtocol {
+    Dns,
+    Http11,
+}
+
+fn load_tls_server_config(
+    config: &Config,
+    application_protocol: TlsApplicationProtocol,
+) -> io::Result<ServerConfig> {
     let cert_path = config
         .tls_cert_pem
         .as_ref()
@@ -783,11 +824,15 @@ fn load_tls_server_config(config: &Config) -> io::Result<ServerConfig> {
         .next()
         .map(PrivateKey)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "TLS private key is missing"))?;
-    ServerConfig::builder()
+    let mut server_config = ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
-        .map_err(io::Error::other)
+        .map_err(io::Error::other)?;
+    if let TlsApplicationProtocol::Http11 = application_protocol {
+        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    }
+    Ok(server_config)
 }
 
 struct HttpRequest {

@@ -14,7 +14,7 @@ algorithm = "round_robin"
 [security]
 deny_any = true
 deny_dnskey = true
-request_timeout_ms = 3000
+request_timeout_ms = 1500
 
 [cache]
 enabled = true
@@ -30,7 +30,6 @@ listen = "127.0.0.1:9100"
 [plugins]
 libraries = [
     "plugins/remote-hosts-plugin/target/debug/libbalancedns_remote_hosts_plugin.dylib",
-    "plugins/adblock-plugin/target/debug/libbalancedns_adblock_plugin.dylib",
 ]
 
 [[upstreams]]

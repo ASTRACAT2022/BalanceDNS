@@ -177,7 +177,7 @@ impl Config {
             });
         let request_timeout_ms = config_security
             .and_then(|x| x.get("request_timeout_ms"))
-            .map_or(3000, |x| {
+            .map_or(1500, |x| {
                 x.as_integer()
                     .expect("security.request_timeout_ms must be an integer")
             }) as u64;
@@ -487,7 +487,7 @@ impl Config {
 
         let request_timeout_ms = config_upstream
             .and_then(|x| x.get("max_failure_duration"))
-            .map_or(2500, |x| {
+            .map_or(1500, |x| {
                 x.as_integer()
                     .expect("upstream.max_failure_duration must be an integer")
             }) as u64;
