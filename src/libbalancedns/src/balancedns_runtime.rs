@@ -10,7 +10,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use rustls::{Certificate, PrivateKey, ServerConfig, ServerConnection, StreamOwned};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -22,6 +22,25 @@ use std::time::Instant;
 use std::time::Duration as StdDuration;
 use url::Url;
 use varz::Varz;
+
+const TCP_SESSION_PREFETCH_MAX: usize = 4;
+const TCP_SESSION_PREFETCH_READ_TIMEOUT_MS: u64 = 5;
+
+trait SessionStream: Read + Write {
+    fn set_read_timeout(&self, timeout: Option<StdDuration>) -> io::Result<()>;
+}
+
+impl SessionStream for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<StdDuration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+}
+
+impl SessionStream for StreamOwned<ServerConnection, TcpStream> {
+    fn set_read_timeout(&self, timeout: Option<StdDuration>) -> io::Result<()> {
+        self.sock.set_read_timeout(timeout)
+    }
+}
 
 pub struct BalanceDnsRuntime {
     config: Config,
@@ -317,31 +336,58 @@ impl BalanceDnsRuntime {
             })
     }
 
-    fn handle_tcp_session<S: Read + Write>(&self, mut stream: S) -> io::Result<()> {
+    fn handle_tcp_session<S: SessionStream>(&self, mut stream: S) -> io::Result<()> {
+        stream.set_read_timeout(Some(StdDuration::from_millis(
+            TCP_SESSION_PREFETCH_READ_TIMEOUT_MS,
+        )))?;
+        let mut pending_bytes = Vec::new();
+        let mut prefetched_packets = VecDeque::new();
+        let mut stream_ended = false;
+
         loop {
-            let mut len_buf = [0u8; 2];
-            match stream.read_exact(&mut len_buf) {
-                Ok(_) => {}
-                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(err) => return Err(err),
-            }
+            prefetch_tcp_packets(
+                &mut stream,
+                &mut pending_bytes,
+                &mut prefetched_packets,
+                &mut stream_ended,
+            )?;
+
+            let packet = match prefetched_packets.pop_front() {
+                Some(packet) => packet,
+                None if stream_ended => {
+                    return if pending_bytes.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "Truncated DNS packet on TCP session",
+                        ))
+                    };
+                }
+                None => {
+                    let mut len_buf = [0u8; 2];
+                    match stream.read_exact(&mut len_buf) {
+                        Ok(_) => {}
+                        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                        Err(err) => return Err(err),
+                    }
+                    let packet_len = ((len_buf[0] as usize) << 8) | len_buf[1] as usize;
+                    if packet_len < 12 || packet_len > 65535 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Suspicious DNS packet size",
+                        ));
+                    }
+                    let mut packet = vec![0u8; packet_len];
+                    stream.read_exact(&mut packet)?;
+                    packet
+                }
+            };
+
             self.varz.client_queries.inc();
             self.varz.client_queries_tcp.inc();
-            let packet_len = ((len_buf[0] as usize) << 8) | len_buf[1] as usize;
-            if packet_len < 12 || packet_len > 65535 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Suspicious DNS packet size",
-                ));
-            }
-            let mut packet = vec![0u8; packet_len];
-            stream.read_exact(&mut packet)?;
             let response = self.process_query(&packet)?;
-            let response_len = response.len();
-            let response_prefix = [(response_len >> 8) as u8, response_len as u8];
-            stream.write_all(&response_prefix)?;
-            stream.write_all(&response)?;
-            stream.flush()?;
+            write_tcp_response_frame(&mut stream, &response)?;
         }
     }
 
@@ -1009,6 +1055,66 @@ fn select_upstreams(
     ordered
 }
 
+fn prefetch_tcp_packets<S: SessionStream>(
+    stream: &mut S,
+    pending_bytes: &mut Vec<u8>,
+    prefetched_packets: &mut VecDeque<Vec<u8>>,
+    stream_ended: &mut bool,
+) -> io::Result<()> {
+    while prefetched_packets.len() < TCP_SESSION_PREFETCH_MAX {
+        if let Some(packet) = try_take_tcp_frame(pending_bytes)? {
+            prefetched_packets.push_back(packet);
+            continue;
+        }
+        if *stream_ended {
+            break;
+        }
+        let mut buf = [0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                *stream_ended = true;
+                break;
+            }
+            Ok(read_len) => pending_bytes.extend_from_slice(&buf[..read_len]),
+            Err(err)
+                if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+fn try_take_tcp_frame(buffer: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
+    if buffer.len() < 2 {
+        return Ok(None);
+    }
+    let packet_len = ((buffer[0] as usize) << 8) | buffer[1] as usize;
+    if packet_len < 12 || packet_len > 65535 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Suspicious DNS packet size",
+        ));
+    }
+    let frame_len = 2 + packet_len;
+    if buffer.len() < frame_len {
+        return Ok(None);
+    }
+    let packet = buffer[2..frame_len].to_vec();
+    buffer.drain(..frame_len);
+    Ok(Some(packet))
+}
+
+fn write_tcp_response_frame<S: Write>(stream: &mut S, response: &[u8]) -> io::Result<()> {
+    let response_len = response.len();
+    let response_prefix = [(response_len >> 8) as u8, response_len as u8];
+    stream.write_all(&response_prefix)?;
+    stream.write_all(response)?;
+    stream.flush()
+}
+
 fn write_http_response<S: Write>(
     stream: &mut S,
     status: &str,
@@ -1028,7 +1134,7 @@ fn write_http_response<S: Write>(
 
 #[cfg(test)]
 mod tests {
-    use super::select_upstreams;
+    use super::{select_upstreams, try_take_tcp_frame};
     use config::{UpstreamConfig, UpstreamProtocol};
     use std::sync::atomic::AtomicUsize;
 
@@ -1068,5 +1174,17 @@ mod tests {
         assert_eq!(names[0], "udp-a");
         assert_eq!(names.len(), 3);
         assert_eq!(names.iter().filter(|name| name.as_str() == "udp-a").count(), 1);
+    }
+
+    #[test]
+    fn tcp_frame_parser_extracts_complete_packet_and_keeps_tail() {
+        let mut buffer = vec![0x00, 0x0c];
+        buffer.extend_from_slice(&[0u8; 12]);
+        buffer.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+
+        let packet = try_take_tcp_frame(&mut buffer).unwrap().unwrap();
+
+        assert_eq!(packet.len(), 12);
+        assert_eq!(buffer, vec![0xaa, 0xbb, 0xcc]);
     }
 }
