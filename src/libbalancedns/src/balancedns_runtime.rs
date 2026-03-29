@@ -23,7 +23,7 @@ use std::time::Duration as StdDuration;
 use url::Url;
 use varz::Varz;
 
-const TCP_SESSION_PREFETCH_MAX: usize = 4;
+const TCP_SESSION_PREFETCH_MAX: usize = 8;
 const TCP_SESSION_PREFETCH_READ_TIMEOUT_MS: u64 = 5;
 
 trait SessionStream: Read + Write {
@@ -79,9 +79,11 @@ impl BalanceDnsRuntime {
             .filter_map(|(name, ip)| ip.parse().ok().map(|ip| (name.clone(), ip)))
             .collect::<HashMap<String, IpAddr>>();
         let http_client = Client::builder()
-            .connect_timeout(StdDuration::from_millis((config.request_timeout_ms / 2).max(500)))
-            .pool_max_idle_per_host(16)
-            .pool_idle_timeout(Some(StdDuration::from_secs(90)))
+            .connect_timeout(StdDuration::from_millis((config.request_timeout_ms / 3).max(250)))
+            .tcp_nodelay(true)
+            .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+            .pool_max_idle_per_host(64)
+            .pool_idle_timeout(Some(StdDuration::from_secs(120)))
             .tcp_keepalive(Some(StdDuration::from_secs(30)))
             .timeout(StdDuration::from_millis(config.request_timeout_ms))
             .build()
@@ -392,60 +394,89 @@ impl BalanceDnsRuntime {
     }
 
     fn handle_doh_session<S: Read + Write>(&self, stream: &mut S) -> io::Result<()> {
-        let request = read_http_request(stream)?;
-        if http_target_path(&request.target)? != "/dns-query" {
-            write_http_response(
-                stream,
-                "404 Not Found",
-                "text/plain; charset=utf-8",
-                b"not found",
-            )?;
-            return Ok(());
-        }
-        let body = match request.method.as_str() {
-            "GET" => parse_doh_get_request(&request.target)?,
-            "POST" => {
-                let content_type = request
-                    .headers
-                    .get("content-type")
-                    .cloned()
-                    .unwrap_or_default();
-                if !content_type.contains("application/dns-message") {
-                    write_http_response(
-                        stream,
-                        "415 Unsupported Media Type",
-                        "text/plain; charset=utf-8",
-                        b"unsupported content-type",
-                    )?;
+        loop {
+            let request = match read_http_request(stream) {
+                Ok(request) => request,
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(err) => return Err(err),
+            };
+            let connection_header = request
+                .headers
+                .get("connection")
+                .map(|value| value.to_ascii_lowercase())
+                .unwrap_or_default();
+            let close_connection = connection_header.contains("close");
+            if http_target_path(&request.target)? != "/dns-query" {
+                write_http_response_with_connection(
+                    stream,
+                    "404 Not Found",
+                    "text/plain; charset=utf-8",
+                    b"not found",
+                    close_connection,
+                )?;
+                if close_connection {
                     return Ok(());
                 }
-                request.body
+                continue;
             }
-            _ => {
-                write_http_response(
+            let body = match request.method.as_str() {
+                "GET" => parse_doh_get_request(&request.target)?,
+                "POST" => {
+                    let content_type = request
+                        .headers
+                        .get("content-type")
+                        .cloned()
+                        .unwrap_or_default();
+                    if !content_type.contains("application/dns-message") {
+                        write_http_response_with_connection(
+                            stream,
+                            "415 Unsupported Media Type",
+                            "text/plain; charset=utf-8",
+                            b"unsupported content-type",
+                            close_connection,
+                        )?;
+                        if close_connection {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    request.body
+                }
+                _ => {
+                    write_http_response_with_connection(
+                        stream,
+                        "405 Method Not Allowed",
+                        "text/plain; charset=utf-8",
+                        b"method not allowed",
+                        close_connection,
+                    )?;
+                    if close_connection {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            };
+            self.varz.client_queries.inc();
+            self.varz.client_queries_tcp.inc();
+            match self.process_query(&body) {
+                Ok(response) => write_http_response_with_connection(
                     stream,
-                    "405 Method Not Allowed",
+                    "200 OK",
+                    "application/dns-message",
+                    &response,
+                    close_connection,
+                )?,
+                Err(err) => write_http_response_with_connection(
+                    stream,
+                    "500 Internal Server Error",
                     "text/plain; charset=utf-8",
-                    b"method not allowed",
-                )?;
+                    err.to_string().as_bytes(),
+                    close_connection,
+                )?,
+            }
+            if close_connection {
                 return Ok(());
             }
-        };
-        self.varz.client_queries.inc();
-        self.varz.client_queries_tcp.inc();
-        match self.process_query(&body) {
-            Ok(response) => write_http_response(
-                stream,
-                "200 OK",
-                "application/dns-message",
-                &response,
-            ),
-            Err(err) => write_http_response(
-                stream,
-                "500 Internal Server Error",
-                "text/plain; charset=utf-8",
-                err.to_string().as_bytes(),
-            ),
         }
     }
 
@@ -1121,12 +1152,23 @@ fn write_http_response<S: Write>(
     content_type: &str,
     body: &[u8],
 ) -> io::Result<()> {
+    write_http_response_with_connection(stream, status, content_type, body, true)
+}
+
+fn write_http_response_with_connection<S: Write>(
+    stream: &mut S,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+    close_connection: bool,
+) -> io::Result<()> {
     write!(
         stream,
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
         status,
         content_type,
-        body.len()
+        body.len(),
+        if close_connection { "close" } else { "keep-alive" }
     )?;
     stream.write_all(body)?;
     stream.flush()
