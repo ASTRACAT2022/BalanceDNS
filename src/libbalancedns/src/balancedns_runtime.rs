@@ -22,6 +22,25 @@ use std::time::Duration as StdDuration;
 use url::Url;
 use varz::Varz;
 
+const TCP_SESSION_MAX_INFLIGHT: usize = 64;
+const TCP_SESSION_READ_POLL_MS: u64 = 10;
+
+trait SessionStream: Read + Write + Send {
+    fn set_read_timeout(&self, timeout: Option<StdDuration>) -> io::Result<()>;
+}
+
+impl SessionStream for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<StdDuration>) -> io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+}
+
+impl SessionStream for StreamOwned<ServerConnection, TcpStream> {
+    fn set_read_timeout(&self, timeout: Option<StdDuration>) -> io::Result<()> {
+        self.sock.set_read_timeout(timeout)
+    }
+}
+
 pub struct BalanceDnsRuntime {
     config: Config,
     cache: Cache,
@@ -299,31 +318,98 @@ impl BalanceDnsRuntime {
             })
     }
 
-    fn handle_tcp_session<S: Read + Write>(&self, mut stream: S) -> io::Result<()> {
+    fn handle_tcp_session<S: SessionStream + 'static>(self: &Arc<Self>, mut stream: S) -> io::Result<()> {
+        stream.set_read_timeout(Some(StdDuration::from_millis(TCP_SESSION_READ_POLL_MS)))?;
+        let (response_tx, response_rx) = mpsc::channel::<io::Result<Vec<u8>>>();
+        let mut pending_bytes = Vec::new();
+        let mut read_buf = [0u8; 4096];
+        let mut inflight = 0usize;
+        let mut reader_closed = false;
+
         loop {
-            let mut len_buf = [0u8; 2];
-            match stream.read_exact(&mut len_buf) {
-                Ok(_) => {}
-                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(err) => return Err(err),
+            while inflight < TCP_SESSION_MAX_INFLIGHT {
+                let packet = match try_take_tcp_frame(&mut pending_bytes)? {
+                    Some(packet) => packet,
+                    None => break,
+                };
+                self.varz.client_queries.inc();
+                self.varz.client_queries_tcp.inc();
+                inflight += 1;
+                let runtime = self.clone();
+                let response_tx = response_tx.clone();
+                thread::spawn(move || {
+                    let result = runtime.process_query(&packet);
+                    let _ = response_tx.send(result);
+                });
             }
-            self.varz.client_queries.inc();
-            self.varz.client_queries_tcp.inc();
-            let packet_len = ((len_buf[0] as usize) << 8) | len_buf[1] as usize;
-            if packet_len < 12 || packet_len > 65535 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Suspicious DNS packet size",
-                ));
+
+            while !reader_closed && inflight < TCP_SESSION_MAX_INFLIGHT {
+                match stream.read(&mut read_buf) {
+                    Ok(0) => {
+                        reader_closed = true;
+                        break;
+                    }
+                    Ok(read_len) => {
+                        pending_bytes.extend_from_slice(&read_buf[..read_len]);
+                    }
+                    Err(err)
+                        if err.kind() == io::ErrorKind::WouldBlock
+                            || err.kind() == io::ErrorKind::TimedOut =>
+                    {
+                        break;
+                    }
+                    Err(err) => return Err(err),
+                }
+
+                while inflight < TCP_SESSION_MAX_INFLIGHT {
+                    let packet = match try_take_tcp_frame(&mut pending_bytes)? {
+                        Some(packet) => packet,
+                        None => break,
+                    };
+                    self.varz.client_queries.inc();
+                    self.varz.client_queries_tcp.inc();
+                    inflight += 1;
+                    let runtime = self.clone();
+                    let response_tx = response_tx.clone();
+                    thread::spawn(move || {
+                        let result = runtime.process_query(&packet);
+                        let _ = response_tx.send(result);
+                    });
+                }
             }
-            let mut packet = vec![0u8; packet_len];
-            stream.read_exact(&mut packet)?;
-            let response = self.process_query(&packet)?;
-            let response_len = response.len();
-            let response_prefix = [(response_len >> 8) as u8, response_len as u8];
-            stream.write_all(&response_prefix)?;
-            stream.write_all(&response)?;
-            stream.flush()?;
+
+            if inflight == 0 {
+                if reader_closed {
+                    return if pending_bytes.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "Truncated DNS packet on TCP session",
+                        ))
+                    };
+                }
+                continue;
+            }
+
+            match response_rx.recv_timeout(StdDuration::from_millis(TCP_SESSION_READ_POLL_MS)) {
+                Ok(Ok(response)) => {
+                    inflight -= 1;
+                    write_tcp_frame(&mut stream, &response)?;
+                }
+                Ok(Err(err)) => {
+                    inflight -= 1;
+                    self.varz.client_queries_errors.inc();
+                    debug!("TCP session query failed: {}", err);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "TCP session response queue unexpectedly closed",
+                    ));
+                }
+            }
         }
     }
 
@@ -921,6 +1007,34 @@ fn http_target_path(target: &str) -> io::Result<String> {
     Url::parse(&format!("https://placeholder{}", target))
         .map(|url| url.path().to_owned())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid HTTP target"))
+}
+
+fn try_take_tcp_frame(buffer: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
+    if buffer.len() < 2 {
+        return Ok(None);
+    }
+    let packet_len = ((buffer[0] as usize) << 8) | buffer[1] as usize;
+    if packet_len < 12 || packet_len > 65535 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Suspicious DNS packet size",
+        ));
+    }
+    let frame_len = 2 + packet_len;
+    if buffer.len() < frame_len {
+        return Ok(None);
+    }
+    let packet = buffer[2..frame_len].to_vec();
+    buffer.drain(..frame_len);
+    Ok(Some(packet))
+}
+
+fn write_tcp_frame<S: Write>(stream: &mut S, response: &[u8]) -> io::Result<()> {
+    let response_len = response.len();
+    let response_prefix = [(response_len >> 8) as u8, response_len as u8];
+    stream.write_all(&response_prefix)?;
+    stream.write_all(response)?;
+    stream.flush()
 }
 
 fn write_http_response<S: Write>(
