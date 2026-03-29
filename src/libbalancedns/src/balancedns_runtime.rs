@@ -258,7 +258,7 @@ impl BalanceDnsRuntime {
                                 match connection {
                                     Ok(connection) => {
                                         let tls_stream = StreamOwned::new(connection, stream);
-                                        if let Err(err) = runtime.handle_tcp_session(tls_stream) {
+                                        if let Err(err) = runtime.handle_tls_session(tls_stream) {
                                             debug!("DoT session closed for {}: {}", addr, err);
                                         }
                                     }
@@ -384,6 +384,20 @@ impl BalanceDnsRuntime {
                 }
             };
 
+            self.varz.client_queries.inc();
+            self.varz.client_queries_tcp.inc();
+            let response = self.process_query(&packet)?;
+            write_tcp_response_frame(&mut stream, &response)?;
+        }
+    }
+
+    fn handle_tls_session<S: Read + Write>(&self, mut stream: S) -> io::Result<()> {
+        loop {
+            let packet = match read_tcp_query_frame(&mut stream) {
+                Ok(packet) => packet,
+                Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(err) => return Err(err),
+            };
             self.varz.client_queries.inc();
             self.varz.client_queries_tcp.inc();
             let response = self.process_query(&packet)?;
@@ -1105,6 +1119,21 @@ fn try_take_tcp_frame(buffer: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
     let packet = buffer[2..frame_len].to_vec();
     buffer.drain(..frame_len);
     Ok(Some(packet))
+}
+
+fn read_tcp_query_frame<S: Read>(stream: &mut S) -> io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf)?;
+    let packet_len = ((len_buf[0] as usize) << 8) | len_buf[1] as usize;
+    if packet_len < 12 || packet_len > 65535 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Suspicious DNS packet size",
+        ));
+    }
+    let mut packet = vec![0u8; packet_len];
+    stream.read_exact(&mut packet)?;
+    Ok(packet)
 }
 
 fn write_tcp_response_frame<S: Write>(stream: &mut S, response: &[u8]) -> io::Result<()> {
