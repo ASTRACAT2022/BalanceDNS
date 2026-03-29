@@ -43,6 +43,12 @@ pub struct RemoteBlocklistConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct RoutingRuleConfig {
+    pub suffix: String,
+    pub upstreams: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct Config {
     pub decrement_ttl: bool,
     pub upstream_servers: Vec<String>,
@@ -86,6 +92,7 @@ pub struct Config {
     pub hosts_remote: Option<RemoteHostsConfig>,
     pub blocklist_remote: Option<RemoteBlocklistConfig>,
     pub plugin_libraries: Vec<String>,
+    pub routing_rules: Vec<RoutingRuleConfig>,
 }
 
 impl Config {
@@ -126,6 +133,7 @@ impl Config {
         let config_hosts_remote = toml_config.get("hosts_remote");
         let config_blocklist_remote = toml_config.get("blocklist_remote");
         let config_plugins = toml_config.get("plugins");
+        let config_routing_rules = toml_config.get("routing_rules");
         let config_global = toml_config.get("global");
 
         let udp_listen_addr = config_server
@@ -267,6 +275,36 @@ impl Config {
                         )
                     })
                     .collect::<Vec<String>>()
+            })
+            .unwrap_or_else(Vec::new);
+
+        let routing_rules = config_routing_rules
+            .and_then(|x| x.as_array())
+            .map(|rules| {
+                rules
+                    .iter()
+                    .map(|rule| {
+                        let table = rule.as_table().expect("Invalid [[routing_rules]] entry");
+                        let suffix = table
+                            .get("suffix")
+                            .and_then(|x| x.as_str())
+                            .map(clean_string)
+                            .expect("routing_rules.suffix must be a string");
+                        let upstreams = table
+                            .get("upstreams")
+                            .and_then(|x| x.as_array())
+                            .expect("routing_rules.upstreams must be an array")
+                            .iter()
+                            .map(|x| {
+                                clean_string(
+                                    x.as_str()
+                                        .expect("routing_rules.upstreams entries must be strings"),
+                                )
+                            })
+                            .collect::<Vec<String>>();
+                        RoutingRuleConfig { suffix, upstreams }
+                    })
+                    .collect::<Vec<RoutingRuleConfig>>()
             })
             .unwrap_or_else(Vec::new);
 
@@ -433,6 +471,7 @@ impl Config {
             hosts_remote,
             blocklist_remote,
             plugin_libraries,
+            routing_rules,
         })
     }
 
@@ -664,6 +703,7 @@ impl Config {
             hosts_remote: None,
             blocklist_remote: None,
             plugin_libraries: Vec::new(),
+            routing_rules: Vec::new(),
         })
     }
 }

@@ -61,6 +61,10 @@ proto = "udp"
 addr = "1.1.1.1:53"
 pool = "default"
 weight = 1
+
+[[routing_rules]]
+suffix = ".ru."
+upstreams = ["cloudflare-udp"]
 "#;
 
         let config = Config::from_string(cfg).unwrap();
@@ -95,6 +99,9 @@ weight = 1
         );
         assert_eq!(config.upstreams[1].proto, UpstreamProtocol::Udp);
         assert_eq!(config.upstreams[1].addr.as_deref(), Some("1.1.1.1:53"));
+        assert_eq!(config.routing_rules.len(), 1);
+        assert_eq!(config.routing_rules[0].suffix, ".ru.");
+        assert_eq!(config.routing_rules[0].upstreams, vec!["cloudflare-udp"]);
     }
 
     #[test]

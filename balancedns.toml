@@ -33,29 +33,37 @@ libraries = [
 ]
 
 [[upstreams]]
-name = "cloudflare-doh"
-proto = "doh"
-url = "https://1.1.1.1/dns-query"
+name = "yandex-ru-udp"
+proto = "udp"
+addr = "77.88.8.8:53"
 pool = "default"
-weight = 5
-
-[[upstreams]]
-name = "google-doh"
-proto = "doh"
-url = "https://8.8.8.8/dns-query"
-pool = "default"
-weight = 5
+weight = 1
 
 [[upstreams]]
 name = "cloudflare-udp"
 proto = "udp"
 addr = "1.1.1.1:53"
 pool = "default"
-weight = 1
+weight = 5
 
 [[upstreams]]
 name = "google-udp"
 proto = "udp"
 addr = "8.8.8.8:53"
 pool = "default"
+weight = 5
+
+[[upstreams]]
+name = "cloudflare-doh-fallback"
+proto = "doh"
+url = "https://1.1.1.1/dns-query"
+pool = "default"
 weight = 1
+
+[[routing_rules]]
+suffix = ".ru."
+upstreams = ["yandex-ru-udp"]
+
+[[routing_rules]]
+suffix = "."
+upstreams = ["cloudflare-udp", "google-udp", "cloudflare-doh-fallback"]

@@ -1,7 +1,7 @@
 use base64;
 use base64::Engine;
 use cache::Cache;
-use config::{Config, UpstreamConfig, UpstreamProtocol};
+use config::{Config, RoutingRuleConfig, UpstreamConfig, UpstreamProtocol};
 use dns;
 use parking_lot::{Mutex, RwLock};
 use plugins::{PacketAction, PluginManager};
@@ -509,7 +509,7 @@ impl BalanceDnsRuntime {
             }
         }
 
-        let response = self.resolve_via_upstreams(&normalized_question)?;
+        let response = self.resolve_via_upstreams(&normalized_question, &fqdn)?;
         let response = self.plugins.apply_post_response(&response)?;
         if self.config.cache_enabled {
             let ttl = dns::min_ttl(
@@ -567,10 +567,14 @@ impl BalanceDnsRuntime {
         }
     }
 
-    fn resolve_via_upstreams(&self, normalized_question: &dns::NormalizedQuestion) -> io::Result<Vec<u8>> {
+    fn resolve_via_upstreams(
+        &self,
+        normalized_question: &dns::NormalizedQuestion,
+        fqdn: &str,
+    ) -> io::Result<Vec<u8>> {
         let (query_packet, upstream_question) = dns::build_query_packet(normalized_question, false)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let upstreams = self.ordered_upstreams();
+        let upstreams = self.ordered_upstreams(fqdn);
         let total_timeout = StdDuration::from_millis(self.config.request_timeout_ms);
         let started_at = std::time::Instant::now();
         let mut last_err = None;
@@ -708,8 +712,10 @@ impl BalanceDnsRuntime {
             .map_err(map_http_client_error)
     }
 
-    fn ordered_upstreams(&self) -> Vec<UpstreamConfig> {
-        select_upstreams(
+    fn ordered_upstreams(&self, fqdn: &str) -> Vec<UpstreamConfig> {
+        route_upstreams_for_fqdn(
+            fqdn,
+            &self.config.routing_rules,
             &self.config.upstreams,
             &self.config.balancing_algorithm,
             &self.rr_counter,
@@ -1069,6 +1075,49 @@ fn select_upstreams(
     ordered
 }
 
+fn route_upstreams_for_fqdn(
+    fqdn: &str,
+    routing_rules: &[RoutingRuleConfig],
+    upstreams: &[UpstreamConfig],
+    balancing_algorithm: &str,
+    rr_counter: &AtomicUsize,
+) -> Vec<UpstreamConfig> {
+    let ordered = select_upstreams(upstreams, balancing_algorithm, rr_counter);
+    if ordered.is_empty() {
+        return ordered;
+    }
+    let matched_rule = routing_rules
+        .iter()
+        .find(|rule| fqdn_matches_suffix(fqdn, &rule.suffix));
+
+    let Some(rule) = matched_rule else {
+        return ordered;
+    };
+
+    let mut prioritized = Vec::new();
+    for upstream_name in &rule.upstreams {
+        if let Some(upstream) = ordered.iter().find(|upstream| upstream.name == *upstream_name) {
+            prioritized.push(upstream.clone());
+        }
+    }
+
+    for upstream in ordered {
+        if !prioritized
+            .iter()
+            .any(|existing| same_upstream(existing, &upstream))
+        {
+            prioritized.push(upstream);
+        }
+    }
+    prioritized
+}
+
+fn fqdn_matches_suffix(fqdn: &str, suffix: &str) -> bool {
+    let fqdn = fqdn.to_ascii_lowercase();
+    let suffix = suffix.to_ascii_lowercase();
+    suffix == "." || fqdn.ends_with(&suffix)
+}
+
 fn prefetch_tcp_packets<S: SessionStream>(
     stream: &mut S,
     pending_bytes: &mut Vec<u8>,
@@ -1163,8 +1212,8 @@ fn write_http_response<S: Write>(
 
 #[cfg(test)]
 mod tests {
-    use super::{select_upstreams, try_take_tcp_frame};
-    use config::{UpstreamConfig, UpstreamProtocol};
+    use super::{route_upstreams_for_fqdn, select_upstreams, try_take_tcp_frame};
+    use config::{RoutingRuleConfig, UpstreamConfig, UpstreamProtocol};
     use std::sync::atomic::AtomicUsize;
 
     #[test]
@@ -1215,5 +1264,79 @@ mod tests {
 
         assert_eq!(packet.len(), 12);
         assert_eq!(buffer, vec![0xaa, 0xbb, 0xcc]);
+    }
+
+    #[test]
+    fn routing_rules_prioritize_named_upstreams() {
+        let upstreams = vec![
+            UpstreamConfig {
+                name: "cloudflare-doh".to_owned(),
+                proto: UpstreamProtocol::Doh,
+                addr: None,
+                url: Some("https://1.1.1.1/dns-query".to_owned()),
+                pool: "default".to_owned(),
+                weight: 1,
+            },
+            UpstreamConfig {
+                name: "yandex-udp".to_owned(),
+                proto: UpstreamProtocol::Udp,
+                addr: Some("77.88.8.8:53".to_owned()),
+                url: None,
+                pool: "default".to_owned(),
+                weight: 1,
+            },
+            UpstreamConfig {
+                name: "cloudflare-udp".to_owned(),
+                proto: UpstreamProtocol::Udp,
+                addr: Some("1.1.1.1:53".to_owned()),
+                url: None,
+                pool: "default".to_owned(),
+                weight: 5,
+            },
+            UpstreamConfig {
+                name: "google-udp".to_owned(),
+                proto: UpstreamProtocol::Udp,
+                addr: Some("8.8.8.8:53".to_owned()),
+                url: None,
+                pool: "default".to_owned(),
+                weight: 5,
+            },
+        ];
+        let routing_rules = vec![
+            RoutingRuleConfig {
+                suffix: ".ru.".to_owned(),
+                upstreams: vec!["yandex-udp".to_owned()],
+            },
+            RoutingRuleConfig {
+                suffix: ".".to_owned(),
+                upstreams: vec!["cloudflare-udp".to_owned(), "google-udp".to_owned()],
+            },
+        ];
+
+        let rr_counter = AtomicUsize::new(0);
+        let ru = route_upstreams_for_fqdn(
+            "example.ru.",
+            &routing_rules,
+            &upstreams,
+            "round_robin",
+            &rr_counter,
+        );
+        let ru_names = ru.into_iter().map(|upstream| upstream.name).collect::<Vec<_>>();
+        assert_eq!(ru_names[0], "yandex-udp");
+
+        let rr_counter = AtomicUsize::new(0);
+        let non_ru = route_upstreams_for_fqdn(
+            "example.com.",
+            &routing_rules,
+            &upstreams,
+            "round_robin",
+            &rr_counter,
+        );
+        let non_ru_names = non_ru
+            .into_iter()
+            .map(|upstream| upstream.name)
+            .collect::<Vec<_>>();
+        assert_eq!(non_ru_names[0], "cloudflare-udp");
+        assert_eq!(non_ru_names[1], "google-udp");
     }
 }
