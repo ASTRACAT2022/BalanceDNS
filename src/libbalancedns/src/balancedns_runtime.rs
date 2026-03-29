@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 use std::time::Duration as StdDuration;
 use url::Url;
 use varz::Varz;
@@ -32,6 +33,23 @@ pub struct BalanceDnsRuntime {
     rr_counter: AtomicUsize,
     varz: Arc<Varz>,
     http_client: Client,
+}
+
+struct InflightQueryGuard<'a> {
+    varz: &'a Varz,
+}
+
+impl<'a> InflightQueryGuard<'a> {
+    fn new(varz: &'a Varz) -> Self {
+        varz.inflight_queries.inc();
+        InflightQueryGuard { varz }
+    }
+}
+
+impl<'a> Drop for InflightQueryGuard<'a> {
+    fn drop(&mut self) {
+        self.varz.inflight_queries.dec();
+    }
 }
 
 impl BalanceDnsRuntime {
@@ -386,6 +404,7 @@ impl BalanceDnsRuntime {
     }
 
     fn process_query(&self, packet: &[u8]) -> io::Result<Vec<u8>> {
+        let _inflight_query = InflightQueryGuard::new(&self.varz);
         let mut packet = packet.to_vec();
         if let Some(action) = self.plugins.apply_pre_query(&packet)? {
             match action {
@@ -518,7 +537,11 @@ impl BalanceDnsRuntime {
                     return Ok(response);
                 }
                 Err(err) => {
-                    self.varz.upstream_timeout.inc();
+                    if is_timeout_error(&err) {
+                        self.varz.upstream_timeout.inc();
+                    } else {
+                        self.varz.upstream_errors.inc();
+                    }
                     last_err = Some(err);
                 }
             }
@@ -539,6 +562,7 @@ impl BalanceDnsRuntime {
         client_tid: u16,
         timeout: StdDuration,
     ) -> io::Result<Vec<u8>> {
+        let started_at = Instant::now();
         let mut response = match upstream.proto {
             UpstreamProtocol::Udp => self.query_udp_upstream(upstream, query_packet, timeout)?,
             UpstreamProtocol::Doh => self.query_doh_upstream(upstream, query_packet, timeout)?,
@@ -553,12 +577,22 @@ impl BalanceDnsRuntime {
                 != dns::qname_to_fqdn(&upstream_question.qname)
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
         {
-            self.varz.upstream_errors.inc();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Upstream [{}] returned a mismatched response", upstream.name),
             ));
         }
+        let sample_rtt = started_at.elapsed().as_secs_f64();
+        let current_rtt = self.varz.upstream_avg_rtt.get();
+        let updated_rtt = if current_rtt == 0.0 {
+            sample_rtt
+        } else {
+            (current_rtt * 0.8) + (sample_rtt * 0.2)
+        };
+        self.varz.upstream_avg_rtt.set(updated_rtt);
+        self.varz
+            .upstream_response_sizes
+            .observe(response.len() as f64);
         dns::set_tid(&mut response, client_tid);
         Ok(response)
     }
@@ -607,30 +641,19 @@ impl BalanceDnsRuntime {
             .body(query_packet.to_vec())
             .send()
             .and_then(|response| response.error_for_status())
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+            .map_err(map_http_client_error)?;
         response
             .bytes()
             .map(|body| body.to_vec())
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
+            .map_err(map_http_client_error)
     }
 
     fn ordered_upstreams(&self) -> Vec<UpstreamConfig> {
-        let mut weighted = Vec::new();
-        for upstream in &self.config.upstreams {
-            let copies = if upstream.weight == 0 { 1 } else { upstream.weight };
-            for _ in 0..copies {
-                weighted.push(upstream.clone());
-            }
-        }
-        if weighted.is_empty() {
-            return weighted;
-        }
-        let start = match self.config.balancing_algorithm.as_str() {
-            "round_robin" => self.rr_counter.fetch_add(1, Ordering::Relaxed) % weighted.len(),
-            _ => 0,
-        };
-        weighted.rotate_left(start);
-        weighted
+        select_upstreams(
+            &self.config.upstreams,
+            &self.config.balancing_algorithm,
+            &self.rr_counter,
+        )
     }
 
     fn lookup_host(&self, fqdn: &str) -> Option<(IpAddr, u32)> {
@@ -923,6 +946,69 @@ fn http_target_path(target: &str) -> io::Result<String> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid HTTP target"))
 }
 
+fn map_http_client_error(err: reqwest::Error) -> io::Error {
+    if err.is_timeout() {
+        io::Error::new(io::ErrorKind::TimedOut, err.to_string())
+    } else {
+        io::Error::new(io::ErrorKind::Other, err.to_string())
+    }
+}
+
+fn is_timeout_error(err: &io::Error) -> bool {
+    matches!(err.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+}
+
+fn same_upstream(left: &UpstreamConfig, right: &UpstreamConfig) -> bool {
+    left.name == right.name && left.proto == right.proto && left.addr == right.addr && left.url == right.url
+}
+
+fn select_upstreams(
+    upstreams: &[UpstreamConfig],
+    balancing_algorithm: &str,
+    rr_counter: &AtomicUsize,
+) -> Vec<UpstreamConfig> {
+    if upstreams.is_empty() {
+        return Vec::new();
+    }
+
+    let mut weighted_indices = Vec::new();
+    for (index, upstream) in upstreams.iter().enumerate() {
+        let copies = if upstream.weight == 0 { 1 } else { upstream.weight };
+        for _ in 0..copies {
+            weighted_indices.push(index);
+        }
+    }
+
+    let primary_index = if weighted_indices.is_empty() {
+        0
+    } else {
+        let start = match balancing_algorithm {
+            "round_robin" => rr_counter.fetch_add(1, Ordering::Relaxed) % weighted_indices.len(),
+            _ => 0,
+        };
+        weighted_indices[start]
+    };
+
+    let mut remaining_indices = (0..upstreams.len())
+        .filter(|index| *index != primary_index)
+        .collect::<Vec<_>>();
+    remaining_indices.sort_by(|left, right| {
+        upstreams[*right]
+            .weight
+            .cmp(&upstreams[*left].weight)
+            .then_with(|| left.cmp(right))
+    });
+
+    let mut ordered = Vec::with_capacity(upstreams.len());
+    ordered.push(upstreams[primary_index].clone());
+    for index in remaining_indices {
+        if !ordered.iter().any(|existing| same_upstream(existing, &upstreams[index])) {
+            ordered.push(upstreams[index].clone());
+        }
+    }
+    ordered
+}
+
 fn write_http_response<S: Write>(
     stream: &mut S,
     status: &str,
@@ -938,4 +1024,49 @@ fn write_http_response<S: Write>(
     )?;
     stream.write_all(body)?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_upstreams;
+    use config::{UpstreamConfig, UpstreamProtocol};
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn round_robin_prefers_weighted_primary_without_repeating_same_upstream() {
+        let upstreams = vec![
+            UpstreamConfig {
+                name: "doh-a".to_owned(),
+                proto: UpstreamProtocol::Doh,
+                addr: None,
+                url: Some("https://1.1.1.1/dns-query".to_owned()),
+                pool: "default".to_owned(),
+                weight: 1,
+            },
+            UpstreamConfig {
+                name: "udp-a".to_owned(),
+                proto: UpstreamProtocol::Udp,
+                addr: Some("1.1.1.1:53".to_owned()),
+                url: None,
+                pool: "default".to_owned(),
+                weight: 5,
+            },
+            UpstreamConfig {
+                name: "udp-b".to_owned(),
+                proto: UpstreamProtocol::Udp,
+                addr: Some("8.8.8.8:53".to_owned()),
+                url: None,
+                pool: "default".to_owned(),
+                weight: 5,
+            },
+        ];
+
+        let rr_counter = AtomicUsize::new(1);
+        let ordered = select_upstreams(&upstreams, "round_robin", &rr_counter);
+        let names = ordered.into_iter().map(|upstream| upstream.name).collect::<Vec<_>>();
+
+        assert_eq!(names[0], "udp-a");
+        assert_eq!(names.len(), 3);
+        assert_eq!(names.iter().filter(|name| name.as_str() == "udp-a").count(), 1);
+    }
 }
