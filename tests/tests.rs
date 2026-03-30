@@ -29,6 +29,8 @@ request_timeout_ms = 3000
 enabled = true
 max_size = 20000
 ttl_seconds = 600
+stale_refresh_enabled = true
+stale_ttl_seconds = 30
 
 [metrics]
 listen = "127.0.0.1:9100"
@@ -80,6 +82,8 @@ upstreams = ["cloudflare-udp"]
         assert!(config.cache_enabled);
         assert_eq!(config.cache_size, 20_000);
         assert_eq!(config.cache_ttl_seconds, 600);
+        assert!(config.stale_refresh_enabled);
+        assert_eq!(config.stale_ttl_seconds, 30);
         assert_eq!(config.webservice_listen_addr, "127.0.0.1:9100");
         assert_eq!(config.hosts_local.get("example.com.").unwrap(), "1.2.3.4");
         assert_eq!(
@@ -152,5 +156,7 @@ weight = 1
 
         let config = Config::from_string(cfg).unwrap();
         assert_eq!(config.request_timeout_ms, 1500);
+        assert!(!config.stale_refresh_enabled);
+        assert_eq!(config.stale_ttl_seconds, 30);
     }
 }

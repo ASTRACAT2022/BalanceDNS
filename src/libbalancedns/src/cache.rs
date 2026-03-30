@@ -35,6 +35,11 @@ impl CacheEntry {
         let now = Instant::recent();
         now > self.expiration
     }
+
+    pub fn is_servable_stale(&self, stale_ttl_seconds: u32) -> bool {
+        let now = Instant::recent();
+        now <= self.expiration + Duration::from_secs(stale_ttl_seconds as u64)
+    }
 }
 
 #[derive(Clone)]

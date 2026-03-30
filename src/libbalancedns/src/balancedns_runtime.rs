@@ -52,6 +52,7 @@ pub struct BalanceDnsRuntime {
     rr_counter: AtomicUsize,
     varz: Arc<Varz>,
     http_client: Client,
+    stale_refresh_inflight: Mutex<HashSet<dns::NormalizedQuestionKey>>,
 }
 
 struct InflightQueryGuard<'a> {
@@ -96,6 +97,7 @@ impl BalanceDnsRuntime {
             rr_counter: AtomicUsize::new(0),
             varz,
             http_client,
+            stale_refresh_inflight: Mutex::new(HashSet::new()),
         })
     }
 
@@ -336,7 +338,7 @@ impl BalanceDnsRuntime {
             })
     }
 
-    fn handle_tcp_session<S: SessionStream>(&self, mut stream: S) -> io::Result<()> {
+    fn handle_tcp_session<S: SessionStream>(self: &Arc<Self>, mut stream: S) -> io::Result<()> {
         stream.set_read_timeout(Some(StdDuration::from_millis(
             TCP_SESSION_PREFETCH_READ_TIMEOUT_MS,
         )))?;
@@ -391,7 +393,7 @@ impl BalanceDnsRuntime {
         }
     }
 
-    fn handle_tls_session<S: Read + Write>(&self, mut stream: S) -> io::Result<()> {
+    fn handle_tls_session<S: Read + Write>(self: &Arc<Self>, mut stream: S) -> io::Result<()> {
         loop {
             let packet = match read_tcp_query_frame(&mut stream) {
                 Ok(packet) => packet,
@@ -405,7 +407,7 @@ impl BalanceDnsRuntime {
         }
     }
 
-    fn handle_doh_session<S: Read + Write>(&self, stream: &mut S) -> io::Result<()> {
+    fn handle_doh_session<S: Read + Write>(self: &Arc<Self>, stream: &mut S) -> io::Result<()> {
         let request = read_http_request(stream)?;
         if http_target_path(&request.target)? != "/dns-query" {
             write_http_response(
@@ -463,7 +465,7 @@ impl BalanceDnsRuntime {
         }
     }
 
-    fn process_query(&self, packet: &[u8]) -> io::Result<Vec<u8>> {
+    fn process_query(self: &Arc<Self>, packet: &[u8]) -> io::Result<Vec<u8>> {
         let _inflight_query = InflightQueryGuard::new(&self.varz);
         let mut packet = packet.to_vec();
         if let Some(action) = self.plugins.apply_pre_query(&packet)? {
@@ -500,6 +502,20 @@ impl BalanceDnsRuntime {
             if let Some(cache_entry) = cache_entry {
                 if cache_entry.is_expired() {
                     self.varz.client_queries_expired.inc();
+                    if self.config.stale_refresh_enabled
+                        && cache_entry.is_servable_stale(self.config.stale_ttl_seconds)
+                    {
+                        self.schedule_stale_refresh(
+                            normalized_question.clone(),
+                            normalized_question.key(),
+                            fqdn.clone(),
+                        );
+                        self.varz.client_queries_cached.inc();
+                        let mut cached_packet = cache_entry.packet.clone();
+                        let _ = dns::set_ttl(&mut cached_packet, 1);
+                        dns::set_tid(&mut cached_packet, normalized_question.tid);
+                        return self.plugins.apply_post_response(&cached_packet);
+                    }
                 } else {
                     self.varz.client_queries_cached.inc();
                     let mut cached_packet = cache_entry.packet.clone();
@@ -525,6 +541,42 @@ impl BalanceDnsRuntime {
         }
         self.update_cache_metrics();
         Ok(response)
+    }
+
+    fn schedule_stale_refresh(
+        self: &Arc<Self>,
+        normalized_question: dns::NormalizedQuestion,
+        cache_key: dns::NormalizedQuestionKey,
+        fqdn: String,
+    ) {
+        {
+            let mut inflight = self.stale_refresh_inflight.lock();
+            if inflight.contains(&cache_key) {
+                return;
+            }
+            inflight.insert(cache_key.clone());
+        }
+
+        let runtime = self.clone();
+        thread::spawn(move || {
+            let refresh_result = runtime
+                .resolve_via_upstreams(&normalized_question, &fqdn)
+                .and_then(|response| runtime.plugins.apply_post_response(&response));
+
+            if let Ok(response) = refresh_result {
+                let ttl = dns::min_ttl(
+                    &response,
+                    runtime.config.min_ttl,
+                    runtime.config.max_ttl,
+                    runtime.config.cache_ttl_seconds,
+                )
+                .unwrap_or(runtime.config.cache_ttl_seconds);
+                let _ = runtime.cache.insert(cache_key.clone(), response, ttl);
+                runtime.update_cache_metrics();
+            }
+
+            runtime.stale_refresh_inflight.lock().remove(&cache_key);
+        });
     }
 
     fn handle_metrics_session<S: Read + Write>(&self, stream: &mut S) -> io::Result<()> {

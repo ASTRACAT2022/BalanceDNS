@@ -20,6 +20,8 @@ request_timeout_ms = 1500
 enabled = true
 max_size = 20000
 ttl_seconds = 600
+stale_refresh_enabled = true
+stale_ttl_seconds = 30
 
 [metrics]
 listen = "127.0.0.1:9100"

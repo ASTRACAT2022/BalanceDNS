@@ -59,6 +59,8 @@ pub struct Config {
     pub cache_enabled: bool,
     pub cache_size: usize,
     pub cache_ttl_seconds: u32,
+    pub stale_refresh_enabled: bool,
+    pub stale_ttl_seconds: u32,
     pub udp_ports: u16,
     pub listen_addr: String,
     pub udp_listen_addr: Option<String>,
@@ -205,6 +207,18 @@ impl Config {
             .map_or(600, |x| {
                 x.as_integer()
                     .expect("cache.ttl_seconds must be an integer")
+            }) as u32;
+        let stale_refresh_enabled = config_cache
+            .and_then(|x| x.get("stale_refresh_enabled"))
+            .map_or(false, |x| {
+                x.as_bool()
+                    .expect("cache.stale_refresh_enabled must be a boolean")
+            });
+        let stale_ttl_seconds = config_cache
+            .and_then(|x| x.get("stale_ttl_seconds"))
+            .map_or(30, |x| {
+                x.as_integer()
+                    .expect("cache.stale_ttl_seconds must be an integer")
             }) as u32;
 
         let webservice_listen_addr = config_metrics
@@ -438,6 +452,8 @@ impl Config {
             cache_enabled,
             cache_size,
             cache_ttl_seconds,
+            stale_refresh_enabled,
+            stale_ttl_seconds,
             udp_ports: 1,
             listen_addr,
             udp_listen_addr,
@@ -670,6 +686,8 @@ impl Config {
             cache_enabled: true,
             cache_size,
             cache_ttl_seconds: max_ttl,
+            stale_refresh_enabled: false,
+            stale_ttl_seconds: 30,
             udp_ports,
             listen_addr: listen_addr.clone(),
             udp_listen_addr: Some(listen_addr.clone()),
