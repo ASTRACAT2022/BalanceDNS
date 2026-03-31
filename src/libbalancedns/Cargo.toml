@@ -13,7 +13,7 @@ libloading = "0.8"
 log = "0.4"
 nix = "~0.8 "
 parking_lot = "*"
-privdrop = "*"
+privdrop = "=0.3.0"
 prometheus = "*"
 rand = "0.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "http2"] }
