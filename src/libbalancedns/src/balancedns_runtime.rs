@@ -939,6 +939,14 @@ fn parse_blocklist(body: &str) -> HashSet<String> {
         if line.is_empty() {
             continue;
         }
+        // Skip AdBlock-style rules (contain ##, ||, $, or start with special characters)
+        if line.contains("##") || line.contains("||") || line.contains('$') || line.starts_with('/') {
+            continue;
+        }
+        // Skip lines with commas (likely multi-domain rules or complex filters)
+        if line.contains(',') {
+            continue;
+        }
         let tokens = line.split_whitespace().collect::<Vec<&str>>();
         if tokens.is_empty() {
             continue;
@@ -953,7 +961,12 @@ fn parse_blocklist(body: &str) -> HashSet<String> {
             blocked.insert(normalize_domain(tokens[0]));
             continue;
         }
-        blocked.insert(normalize_domain(tokens[0]));
+        // Only add simple domain names (no wildcards or special characters)
+        let domain = tokens[0];
+        if domain.starts_with('*') || domain.contains('*') {
+            continue;
+        }
+        blocked.insert(normalize_domain(domain));
     }
     blocked
 }
