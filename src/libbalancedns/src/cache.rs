@@ -18,9 +18,9 @@
 
 use clockpro_cache::*;
 use coarsetime::{Duration, Instant};
-use config::Config;
-use dns;
-use dns::{NormalizedQuestion, NormalizedQuestionKey, DNS_CLASS_IN, DNS_RCODE_NXDOMAIN};
+use crate::config::Config;
+use crate::dns;
+use crate::dns::{NormalizedQuestion, NormalizedQuestionKey, DNS_CLASS_IN, DNS_RCODE_NXDOMAIN};
 use parking_lot::Mutex;
 use std::sync::Arc;
 

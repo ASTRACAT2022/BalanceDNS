@@ -2,6 +2,7 @@
 name = "balancedns"
 version = "0.3.0"
 authors = ["Frank Denis <github@pureftpd.org>"]
+edition = "2018"
 
 [features]
 clippy = ["libbalancedns/clippy"]

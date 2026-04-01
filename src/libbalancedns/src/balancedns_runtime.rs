@@ -1,11 +1,14 @@
 use base64;
 use base64::Engine;
-use cache::Cache;
-use config::{Config, RoutingRuleConfig, UpstreamConfig, UpstreamProtocol};
-use dns;
+use crate::cache::Cache;
+use crate::config::{Config, RoutingRuleConfig, UpstreamConfig, UpstreamProtocol};
+use crate::dns;
+use crate::plugins::{PacketAction, PluginManager};
+use crate::varz::Varz;
+use log::{debug, error, info};
 use parking_lot::{Mutex, RwLock};
-use plugins::{PacketAction, PluginManager};
 use prometheus::{Encoder, TextEncoder};
+use rand::Rng;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use rustls::{Certificate, PrivateKey, ServerConfig, ServerConnection, StreamOwned};
@@ -21,7 +24,6 @@ use std::thread;
 use std::time::Instant;
 use std::time::Duration as StdDuration;
 use url::Url;
-use varz::Varz;
 
 const TCP_SESSION_PREFETCH_MAX: usize = 4;
 const TCP_SESSION_PREFETCH_READ_TIMEOUT_MS: u64 = 5;
@@ -53,6 +55,7 @@ pub struct BalanceDnsRuntime {
     varz: Arc<Varz>,
     http_client: Client,
     stale_refresh_inflight: Mutex<HashSet<dns::NormalizedQuestionKey>>,
+    odoh_public_key_bytes: Vec<u8>,
 }
 
 struct InflightQueryGuard<'a> {
@@ -72,6 +75,17 @@ impl<'a> Drop for InflightQueryGuard<'a> {
     }
 }
 
+struct StaleRefreshGuard<'a> {
+    runtime: &'a BalanceDnsRuntime,
+    cache_key: dns::NormalizedQuestionKey,
+}
+
+impl<'a> Drop for StaleRefreshGuard<'a> {
+    fn drop(&mut self) {
+        self.runtime.stale_refresh_inflight.lock().remove(&self.cache_key);
+    }
+}
+
 impl BalanceDnsRuntime {
     pub fn new(config: Config, varz: Arc<Varz>) -> Arc<Self> {
         let local_hosts = config
@@ -87,6 +101,9 @@ impl BalanceDnsRuntime {
             .timeout(StdDuration::from_millis(config.request_timeout_ms))
             .build()
             .expect("Unable to initialize HTTP client");
+
+        let odoh_public_key_bytes: Vec<u8> = (0..64).map(|_| rand::random()).collect();
+
         Arc::new(BalanceDnsRuntime {
             cache: Cache::new(config.clone()),
             config: config.clone(),
@@ -98,6 +115,7 @@ impl BalanceDnsRuntime {
             varz,
             http_client,
             stale_refresh_inflight: Mutex::new(HashSet::new()),
+            odoh_public_key_bytes,
         })
     }
 
@@ -310,6 +328,97 @@ impl BalanceDnsRuntime {
             })
     }
 
+    fn handle_doh_session<S: Read + Write>(self: &Arc<Self>, stream: &mut S) -> io::Result<()> {
+        let request = read_http_request(stream)?;
+        let path = http_target_path(&request.target)?;
+
+        if path == "/dns-query" {
+            let body = match request.method.as_str() {
+                "GET" => parse_doh_get_request(&request.target)?,
+                "POST" => {
+                    let content_type = request
+                        .headers
+                        .get("content-type")
+                        .cloned()
+                        .unwrap_or_default();
+                    if !content_type.contains("application/dns-message") {
+                        write_http_response(
+                            stream,
+                            "415 Unsupported Media Type",
+                            "text/plain; charset=utf-8",
+                            b"unsupported content-type",
+                        )?;
+                        return Ok(());
+                    }
+                    request.body
+                }
+                _ => {
+                    write_http_response(
+                        stream,
+                        "405 Method Not Allowed",
+                        "text/plain; charset=utf-8",
+                        b"method not allowed",
+                    )?;
+                    return Ok(());
+                }
+            };
+            self.varz.client_queries.inc();
+            self.varz.client_queries_tcp.inc();
+            match self.process_query(&body) {
+                Ok(response) => write_http_response(
+                    stream,
+                    "200 OK",
+                    "application/dns-message",
+                    &response,
+                ),
+                Err(err) => write_http_response(
+                    stream,
+                    "500 Internal Server Error",
+                    "text/plain; charset=utf-8",
+                    err.to_string().as_bytes(),
+                ),
+            }
+        } else if path == "/odoh/configs" && request.method == "GET" {
+            write_http_response(
+                stream,
+                "200 OK",
+                "application/octet-stream",
+                &self.odoh_public_key_bytes,
+            )
+        } else if path == "/odoh" && request.method == "POST" {
+            let content_type = request
+                .headers
+                .get("content-type")
+                .cloned()
+                .unwrap_or_default();
+            if !content_type.contains("application/octet-stream") {
+                write_http_response(
+                    stream,
+                    "415 Unsupported Media Type",
+                    "text/plain; charset=utf-8",
+                    b"unsupported content-type",
+                )?;
+                return Ok(());
+            }
+
+            write_http_response(
+                stream,
+                "501 Not Implemented",
+                "text/plain; charset=utf-8",
+                b"ODoH is not fully implemented yet",
+            )?;
+            return Ok(());
+        } else {
+            write_http_response(
+                stream,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                b"not found",
+            )?;
+            Ok(())
+        }
+    }
+
     fn spawn_metrics_listener(self: &Arc<Self>, listen_addr: String) -> io::Result<thread::JoinHandle<()>> {
         let listener = TcpListener::bind(&listen_addr)?;
         info!("Metrics listener is ready on http://{}/metrics", listen_addr);
@@ -407,71 +516,13 @@ impl BalanceDnsRuntime {
         }
     }
 
-    fn handle_doh_session<S: Read + Write>(self: &Arc<Self>, stream: &mut S) -> io::Result<()> {
-        let request = read_http_request(stream)?;
-        if http_target_path(&request.target)? != "/dns-query" {
-            write_http_response(
-                stream,
-                "404 Not Found",
-                "text/plain; charset=utf-8",
-                b"not found",
-            )?;
-            return Ok(());
-        }
-        let body = match request.method.as_str() {
-            "GET" => parse_doh_get_request(&request.target)?,
-            "POST" => {
-                let content_type = request
-                    .headers
-                    .get("content-type")
-                    .cloned()
-                    .unwrap_or_default();
-                if !content_type.contains("application/dns-message") {
-                    write_http_response(
-                        stream,
-                        "415 Unsupported Media Type",
-                        "text/plain; charset=utf-8",
-                        b"unsupported content-type",
-                    )?;
-                    return Ok(());
-                }
-                request.body
-            }
-            _ => {
-                write_http_response(
-                    stream,
-                    "405 Method Not Allowed",
-                    "text/plain; charset=utf-8",
-                    b"method not allowed",
-                )?;
-                return Ok(());
-            }
-        };
-        self.varz.client_queries.inc();
-        self.varz.client_queries_tcp.inc();
-        match self.process_query(&body) {
-            Ok(response) => write_http_response(
-                stream,
-                "200 OK",
-                "application/dns-message",
-                &response,
-            ),
-            Err(err) => write_http_response(
-                stream,
-                "500 Internal Server Error",
-                "text/plain; charset=utf-8",
-                err.to_string().as_bytes(),
-            ),
-        }
-    }
-
     fn process_query(self: &Arc<Self>, packet: &[u8]) -> io::Result<Vec<u8>> {
         let _inflight_query = InflightQueryGuard::new(&self.varz);
         let mut packet = packet.to_vec();
-        if let Some(action) = self.plugins.apply_pre_query(&packet)? {
+        if let Some(action) = self.plugins.apply_pre_query(&packet) {
             match action {
                 PacketAction::Continue(updated) => packet = updated,
-                PacketAction::Respond(response) => return self.plugins.apply_post_response(&response),
+                PacketAction::Respond(response) => return Ok(self.plugins.apply_post_response(&response)),
             }
         }
         let normalized_question = dns::normalize(&packet, true)
@@ -494,7 +545,7 @@ impl BalanceDnsRuntime {
         if let Some((ip_addr, ttl)) = self.lookup_host(&fqdn) {
             let response = dns::build_address_packet(&normalized_question, ip_addr, ttl)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-            return self.plugins.apply_post_response(&response);
+            return Ok(self.plugins.apply_post_response(&response));
         }
 
         if self.config.cache_enabled {
@@ -514,19 +565,19 @@ impl BalanceDnsRuntime {
                         let mut cached_packet = cache_entry.packet.clone();
                         let _ = dns::set_ttl(&mut cached_packet, 1);
                         dns::set_tid(&mut cached_packet, normalized_question.tid);
-                        return self.plugins.apply_post_response(&cached_packet);
+                        return Ok(self.plugins.apply_post_response(&cached_packet));
                     }
                 } else {
                     self.varz.client_queries_cached.inc();
                     let mut cached_packet = cache_entry.packet.clone();
                     dns::set_tid(&mut cached_packet, normalized_question.tid);
-                    return self.plugins.apply_post_response(&cached_packet);
+                    return Ok(self.plugins.apply_post_response(&cached_packet));
                 }
             }
         }
 
         let response = self.resolve_via_upstreams(&normalized_question, &fqdn)?;
-        let response = self.plugins.apply_post_response(&response)?;
+        let response = self.plugins.apply_post_response(&response);
         if self.config.cache_enabled {
             let ttl = dns::min_ttl(
                 &response,
@@ -539,7 +590,6 @@ impl BalanceDnsRuntime {
                 .cache
                 .insert(normalized_question.key(), response.clone(), ttl);
         }
-        self.update_cache_metrics();
         Ok(response)
     }
 
@@ -559,9 +609,16 @@ impl BalanceDnsRuntime {
 
         let runtime = self.clone();
         thread::spawn(move || {
+            let _guard = StaleRefreshGuard {
+                runtime: &runtime,
+                cache_key: cache_key.clone(),
+            };
             let refresh_result = runtime
                 .resolve_via_upstreams(&normalized_question, &fqdn)
-                .and_then(|response| runtime.plugins.apply_post_response(&response));
+                .and_then(|response| {
+                    let processed = runtime.plugins.apply_post_response(&response);
+                    Ok(processed)
+                });
 
             if let Ok(response) = refresh_result {
                 let ttl = dns::min_ttl(
@@ -572,10 +629,7 @@ impl BalanceDnsRuntime {
                 )
                 .unwrap_or(runtime.config.cache_ttl_seconds);
                 let _ = runtime.cache.insert(cache_key.clone(), response, ttl);
-                runtime.update_cache_metrics();
             }
-
-            runtime.stale_refresh_inflight.lock().remove(&cache_key);
         });
     }
 
@@ -932,6 +986,7 @@ fn fetch_text(client: &Client, url: &str) -> io::Result<String> {
 enum TlsApplicationProtocol {
     Dns,
     Http11,
+    Http2,
 }
 
 fn load_tls_server_config(

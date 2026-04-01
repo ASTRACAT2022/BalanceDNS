@@ -11,9 +11,9 @@
 //! Timeouts are currently handled by the Resolvers themselves.
 
 use super::BalanceDNSContext;
-use cache::Cache;
-use client_query::*;
-use dns;
+use crate::cache::Cache;
+use crate::client_query::*;
+use crate::dns;
 use futures::future::{self, Future};
 use futures::oneshot;
 use futures::stream::Stream;
@@ -25,8 +25,8 @@ use std::rc::Rc;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use tokio_core::reactor::{Core, Handle};
-use udp_stream::*;
-use varz::Varz;
+use crate::udp_stream::*;
+use crate::varz::Varz;
 
 use super::{DNS_QUERY_MAX_SIZE, DNS_QUERY_MIN_SIZE};
 

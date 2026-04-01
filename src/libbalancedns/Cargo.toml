@@ -3,6 +3,7 @@ name = "libbalancedns"
 version = "0.3.0"
 authors = ["Frank Denis <github@pureftpd.org>"]
 publish = false
+edition = "2018"
 
 [dependencies]
 base64 = "*"

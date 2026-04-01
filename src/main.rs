@@ -2,34 +2,31 @@
 //! the service.
 #![allow(dead_code, unused_imports, unused_variables)]
 
-extern crate clap;
-extern crate env_logger;
-extern crate libbalancedns;
 #[macro_use]
 extern crate log;
 
-use clap::{App, Arg};
+use clap::{Command, Arg};
 use libbalancedns::{BalanceDNS, Config};
 
 fn main() {
     env_logger::init();
 
-    let matches = App::new("BalanceDNS")
+    let matches = Command::new("BalanceDNS")
         .version("0.3.0")
         .author("Frank Denis")
         .about("A balancing DNS proxy with UDP, TCP, DoT and DoH support")
         .arg(
-            Arg::with_name("config_file")
-                .short("c")
+            Arg::new("config_file")
+                .short('c')
                 .long("config")
                 .value_name("FILE")
                 .help("Path to the BalanceDNS TOML config file")
-                .takes_value(true)
+                .num_args(1)
                 .required(true),
         )
         .get_matches();
 
-    let config_file = match matches.value_of("config_file") {
+    let config_file = match matches.get_one::<String>("config_file") {
         None => {
             error!("A path to the configuration file is required");
             return;

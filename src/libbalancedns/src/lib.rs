@@ -8,22 +8,8 @@
 )]
 #![allow(dead_code, unused_imports, unused_variables)]
 
-extern crate base64;
-extern crate clockpro_cache;
-extern crate coarsetime;
-extern crate libloading;
 #[macro_use]
 extern crate log;
-extern crate nix;
-extern crate parking_lot;
-extern crate privdrop;
-extern crate reqwest;
-extern crate rand;
-extern crate rustls;
-extern crate rustls_pemfile;
-extern crate toml;
-extern crate url;
-
 #[macro_use]
 extern crate prometheus;
 

@@ -6,7 +6,7 @@
 use base64;
 use byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt};
 use coarsetime::Clock;
-use dns;
+use crate::dns;
 use rand::distributions::{IndependentSample, Range};
 use rand::{self, Rng};
 use siphasher::sip::SipHasher13;
@@ -15,7 +15,7 @@ use std::io::Cursor;
 use std::net::{self, SocketAddr};
 use std::rc::Rc;
 use tokio_core::reactor::Handle;
-use upstream_server::UpstreamServer;
+use crate::upstream_server::UpstreamServer;
 
 const PROBE_PREFIX: &[u8] = b"balancedns-probe-";
 const PROBE_SUFFIX: &[u8] = b"";
