@@ -23,6 +23,19 @@ env_logger = "0.11"
 log = "0.4"
 
 [profile.release]
-lto = true
+lto = "fat"
 panic = "abort"
 opt-level = 3
+codegen-units = 1
+strip = true
+target-cpu = "native"
+
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

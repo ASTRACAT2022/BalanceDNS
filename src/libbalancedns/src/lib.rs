@@ -17,6 +17,7 @@ mod balancedns_runtime;
 mod cache;
 mod config;
 pub mod dns;
+mod odoh;
 mod plugins;
 mod varz;
 

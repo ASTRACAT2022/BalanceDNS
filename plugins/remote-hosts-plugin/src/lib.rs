@@ -86,6 +86,16 @@ pub extern "C" fn balancedns_plugin_free(ptr: *mut u8, len: usize) {
     }
 }
 
+#[no_mangle]
+pub extern "C" fn balancedns_plugin_post_response(
+    input: *const u8,
+    input_len: usize,
+    output: *mut PluginOutput,
+) -> i32 {
+    let _ = (input, input_len, output);
+    0
+}
+
 fn refresh_hosts(state: &State) -> Result<(), String> {
     let body = ureq::get(HOSTS_URL)
         .timeout(Duration::from_secs(30))
@@ -173,20 +183,44 @@ fn parse_question(packet: &[u8]) -> Result<Question, ()> {
     })
 }
 
-fn parse_name(packet: &[u8], mut offset: usize) -> Result<(String, usize), ()> {
+fn parse_name(packet: &[u8], start_offset: usize) -> Result<(String, usize), ()> {
     let mut labels = Vec::new();
+    let mut offset = start_offset;
+    let mut jumped = false;
+    let mut max_jumps: usize = 10;
     loop {
         if offset >= packet.len() {
             return Err(());
         }
         let label_len = packet[offset] as usize;
-        offset += 1;
         if label_len == 0 {
+            if !jumped {
+                offset += 1;
+            }
             break;
+        }
+        if label_len & 0xc0 == 0xc0 {
+            if offset + 1 >= packet.len() {
+                return Err(());
+            }
+            let pointer = ((label_len & 0x3f) as usize) << 8 | packet[offset + 1] as usize;
+            if pointer >= start_offset {
+                return Err(());
+            }
+            if !jumped {
+                jumped = true;
+            }
+            offset = pointer;
+            max_jumps = max_jumps.saturating_sub(1);
+            if max_jumps == 0 {
+                return Err(());
+            }
+            continue;
         }
         if label_len & 0xc0 != 0 {
             return Err(());
         }
+        offset += 1;
         if offset + label_len > packet.len() {
             return Err(());
         }

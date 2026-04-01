@@ -3,6 +3,7 @@ use base64::Engine;
 use crate::cache::Cache;
 use crate::config::{Config, RoutingRuleConfig, UpstreamConfig, UpstreamProtocol};
 use crate::dns;
+use crate::odoh::OdohServer;
 use crate::plugins::{PacketAction, PluginManager};
 use crate::varz::Varz;
 use log::{debug, error, info};
@@ -19,14 +20,20 @@ use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 use std::time::Duration as StdDuration;
 use url::Url;
+use crossbeam_channel::bounded;
 
 const TCP_SESSION_PREFETCH_MAX: usize = 4;
 const TCP_SESSION_PREFETCH_READ_TIMEOUT_MS: u64 = 5;
+
+// Upstream query timeouts
+const UPSTREAM_QUERY_MIN_TIMEOUT_MS: u64 = 100;
+const UPSTREAM_QUERY_MAX_TIMEOUT_MS: u64 = 1000;
+const UPSTREAM_QUERY_MAX_DEVIATION_COEFFICIENT: f64 = 2.0;
+const UPSTREAM_PROBES_DELAY_MS: u64 = 5000;
 
 trait SessionStream: Read + Write {
     fn set_read_timeout(&self, timeout: Option<StdDuration>) -> io::Result<()>;
@@ -55,7 +62,7 @@ pub struct BalanceDnsRuntime {
     varz: Arc<Varz>,
     http_client: Client,
     stale_refresh_inflight: Mutex<HashSet<dns::NormalizedQuestionKey>>,
-    odoh_public_key_bytes: Vec<u8>,
+    odoh_server: OdohServer,
 }
 
 struct InflightQueryGuard<'a> {
@@ -102,7 +109,7 @@ impl BalanceDnsRuntime {
             .build()
             .expect("Unable to initialize HTTP client");
 
-        let odoh_public_key_bytes: Vec<u8> = (0..64).map(|_| rand::random()).collect();
+        let odoh_server = OdohServer::new();
 
         Arc::new(BalanceDnsRuntime {
             cache: Cache::new(config.clone()),
@@ -115,7 +122,7 @@ impl BalanceDnsRuntime {
             varz,
             http_client,
             stale_refresh_inflight: Mutex::new(HashSet::new()),
-            odoh_public_key_bytes,
+            odoh_server,
         })
     }
 
@@ -183,7 +190,7 @@ impl BalanceDnsRuntime {
         } else {
             default_workers.max(2)
         };
-        let (tx, rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>();
+        let (tx, rx) = bounded::<(SocketAddr, Vec<u8>)>(worker_count * 1024);
         let rx = Arc::new(Mutex::new(rx));
         for worker_id in 0..worker_count {
             let runtime = self.clone();
@@ -379,35 +386,21 @@ impl BalanceDnsRuntime {
                 ),
             }
         } else if path == "/odoh/configs" && request.method == "GET" {
-            write_http_response(
-                stream,
-                "200 OK",
-                "application/octet-stream",
-                &self.odoh_public_key_bytes,
-            )
-        } else if path == "/odoh" && request.method == "POST" {
-            let content_type = request
-                .headers
-                .get("content-type")
-                .cloned()
-                .unwrap_or_default();
-            if !content_type.contains("application/octet-stream") {
-                write_http_response(
-                    stream,
-                    "415 Unsupported Media Type",
-                    "text/plain; charset=utf-8",
-                    b"unsupported content-type",
-                )?;
-                return Ok(());
-            }
-
+            // oDoH is not implemented yet - return empty config
             write_http_response(
                 stream,
                 "501 Not Implemented",
                 "text/plain; charset=utf-8",
-                b"ODoH is not fully implemented yet",
-            )?;
-            return Ok(());
+                b"oDoH is not implemented yet",
+            )
+        } else if path == "/odoh" && request.method == "POST" {
+            // oDoH is not implemented yet
+            write_http_response(
+                stream,
+                "501 Not Implemented",
+                "text/plain; charset=utf-8",
+                b"oDoH is not implemented yet",
+            )
         } else {
             write_http_response(
                 stream,
@@ -538,14 +531,14 @@ impl BalanceDnsRuntime {
             return Ok(dns::build_refused_packet(&normalized_question)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?);
         }
-        if self.is_blocked(&fqdn) {
-            return Ok(dns::build_nxdomain_packet(&normalized_question)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?);
-        }
         if let Some((ip_addr, ttl)) = self.lookup_host(&fqdn) {
             let response = dns::build_address_packet(&normalized_question, ip_addr, ttl)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
             return Ok(self.plugins.apply_post_response(&response));
+        }
+        if self.is_blocked(&fqdn) {
+            return Ok(dns::build_nxdomain_packet(&normalized_question)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?);
         }
 
         if self.config.cache_enabled {
@@ -818,6 +811,7 @@ impl BalanceDnsRuntime {
             .map_err(map_http_client_error)
     }
 
+    #[inline]
     fn ordered_upstreams(&self, fqdn: &str) -> Vec<UpstreamConfig> {
         route_upstreams_for_fqdn(
             fqdn,
@@ -828,6 +822,7 @@ impl BalanceDnsRuntime {
         )
     }
 
+    #[inline]
     fn lookup_host(&self, fqdn: &str) -> Option<(IpAddr, u32)> {
         if let Some(ip_addr) = self.local_hosts.get(fqdn).copied() {
             return Some((ip_addr, self.config.cache_ttl_seconds));
@@ -846,6 +841,7 @@ impl BalanceDnsRuntime {
             })
     }
 
+    #[inline]
     fn is_blocked(&self, fqdn: &str) -> bool {
         self.remote_blocklist.read().contains(fqdn)
     }
@@ -924,6 +920,10 @@ fn parse_hosts_mapping(body: &str) -> HashMap<String, IpAddr> {
             continue;
         };
         if let Ok(ip_addr) = ip_str.parse::<IpAddr>() {
+            // Skip localhost and null addresses (used for blocking in hosts files)
+            if ip_addr.is_loopback() || ip_addr.is_unspecified() {
+                continue;
+            }
             for name in names {
                 hosts.insert(normalize_domain(name), ip_addr);
             }
@@ -958,6 +958,7 @@ fn parse_blocklist(body: &str) -> HashSet<String> {
     blocked
 }
 
+#[inline]
 fn strip_comment(line: &str) -> &str {
     match line.find('#') {
         Some(idx) => &line[..idx],
@@ -965,6 +966,7 @@ fn strip_comment(line: &str) -> &str {
     }
 }
 
+#[inline]
 fn normalize_domain(value: &str) -> String {
     let mut normalized = value.trim().trim_matches('`').trim().to_ascii_lowercase();
     if !normalized.ends_with('.') {
@@ -1127,10 +1129,12 @@ fn map_http_client_error(err: reqwest::Error) -> io::Error {
     }
 }
 
+#[inline]
 fn is_timeout_error(err: &io::Error) -> bool {
     matches!(err.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
 }
 
+#[inline]
 fn same_upstream(left: &UpstreamConfig, right: &UpstreamConfig) -> bool {
     left.name == right.name && left.proto == right.proto && left.addr == right.addr && left.url == right.url
 }
@@ -1219,6 +1223,7 @@ fn route_upstreams_for_fqdn(
     prioritized
 }
 
+#[inline]
 fn fqdn_matches_suffix(fqdn: &str, suffix: &str) -> bool {
     let fqdn = fqdn.to_ascii_lowercase();
     let suffix = suffix.to_ascii_lowercase();
@@ -1257,6 +1262,7 @@ fn prefetch_tcp_packets<S: SessionStream>(
     Ok(())
 }
 
+#[inline]
 fn try_take_tcp_frame(buffer: &mut Vec<u8>) -> io::Result<Option<Vec<u8>>> {
     if buffer.len() < 2 {
         return Ok(None);
@@ -1292,6 +1298,7 @@ fn read_tcp_query_frame<S: Read>(stream: &mut S) -> io::Result<Vec<u8>> {
     Ok(packet)
 }
 
+#[inline]
 fn write_tcp_response_frame<S: Write>(stream: &mut S, response: &[u8]) -> io::Result<()> {
     let response_len = response.len();
     let response_prefix = [(response_len >> 8) as u8, response_len as u8];

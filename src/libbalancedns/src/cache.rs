@@ -31,11 +31,13 @@ pub struct CacheEntry {
 }
 
 impl CacheEntry {
+    #[inline]
     pub fn is_expired(&self) -> bool {
         let now = Instant::recent();
         now > self.expiration
     }
 
+    #[inline]
     pub fn is_servable_stale(&self, stale_ttl_seconds: u32) -> bool {
         let now = Instant::recent();
         now <= self.expiration + Duration::from_secs(stale_ttl_seconds as u64)
@@ -57,12 +59,14 @@ pub struct CacheStats {
 }
 
 impl Cache {
+    #[inline]
     pub fn new(config: Config) -> Cache {
         let arc = ClockProCache::new(config.cache_size).unwrap();
         let arc_mx = Arc::new(Mutex::new(arc));
         Cache { config, arc_mx }
     }
 
+    #[inline]
     pub fn stats(&self) -> CacheStats {
         let cache = self.arc_mx.lock();
         CacheStats {
@@ -74,6 +78,7 @@ impl Cache {
         }
     }
 
+    #[inline]
     pub fn insert(&self, normalized_question_key: NormalizedQuestionKey, packet: Vec<u8>, ttl: u32) -> bool {
         debug_assert!(packet.len() >= dns::DNS_HEADER_SIZE);
         if packet.len() < dns::DNS_HEADER_SIZE {
@@ -87,6 +92,7 @@ impl Cache {
         cache.insert(normalized_question_key, cache_entry)
     }
 
+    #[inline]
     pub fn get(&self, normalized_question_key: &NormalizedQuestionKey) -> Option<CacheEntry> {
         let mut cache = self.arc_mx.lock();
         cache

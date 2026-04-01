@@ -10,6 +10,7 @@ base64 = "*"
 clippy = {version = "*", optional = true}
 clockpro-cache = "0.1.12"
 coarsetime = "0.1.10"
+crossbeam-channel = "0.5"
 libloading = "0.8"
 log = "0.4"
 nix = "~0.8 "
@@ -17,13 +18,26 @@ parking_lot = "*"
 privdrop = "=0.3.0"
 prometheus = "*"
 rand = "0.5"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots", "http2"] }
 rustls = "0.21"
 rustls-pemfile = "1"
 toml = "0.8"
 url = "*"
 
 [profile.release]
-lto = true
+lto = "fat"
 panic = "abort"
 opt-level = 3
+codegen-units = 1
+strip = true
+target-cpu = "native"
+
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
