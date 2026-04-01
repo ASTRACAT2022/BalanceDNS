@@ -106,15 +106,12 @@ impl Config {
     }
 
     pub fn from_string(toml: &str) -> Result<Config, Error> {
-        let toml_config = match toml.parse() {
-            Ok(toml_config) => toml_config,
-            Err(_) => {
-                return Err(Error::new(
-                    ErrorKind::InvalidData,
-                    "Syntax error - config file is not valid TOML",
-                ))
-            }
-        };
+        let toml_config: toml::Value = toml::from_str(toml).map_err(|err| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("Syntax error - config file is not valid TOML: {}", err),
+            )
+        })?;
         Self::parse(toml_config)
     }
 
