@@ -95,6 +95,7 @@ struct StaleRefreshGuard<'a> {
 impl<'a> Drop for StaleRefreshGuard<'a> {
     fn drop(&mut self) {
         self.runtime.stale_refresh_inflight.lock().remove(&self.cache_key);
+        self.runtime.stale_refresh_active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -687,7 +688,6 @@ impl BalanceDnsRuntime {
                 .unwrap_or(runtime.config.cache_ttl_seconds);
                 let _ = runtime.cache.insert(cache_key.clone(), response, ttl);
             }
-            runtime.stale_refresh_active.fetch_sub(1, Ordering::Relaxed);
         });
     }
 
