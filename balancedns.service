@@ -33,4 +33,4 @@ ReadWritePaths=/var/lib/balancedns
 ReadOnlyPaths=/etc/balancedns.toml
 StateDirectory=balancedns
 WorkingDirectory=/var/lib/balancedns
-ExecStart=/usr/local/bin/balancedns --config /etc/balancedns.toml
+ExecStart=/usr/sbin/balancedns --config /etc/balancedns.toml

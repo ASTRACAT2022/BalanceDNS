@@ -64,7 +64,19 @@ install_config() {
 }
 
 install_unit() {
-    install -m 0644 "${REPO_DIR}/balancedns.service" "${SYSTEMD_UNIT_PATH}.new"
+    awk \
+        -v service_user="${SERVICE_USER}" \
+        -v service_group="${SERVICE_GROUP}" \
+        -v binary_path="${BINARY_PATH}" \
+        -v config_path="${CONFIG_PATH}" \
+        '
+        /^User=/ { print "User=" service_user; next }
+        /^Group=/ { print "Group=" service_group; next }
+        /^ReadOnlyPaths=/ { print "ReadOnlyPaths=" config_path; next }
+        /^ExecStart=/ { print "ExecStart=" binary_path " --config " config_path; next }
+        { print }
+        ' "${REPO_DIR}/balancedns.service" > "${SYSTEMD_UNIT_PATH}.new"
+    chmod 0644 "${SYSTEMD_UNIT_PATH}.new"
     mv -f "${SYSTEMD_UNIT_PATH}.new" "${SYSTEMD_UNIT_PATH}"
 }
 
