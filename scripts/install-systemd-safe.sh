@@ -8,6 +8,7 @@ SERVICE_USER="${SERVICE_USER:-balancedns}"
 SERVICE_GROUP="${SERVICE_GROUP:-balancedns}"
 SYSTEMD_UNIT_PATH="${SYSTEMD_UNIT_PATH:-/etc/systemd/system/${SERVICE_NAME}.service}"
 BINARY_PATH="${BINARY_PATH:-/usr/sbin/balancedns}"
+CLI_BINARY_PATH="${CLI_BINARY_PATH:-/usr/sbin/astracatdnscli}"
 PLUGIN_DIR="${PLUGIN_DIR:-/usr/lib/balancedns/plugins}"
 CONFIG_SOURCE="${CONFIG_SOURCE:-${REPO_DIR}/balancedns.toml}"
 CONFIG_PATH="${CONFIG_PATH:-/etc/balancedns.toml}"
@@ -98,6 +99,7 @@ main() {
     RUN_TESTS="${RUN_TESTS}" \
     SERVICE_NAME="${SERVICE_NAME}" \
     BINARY_PATH="${BINARY_PATH}" \
+    CLI_BINARY_PATH="${CLI_BINARY_PATH}" \
     PLUGIN_DIR="${PLUGIN_DIR}" \
     CONFIG_PATH="${CONFIG_PATH}" \
     REPO_DIR="${REPO_DIR}" \
@@ -108,6 +110,7 @@ main() {
 
     log "systemd unit installed: ${SYSTEMD_UNIT_PATH}"
     log "binary installed: ${BINARY_PATH}"
+    log "admin cli installed: ${CLI_BINARY_PATH}"
     log "plugins installed: ${PLUGIN_DIR}"
     log "config path: ${CONFIG_PATH}"
     log "service is active"

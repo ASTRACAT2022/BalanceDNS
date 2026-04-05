@@ -7,6 +7,7 @@ REMOTE_NAME="${REMOTE_NAME:-origin}"
 BRANCH="${BRANCH:-main}"
 SERVICE_NAME="${SERVICE_NAME:-balancedns}"
 BINARY_PATH="${BINARY_PATH:-/usr/sbin/balancedns}"
+CLI_BINARY_PATH="${CLI_BINARY_PATH:-/usr/sbin/astracatdnscli}"
 PLUGIN_DIR="${PLUGIN_DIR:-/usr/lib/balancedns/plugins}"
 CONFIG_SOURCE="${CONFIG_SOURCE:-${REPO_DIR}/balancedns.toml}"
 CONFIG_PATH="${CONFIG_PATH:-/etc/balancedns.toml}"
@@ -66,6 +67,11 @@ rollback() {
         install -m 0755 "${ROLLBACK_DIR}/balancedns.previous" "${BINARY_PATH}"
     else
         rm -f "${BINARY_PATH}"
+    fi
+    if [ -f "${ROLLBACK_DIR}/astracatdnscli.previous" ]; then
+        install -m 0755 "${ROLLBACK_DIR}/astracatdnscli.previous" "${CLI_BINARY_PATH}"
+    else
+        rm -f "${CLI_BINARY_PATH}"
     fi
     mkdir -p "${PLUGIN_DIR}"
     for plugin_name in "${PLUGIN_NAMES[@]}"; do
@@ -138,6 +144,9 @@ ROLLBACK_DIR="$(mktemp -d)"
 if [ -f "${BINARY_PATH}" ]; then
     cp -p "${BINARY_PATH}" "${ROLLBACK_DIR}/balancedns.previous"
 fi
+if [ -f "${CLI_BINARY_PATH}" ]; then
+    cp -p "${CLI_BINARY_PATH}" "${ROLLBACK_DIR}/astracatdnscli.previous"
+fi
 
 mkdir -p "${PLUGIN_DIR}"
 for plugin_name in "${PLUGIN_NAMES[@]}"; do
@@ -155,6 +164,10 @@ DEPLOY_PHASE="install"
 log "installing binary"
 install -m 0755 "${REPO_DIR}/target/release/balancedns" "${BINARY_PATH}.new"
 mv -f "${BINARY_PATH}.new" "${BINARY_PATH}"
+
+log "installing admin cli"
+install -m 0755 "${REPO_DIR}/target/release/astracatdnscli" "${CLI_BINARY_PATH}.new"
+mv -f "${CLI_BINARY_PATH}.new" "${CLI_BINARY_PATH}"
 
 log "installing plugins"
 for plugin_name in "${PLUGIN_NAMES[@]}"; do

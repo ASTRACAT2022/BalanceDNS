@@ -19,6 +19,8 @@ pub struct Varz {
     pub client_queries: Gauge,
     pub client_queries_udp: Counter,
     pub client_queries_tcp: Counter,
+    pub client_queries_dot: Counter,
+    pub client_queries_doh: Counter,
     pub client_queries_cached: Counter,
     pub client_queries_expired: Counter,
     pub client_queries_offline: Counter,
@@ -92,6 +94,20 @@ impl Varz {
                 "balancedns_client_queries_tcp",
                 "Number of client queries received \
                  using TCP",
+                labels! {"handler" => "all",}
+            ))
+            .unwrap(),
+            client_queries_dot: register_counter!(opts!(
+                "balancedns_client_queries_dot",
+                "Number of client queries received \
+                 using DoT",
+                labels! {"handler" => "all",}
+            ))
+            .unwrap(),
+            client_queries_doh: register_counter!(opts!(
+                "balancedns_client_queries_doh",
+                "Number of client queries received \
+                 using DoH",
                 labels! {"handler" => "all",}
             ))
             .unwrap(),
@@ -171,7 +187,10 @@ impl Varz {
     pub fn snapshot(&self) {
         let StartInstant(start_instant) = self.start_instant;
         self.uptime.set(start_instant.elapsed().as_secs() as f64);
-        let client_queries = self.client_queries_udp.get() + self.client_queries_tcp.get();
+        let client_queries = self.client_queries_udp.get()
+            + self.client_queries_tcp.get()
+            + self.client_queries_dot.get()
+            + self.client_queries_doh.get();
         self.client_queries.set(client_queries);
     }
 }

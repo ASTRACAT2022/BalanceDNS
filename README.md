@@ -38,6 +38,35 @@ cargo build --release
 ./target/release/balancedns -c ./balancedns.toml
 ```
 
+# Автонастройка
+
+Есть интерактивный скрипт, который сам собирает конфиг из твоих ответов, включает Prometheus и предлагает сборку/установку:
+
+```bash
+./scripts/autosetup.sh
+```
+
+Полный конструктор конфигурации + автоинсталлер/deploy:
+
+```bash
+./scripts/install-wizard.sh
+```
+
+# Admin CLI
+
+Добавлен админский CLI с live-графиками и техстатусом:
+
+```bash
+cargo run --bin astracatdnscli -- status -c ./balancedns.toml
+cargo run --bin astracatdnscli -- watch -c ./balancedns.toml -i 2
+```
+
+Для установленного сервера команда обычно доступна как:
+
+```bash
+astracatdnscli watch -c /etc/balancedns.toml
+```
+
 # Конфиг
 
 Пример рабочего конфига находится в файле `balancedns.toml`.
@@ -85,6 +114,11 @@ refresh_seconds = 300
 
 [plugins]
 libraries = []
+
+[global]
+threads_udp = 8
+threads_tcp = 4
+max_tcp_clients = 4096
 
 [[upstreams]]
 name = "cloudflare-doh"
@@ -208,6 +242,14 @@ libraries = [
   "plugins/libbalancedns_filter.dylib"
 ]
 ```
+
+## [global]
+
+- `threads_udp` — число UDP worker-потоков
+- `threads_tcp` — число TCP acceptor-потоков (legacy/совместимость)
+- `max_tcp_clients` — лимит одновременных TCP/DoT/DoH-соединений
+
+Для высокой нагрузки обычно полезно ставить `threads_udp` примерно `2 x CPU cores`.
 
 ## [[upstreams]]
 
@@ -366,6 +408,8 @@ pub extern "C" fn balancedns_plugin_free(ptr: *mut u8, len: usize) {
 - `balancedns_client_queries`
 - `balancedns_client_queries_udp`
 - `balancedns_client_queries_tcp`
+- `balancedns_client_queries_dot`
+- `balancedns_client_queries_doh`
 - `balancedns_client_queries_cached`
 - `balancedns_client_queries_expired`
 - `balancedns_client_queries_errors`
@@ -422,8 +466,11 @@ cargo fmt -- --check
 # Структура проекта
 
 - `src/main.rs` — CLI-вход
+- `src/bin/astracatdnscli.rs` — admin CLI (status/watch, live-графики)
 - `src/libbalancedns/src/config.rs` — парсинг нового и legacy-конфига
 - `src/libbalancedns/src/balancedns_runtime.rs` — runtime, listeners, upstream, cache, hosts, blocklist, DoT, DoH, metrics
 - `src/libbalancedns/src/plugins.rs` — загрузка и вызов плагинов
 - `balancedns.toml` — пример конфигурации
 - `balancedns.service` — пример unit-файла
+- `scripts/autosetup.sh` — интерактивная автонастройка конфига/сборки
+- `scripts/install-wizard.sh` — конструктор конфига + автоинсталлер/deploy

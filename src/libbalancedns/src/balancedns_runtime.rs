@@ -15,6 +15,7 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use rustls::{Certificate, PrivateKey, ServerConfig, ServerConnection, StreamOwned};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -36,6 +37,8 @@ const UPSTREAM_QUERY_MAX_DEVIATION_COEFFICIENT: f64 = 2.0;
 const UPSTREAM_PROBES_DELAY_MS: u64 = 5000;
 const MAX_STALE_REFRESH_THREADS: usize = 8;
 const DOH_MAX_BODY_SIZE: usize = 65535;
+const UDP_UPSTREAM_SOCKET_POOL_MIN: usize = 32;
+const UDP_UPSTREAM_SOCKET_POOL_MAX: usize = 256;
 
 trait SessionStream: Read + Write {
     fn set_read_timeout(&self, timeout: Option<StdDuration>) -> io::Result<()>;
@@ -66,7 +69,7 @@ pub struct BalanceDnsRuntime {
     stale_refresh_inflight: Mutex<HashSet<dns::NormalizedQuestionKey>>,
     stale_refresh_active: AtomicUsize,
     tcp_connection_count: AtomicUsize,
-    upstream_udp_sockets: Vec<UdpSocket>,
+    upstream_udp_sockets: Vec<Mutex<UdpSocket>>,
     odoh_server: OdohServer,
 }
 
@@ -118,11 +121,13 @@ impl BalanceDnsRuntime {
         let odoh_server = OdohServer::new();
 
         // Pre-create a pool of UDP sockets for upstream queries
-        let socket_pool_size = 64;
+        let socket_pool_size = thread::available_parallelism()
+            .map(|parallelism| (parallelism.get() * 8).clamp(UDP_UPSTREAM_SOCKET_POOL_MIN, UDP_UPSTREAM_SOCKET_POOL_MAX))
+            .unwrap_or(64);
         let mut upstream_udp_sockets = Vec::with_capacity(socket_pool_size);
         for _ in 0..socket_pool_size {
             match UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))) {
-                Ok(sock) => upstream_udp_sockets.push(sock),
+                Ok(sock) => upstream_udp_sockets.push(Mutex::new(sock)),
                 Err(err) => {
                     log::warn!("Failed to pre-allocate upstream UDP socket: {}", err);
                 }
@@ -131,8 +136,10 @@ impl BalanceDnsRuntime {
         if upstream_udp_sockets.is_empty() {
             // Fallback: at least one
             upstream_udp_sockets.push(
-                UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
-                    .expect("Unable to bind any UDP socket for upstream queries"),
+                Mutex::new(
+                    UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+                        .expect("Unable to bind any UDP socket for upstream queries"),
+                ),
             );
         }
 
@@ -155,6 +162,7 @@ impl BalanceDnsRuntime {
     }
 
     pub fn run(self: &Arc<Self>) -> io::Result<()> {
+        self.prime_remote_data_in_memory();
         self.spawn_refreshers();
         let mut handles = Vec::new();
         if let Some(ref listen_addr) = self.config.udp_listen_addr {
@@ -204,6 +212,11 @@ impl BalanceDnsRuntime {
                 })
                 .unwrap();
         }
+    }
+
+    fn prime_remote_data_in_memory(&self) {
+        self.refresh_remote_hosts_once();
+        self.refresh_remote_blocklist_once();
     }
 
     fn spawn_udp_listener(self: &Arc<Self>, listen_addr: String) -> io::Result<thread::JoinHandle<()>> {
@@ -425,7 +438,7 @@ impl BalanceDnsRuntime {
                 }
             };
             self.varz.client_queries.inc();
-            self.varz.client_queries_tcp.inc();
+            self.varz.client_queries_doh.inc();
             match self.process_query(&body) {
                 Ok(response) => write_http_response(
                     stream,
@@ -558,7 +571,7 @@ impl BalanceDnsRuntime {
                 Err(err) => return Err(err),
             };
             self.varz.client_queries.inc();
-            self.varz.client_queries_tcp.inc();
+            self.varz.client_queries_dot.inc();
             let response = self.process_query(&packet)?;
             write_tcp_response_frame(&mut stream, &response)?;
         }
@@ -566,14 +579,18 @@ impl BalanceDnsRuntime {
 
     fn process_query(self: &Arc<Self>, packet: &[u8]) -> io::Result<Vec<u8>> {
         let _inflight_query = InflightQueryGuard::new(&self.varz);
-        let mut packet = packet.to_vec();
-        if let Some(action) = self.plugins.apply_pre_query(&packet) {
-            match action {
-                PacketAction::Continue(updated) => packet = updated,
-                PacketAction::Respond(response) => return Ok(self.plugins.apply_post_response(&response)),
+        let packet = if self.plugins.is_empty() {
+            Cow::Borrowed(packet)
+        } else {
+            match self.plugins.apply_pre_query(packet) {
+                None => Cow::Borrowed(packet),
+                Some(PacketAction::Continue(updated)) => Cow::Owned(updated),
+                Some(PacketAction::Respond(response)) => {
+                    return Ok(self.apply_post_response_plugins(response))
+                }
             }
-        }
-        let normalized_question = dns::normalize(&packet, true)
+        };
+        let normalized_question = dns::normalize(packet.as_ref(), true)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let fqdn = dns::qname_to_fqdn(&normalized_question.qname)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
@@ -589,7 +606,7 @@ impl BalanceDnsRuntime {
         if let Some((ip_addr, ttl)) = self.lookup_host(&fqdn) {
             let response = dns::build_address_packet(&normalized_question, ip_addr, ttl)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-            return Ok(self.plugins.apply_post_response(&response));
+            return Ok(self.apply_post_response_plugins(response));
         }
         if self.is_blocked(&fqdn) {
             return Ok(dns::build_nxdomain_packet(&normalized_question)
@@ -613,19 +630,19 @@ impl BalanceDnsRuntime {
                         let mut cached_packet = cache_entry.packet.clone();
                         let _ = dns::set_ttl(&mut cached_packet, 1);
                         dns::set_tid(&mut cached_packet, normalized_question.tid);
-                        return Ok(self.plugins.apply_post_response(&cached_packet));
+                        return Ok(self.apply_post_response_plugins(cached_packet));
                     }
                 } else {
                     self.varz.client_queries_cached.inc();
                     let mut cached_packet = cache_entry.packet.clone();
                     dns::set_tid(&mut cached_packet, normalized_question.tid);
-                    return Ok(self.plugins.apply_post_response(&cached_packet));
+                    return Ok(self.apply_post_response_plugins(cached_packet));
                 }
             }
         }
 
         let response = self.resolve_via_upstreams(&normalized_question, &fqdn)?;
-        let response = self.plugins.apply_post_response(&response);
+        let response = self.apply_post_response_plugins(response);
         if self.config.cache_enabled {
             let ttl = dns::min_ttl(
                 &response,
@@ -674,7 +691,7 @@ impl BalanceDnsRuntime {
             let refresh_result = runtime
                 .resolve_via_upstreams(&normalized_question, &fqdn)
                 .and_then(|response| {
-                    let processed = runtime.plugins.apply_post_response(&response);
+                    let processed = runtime.apply_post_response_plugins(response);
                     Ok(processed)
                 });
 
@@ -738,11 +755,14 @@ impl BalanceDnsRuntime {
     ) -> io::Result<Vec<u8>> {
         let (query_packet, upstream_question) = dns::build_query_packet(normalized_question, false)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let upstreams = self.ordered_upstreams(fqdn);
+        let upstream_indices = self.ordered_upstream_indices(fqdn);
+        let upstream_question_fqdn = dns::qname_to_fqdn(&upstream_question.qname)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let total_timeout = StdDuration::from_millis(self.config.request_timeout_ms);
         let started_at = std::time::Instant::now();
         let mut last_err = None;
-        for upstream in upstreams {
+        for upstream_idx in upstream_indices {
+            let upstream = &self.config.upstreams[upstream_idx];
             let elapsed = started_at.elapsed();
             if elapsed >= total_timeout {
                 last_err = Some(io::Error::new(
@@ -754,9 +774,10 @@ impl BalanceDnsRuntime {
             let remaining_timeout = total_timeout.saturating_sub(elapsed);
             self.varz.upstream_sent.inc();
             match self.query_upstream(
-                &upstream,
+                upstream,
                 &query_packet,
                 &upstream_question,
+                &upstream_question_fqdn,
                 normalized_question.tid,
                 remaining_timeout,
             ) {
@@ -787,6 +808,7 @@ impl BalanceDnsRuntime {
         upstream: &UpstreamConfig,
         query_packet: &[u8],
         upstream_question: &dns::NormalizedQuestionMinimal,
+        upstream_question_fqdn: &str,
         client_tid: u16,
         timeout: StdDuration,
     ) -> io::Result<Vec<u8>> {
@@ -797,13 +819,12 @@ impl BalanceDnsRuntime {
         };
         let normalized_response = dns::normalize(&response, false)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let normalized_response_fqdn = dns::qname_to_fqdn(&normalized_response.qname)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         if normalized_response.tid != upstream_question.tid
             || normalized_response.qtype != upstream_question.qtype
             || normalized_response.qclass != upstream_question.qclass
-            || dns::qname_to_fqdn(&normalized_response.qname)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
-                != dns::qname_to_fqdn(&upstream_question.qname)
-                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+            || normalized_response_fqdn != upstream_question_fqdn
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -837,15 +858,36 @@ impl BalanceDnsRuntime {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing upstream addr"))?
             .parse()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid upstream addr"))?;
-        // Use a socket from the pre-allocated pool instead of binding a new one per query
         let pool_idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % self.upstream_udp_sockets.len();
-        let socket = &self.upstream_udp_sockets[pool_idx];
+        let socket = self.upstream_udp_sockets[pool_idx].lock();
+
+        // Serialize request/response per pooled socket to avoid reply mixups under concurrent load.
         socket.set_read_timeout(Some(timeout))?;
         socket.set_write_timeout(Some(timeout))?;
         socket.send_to(query_packet, remote_addr)?;
+
+        let deadline = Instant::now() + timeout;
         let mut buf = [0u8; 65535];
-        let (len, _) = socket.recv_from(&mut buf)?;
-        Ok(buf[..len].to_vec())
+        loop {
+            let remaining_timeout = deadline.saturating_duration_since(Instant::now());
+            socket.set_read_timeout(Some(remaining_timeout))?;
+            match socket.recv_from(&mut buf) {
+                Ok((len, addr)) if addr == remote_addr => return Ok(buf[..len].to_vec()),
+                Ok((_len, addr)) => {
+                    debug!(
+                        "Ignoring UDP response from unexpected sender {} (expected {})",
+                        addr, remote_addr
+                    );
+                    if remaining_timeout.is_zero() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "Timed out while waiting for UDP upstream response",
+                        ));
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     fn query_doh_upstream(
@@ -875,11 +917,11 @@ impl BalanceDnsRuntime {
     }
 
     #[inline]
-    fn ordered_upstreams(&self, fqdn: &str) -> Vec<UpstreamConfig> {
-        route_upstreams_for_fqdn(
+    fn ordered_upstream_indices(&self, fqdn: &str) -> Vec<usize> {
+        route_upstream_indices_for_fqdn(
             fqdn,
             &self.config.routing_rules,
-            &self.config.upstreams,
+            self.config.upstreams.as_slice(),
             &self.config.balancing_algorithm,
             &self.rr_counter,
         )
@@ -915,14 +957,7 @@ impl BalanceDnsRuntime {
             None => return,
         };
         loop {
-            match fetch_text(&self.http_client, &config.url) {
-                Ok(body) => {
-                    let hosts = parse_hosts_mapping(&body);
-                    *self.remote_hosts.write() = hosts;
-                    info!("Loaded {} remote host overrides", self.remote_hosts.read().len());
-                }
-                Err(err) => error!("Unable to refresh remote hosts [{}]: {}", config.url, err),
-            }
+            self.refresh_remote_hosts_once();
             thread::sleep(StdDuration::from_secs(config.refresh_seconds));
         }
     }
@@ -933,15 +968,36 @@ impl BalanceDnsRuntime {
             None => return,
         };
         loop {
-            match fetch_text(&self.http_client, &config.url) {
-                Ok(body) => {
-                    let entries = parse_blocklist(&body);
-                    *self.remote_blocklist.write() = entries;
-                    info!("Loaded {} remote blocked domains", self.remote_blocklist.read().len());
-                }
-                Err(err) => error!("Unable to refresh blocklist [{}]: {}", config.url, err),
-            }
+            self.refresh_remote_blocklist_once();
             thread::sleep(StdDuration::from_secs(config.refresh_seconds));
+        }
+    }
+
+    fn refresh_remote_hosts_once(&self) {
+        let Some(config) = self.config.hosts_remote.as_ref() else {
+            return;
+        };
+        match fetch_text(&self.http_client, &config.url) {
+            Ok(body) => {
+                let hosts = parse_hosts_mapping(&body);
+                *self.remote_hosts.write() = hosts;
+                info!("Loaded {} remote host overrides", self.remote_hosts.read().len());
+            }
+            Err(err) => error!("Unable to refresh remote hosts [{}]: {}", config.url, err),
+        }
+    }
+
+    fn refresh_remote_blocklist_once(&self) {
+        let Some(config) = self.config.blocklist_remote.as_ref() else {
+            return;
+        };
+        match fetch_text(&self.http_client, &config.url) {
+            Ok(body) => {
+                let entries = parse_blocklist(&body);
+                *self.remote_blocklist.write() = entries;
+                info!("Loaded {} remote blocked domains", self.remote_blocklist.read().len());
+            }
+            Err(err) => error!("Unable to refresh blocklist [{}]: {}", config.url, err),
         }
     }
 
@@ -957,6 +1013,15 @@ impl BalanceDnsRuntime {
     fn snapshot_metrics(&self) {
         self.varz.snapshot();
         self.update_cache_metrics();
+    }
+
+    #[inline]
+    fn apply_post_response_plugins(&self, response: Vec<u8>) -> Vec<u8> {
+        if self.plugins.is_empty() {
+            response
+        } else {
+            self.plugins.apply_post_response(&response)
+        }
     }
 }
 
@@ -1231,36 +1296,31 @@ fn is_timeout_error(err: &io::Error) -> bool {
 }
 
 #[inline]
-fn same_upstream(left: &UpstreamConfig, right: &UpstreamConfig) -> bool {
-    left.name == right.name && left.proto == right.proto && left.addr == right.addr && left.url == right.url
-}
-
-fn select_upstreams(
+fn select_upstream_indices(
     upstreams: &[UpstreamConfig],
     balancing_algorithm: &str,
     rr_counter: &AtomicUsize,
-) -> Vec<UpstreamConfig> {
+) -> Vec<usize> {
     if upstreams.is_empty() {
         return Vec::new();
     }
 
-    let mut weighted_indices = Vec::new();
-    for (index, upstream) in upstreams.iter().enumerate() {
-        let copies = if upstream.weight == 0 { 1 } else { upstream.weight };
-        for _ in 0..copies {
-            weighted_indices.push(index);
-        }
-    }
-
-    let primary_index = if weighted_indices.is_empty() {
-        0
-    } else {
-        let start = match balancing_algorithm {
-            "round_robin" => rr_counter.fetch_add(1, Ordering::Relaxed) % weighted_indices.len(),
-            _ => 0,
-        };
-        weighted_indices[start]
+    let total_weight = upstreams
+        .iter()
+        .fold(0usize, |sum, upstream| sum.saturating_add(upstream.weight.max(1)));
+    let mut slot = match balancing_algorithm {
+        "round_robin" if total_weight > 0 => rr_counter.fetch_add(1, Ordering::Relaxed) % total_weight,
+        _ => 0,
     };
+    let mut primary_index = 0usize;
+    for (index, upstream) in upstreams.iter().enumerate() {
+        let weight = upstream.weight.max(1);
+        if slot < weight {
+            primary_index = index;
+            break;
+        }
+        slot -= weight;
+    }
 
     let mut remaining_indices = (0..upstreams.len())
         .filter(|index| *index != primary_index)
@@ -1273,47 +1333,51 @@ fn select_upstreams(
     });
 
     let mut ordered = Vec::with_capacity(upstreams.len());
-    ordered.push(upstreams[primary_index].clone());
+    ordered.push(primary_index);
     for index in remaining_indices {
-        if !ordered.iter().any(|existing| same_upstream(existing, &upstreams[index])) {
-            ordered.push(upstreams[index].clone());
-        }
+        ordered.push(index);
     }
     ordered
 }
 
-fn route_upstreams_for_fqdn(
+fn route_upstream_indices_for_fqdn(
     fqdn: &str,
     routing_rules: &[RoutingRuleConfig],
     upstreams: &[UpstreamConfig],
     balancing_algorithm: &str,
     rr_counter: &AtomicUsize,
-) -> Vec<UpstreamConfig> {
-    let ordered = select_upstreams(upstreams, balancing_algorithm, rr_counter);
-    if ordered.is_empty() {
-        return ordered;
+) -> Vec<usize> {
+    let ordered_indices = select_upstream_indices(upstreams, balancing_algorithm, rr_counter);
+    if ordered_indices.is_empty() {
+        return ordered_indices;
     }
     let matched_rule = routing_rules
         .iter()
         .find(|rule| fqdn_matches_suffix(fqdn, &rule.suffix));
 
     let Some(rule) = matched_rule else {
-        return ordered;
+        return ordered_indices;
     };
 
-    let mut prioritized = Vec::new();
+    let mut prioritized = Vec::with_capacity(ordered_indices.len());
+    let mut seen = vec![false; upstreams.len()];
     for upstream_name in &rule.upstreams {
-        if let Some(upstream) = ordered.iter().find(|upstream| upstream.name == *upstream_name) {
-            prioritized.push(upstream.clone());
+        if let Some(index) = ordered_indices
+            .iter()
+            .copied()
+            .find(|index| upstreams[*index].name == *upstream_name)
+        {
+            if !seen[index] {
+                seen[index] = true;
+                prioritized.push(index);
+            }
         }
     }
 
-    for upstream in ordered {
-        if !prioritized
-            .iter()
-            .any(|existing| same_upstream(existing, &upstream))
-        {
-            prioritized.push(upstream);
+    for index in ordered_indices {
+        if !seen[index] {
+            seen[index] = true;
+            prioritized.push(index);
         }
     }
     prioritized
@@ -1422,8 +1486,8 @@ fn write_http_response<S: Write>(
 
 #[cfg(test)]
 mod tests {
-    use super::{route_upstreams_for_fqdn, select_upstreams, try_take_tcp_frame};
-    use config::{RoutingRuleConfig, UpstreamConfig, UpstreamProtocol};
+    use super::{route_upstream_indices_for_fqdn, select_upstream_indices, try_take_tcp_frame};
+    use crate::config::{RoutingRuleConfig, UpstreamConfig, UpstreamProtocol};
     use std::sync::atomic::AtomicUsize;
 
     #[test]
@@ -1456,8 +1520,11 @@ mod tests {
         ];
 
         let rr_counter = AtomicUsize::new(1);
-        let ordered = select_upstreams(&upstreams, "round_robin", &rr_counter);
-        let names = ordered.into_iter().map(|upstream| upstream.name).collect::<Vec<_>>();
+        let ordered = select_upstream_indices(&upstreams, "round_robin", &rr_counter);
+        let names = ordered
+            .into_iter()
+            .map(|upstream_index| upstreams[upstream_index].name.clone())
+            .collect::<Vec<String>>();
 
         assert_eq!(names[0], "udp-a");
         assert_eq!(names.len(), 3);
@@ -1524,18 +1591,21 @@ mod tests {
         ];
 
         let rr_counter = AtomicUsize::new(0);
-        let ru = route_upstreams_for_fqdn(
+        let ru = route_upstream_indices_for_fqdn(
             "example.ru.",
             &routing_rules,
             &upstreams,
             "round_robin",
             &rr_counter,
         );
-        let ru_names = ru.into_iter().map(|upstream| upstream.name).collect::<Vec<_>>();
+        let ru_names = ru
+            .into_iter()
+            .map(|upstream_index| upstreams[upstream_index].name.clone())
+            .collect::<Vec<_>>();
         assert_eq!(ru_names[0], "yandex-udp");
 
         let rr_counter = AtomicUsize::new(0);
-        let non_ru = route_upstreams_for_fqdn(
+        let non_ru = route_upstream_indices_for_fqdn(
             "example.com.",
             &routing_rules,
             &upstreams,
@@ -1544,7 +1614,7 @@ mod tests {
         );
         let non_ru_names = non_ru
             .into_iter()
-            .map(|upstream| upstream.name)
+            .map(|upstream_index| upstreams[upstream_index].name.clone())
             .collect::<Vec<_>>();
         assert_eq!(non_ru_names[0], "cloudflare-udp");
         assert_eq!(non_ru_names[1], "google-udp");

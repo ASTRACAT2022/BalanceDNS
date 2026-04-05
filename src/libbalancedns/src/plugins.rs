@@ -47,29 +47,38 @@ impl PluginManager {
         PluginManager { plugins }
     }
 
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.plugins.is_empty()
+    }
+
     pub fn apply_pre_query(&self, packet: &[u8]) -> Option<PacketAction> {
-        let mut current = packet.to_vec();
-        let mut changed = false;
+        if self.plugins.is_empty() {
+            return None;
+        }
+        let mut current: Option<Vec<u8>> = None;
         for plugin in &self.plugins {
-            match plugin.call_hook(b"balancedns_plugin_pre_query", &current) {
+            let input = current.as_deref().unwrap_or(packet);
+            match plugin.call_hook(b"balancedns_plugin_pre_query", input) {
                 None => {}
                 Some(PacketAction::Continue(updated)) => {
-                    current = updated;
-                    changed = true;
+                    current = Some(updated);
                 }
                 Some(PacketAction::Respond(updated)) => {
                     return Some(PacketAction::Respond(updated));
                 }
             }
         }
-        if changed {
-            Some(PacketAction::Continue(current))
-        } else {
-            None
+        match current {
+            Some(updated) => Some(PacketAction::Continue(updated)),
+            None => None,
         }
     }
 
     pub fn apply_post_response(&self, packet: &[u8]) -> Vec<u8> {
+        if self.plugins.is_empty() {
+            return packet.to_vec();
+        }
         let mut current = packet.to_vec();
         for plugin in &self.plugins {
             match plugin.call_hook(b"balancedns_plugin_post_response", &current) {

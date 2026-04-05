@@ -67,6 +67,10 @@ weight = 1
 [[routing_rules]]
 suffix = ".ru."
 upstreams = ["cloudflare-udp"]
+
+[global]
+threads_udp = 6
+threads_tcp = 4
 "#;
 
         let config = Config::from_string(cfg).unwrap();
@@ -106,6 +110,8 @@ upstreams = ["cloudflare-udp"]
         assert_eq!(config.routing_rules.len(), 1);
         assert_eq!(config.routing_rules[0].suffix, ".ru.");
         assert_eq!(config.routing_rules[0].upstreams, vec!["cloudflare-udp"]);
+        assert_eq!(config.udp_acceptor_threads, 6);
+        assert_eq!(config.tcp_acceptor_threads, 4);
     }
 
     #[test]

@@ -27,6 +27,14 @@ decrement_ttl = true
 [metrics]
 listen = "127.0.0.1:9100"
 
+[global]
+threads_udp = 8
+threads_tcp = 4
+max_tcp_clients = 4096
+max_waiting_clients = 1000000
+max_active_queries = 200000
+max_clients_waiting_for_query = 2000
+
 [hosts_local]
 # "example.com." = "1.2.3.4"
 

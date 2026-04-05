@@ -375,6 +375,18 @@ impl Config {
                 x.as_integer()
                     .expect("global.max_clients_waiting_for_query must be an integer")
             }) as usize;
+        let udp_acceptor_threads = config_global
+            .and_then(|x| x.get("threads_udp"))
+            .map_or(1, |x| {
+                x.as_integer()
+                    .expect("global.threads_udp must be an integer")
+            }) as usize;
+        let tcp_acceptor_threads = config_global
+            .and_then(|x| x.get("threads_tcp"))
+            .map_or(1, |x| {
+                x.as_integer()
+                    .expect("global.threads_tcp must be an integer")
+            }) as usize;
 
         let upstreams_value = toml_config
             .get("upstreams")
@@ -488,8 +500,8 @@ impl Config {
             user,
             group,
             chroot_dir,
-            udp_acceptor_threads: 1,
-            tcp_acceptor_threads: 1,
+            udp_acceptor_threads: udp_acceptor_threads.max(1),
+            tcp_acceptor_threads: tcp_acceptor_threads.max(1),
             dnstap_enabled: false,
             dnstap_backlog: 4096,
             dnstap_socket_path: None,
