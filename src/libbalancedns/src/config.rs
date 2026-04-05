@@ -168,8 +168,12 @@ impl Config {
             .unwrap_or_else(|| "round_robin".to_owned());
         let lbmode = match balancing_algorithm.as_str() {
             "uniform" | "consistent_hash" => LoadBalancingMode::Uniform,
-            "minload" | "power_of_two" => LoadBalancingMode::P2,
-            _ => LoadBalancingMode::Fallback,
+            "minload" | "power_of_two" | "fastest" => LoadBalancingMode::P2,
+            "round_robin" | "fallback" => LoadBalancingMode::Fallback,
+            other => {
+                eprintln!("WARNING: Unknown balancing algorithm '{}', using 'round_robin' (fallback mode)", other);
+                LoadBalancingMode::Fallback
+            }
         };
 
         let deny_any = config_security
@@ -205,6 +209,21 @@ impl Config {
                 x.as_integer()
                     .expect("cache.ttl_seconds must be an integer")
             }) as u32;
+        let min_ttl = config_cache
+            .and_then(|x| x.get("min_ttl"))
+            .map_or(0, |x| {
+                x.as_integer().expect("cache.min_ttl must be an integer")
+            }) as u32;
+        let max_ttl = config_cache
+            .and_then(|x| x.get("max_ttl"))
+            .map_or(86_400, |x| {
+                x.as_integer().expect("cache.max_ttl must be an integer")
+            }) as u32;
+        let decrement_ttl = config_cache
+            .and_then(|x| x.get("decrement_ttl"))
+            .map_or(true, |x| {
+                x.as_bool().expect("cache.decrement_ttl must be a boolean")
+            });
         let stale_refresh_enabled = config_cache
             .and_then(|x| x.get("stale_refresh_enabled"))
             .map_or(false, |x| {
@@ -440,7 +459,7 @@ impl Config {
             .unwrap_or_else(|| "0.0.0.0:5353".to_owned());
 
         Ok(Config {
-            decrement_ttl: true,
+            decrement_ttl,
             upstream_servers,
             upstreams,
             lbmode,
@@ -461,8 +480,8 @@ impl Config {
             tls_key_pem,
             webservice_enabled,
             webservice_listen_addr,
-            min_ttl: 0,
-            max_ttl: cache_ttl_seconds,
+            min_ttl,
+            max_ttl,
             deny_any,
             deny_dnskey,
             request_timeout_ms,
