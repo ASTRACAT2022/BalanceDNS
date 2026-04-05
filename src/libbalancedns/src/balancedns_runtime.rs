@@ -34,6 +34,8 @@ const UPSTREAM_QUERY_MIN_TIMEOUT_MS: u64 = 100;
 const UPSTREAM_QUERY_MAX_TIMEOUT_MS: u64 = 1000;
 const UPSTREAM_QUERY_MAX_DEVIATION_COEFFICIENT: f64 = 2.0;
 const UPSTREAM_PROBES_DELAY_MS: u64 = 5000;
+const MAX_STALE_REFRESH_THREADS: usize = 8;
+const DOH_MAX_BODY_SIZE: usize = 65535;
 
 trait SessionStream: Read + Write {
     fn set_read_timeout(&self, timeout: Option<StdDuration>) -> io::Result<()>;
@@ -62,6 +64,9 @@ pub struct BalanceDnsRuntime {
     varz: Arc<Varz>,
     http_client: Client,
     stale_refresh_inflight: Mutex<HashSet<dns::NormalizedQuestionKey>>,
+    stale_refresh_active: AtomicUsize,
+    tcp_connection_count: AtomicUsize,
+    upstream_udp_sockets: Vec<UdpSocket>,
     odoh_server: OdohServer,
 }
 
@@ -111,6 +116,25 @@ impl BalanceDnsRuntime {
 
         let odoh_server = OdohServer::new();
 
+        // Pre-create a pool of UDP sockets for upstream queries
+        let socket_pool_size = 64;
+        let mut upstream_udp_sockets = Vec::with_capacity(socket_pool_size);
+        for _ in 0..socket_pool_size {
+            match UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))) {
+                Ok(sock) => upstream_udp_sockets.push(sock),
+                Err(err) => {
+                    log::warn!("Failed to pre-allocate upstream UDP socket: {}", err);
+                }
+            }
+        }
+        if upstream_udp_sockets.is_empty() {
+            // Fallback: at least one
+            upstream_udp_sockets.push(
+                UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+                    .expect("Unable to bind any UDP socket for upstream queries"),
+            );
+        }
+
         Arc::new(BalanceDnsRuntime {
             cache: Cache::new(config.clone()),
             config: config.clone(),
@@ -122,6 +146,9 @@ impl BalanceDnsRuntime {
             varz,
             http_client,
             stale_refresh_inflight: Mutex::new(HashSet::new()),
+            stale_refresh_active: AtomicUsize::new(0),
+            tcp_connection_count: AtomicUsize::new(0),
+            upstream_udp_sockets,
             odoh_server,
         })
     }
@@ -242,6 +269,7 @@ impl BalanceDnsRuntime {
     fn spawn_tcp_listener(self: &Arc<Self>, listen_addr: String) -> io::Result<thread::JoinHandle<()>> {
         let listener = TcpListener::bind(&listen_addr)?;
         info!("TCP listener is ready on {}", listen_addr);
+        let max_tcp = self.config.max_tcp_clients;
         thread::Builder::new()
             .name("balancedns_tcp".to_string())
             .spawn({
@@ -249,12 +277,20 @@ impl BalanceDnsRuntime {
                 move || loop {
                     match listener.accept() {
                         Ok((stream, addr)) => {
+                            let current = runtime.tcp_connection_count.load(Ordering::Relaxed);
+                            if current >= max_tcp {
+                                debug!("TCP connection limit reached ({}/{}), rejecting {}", current, max_tcp, addr);
+                                drop(stream);
+                                continue;
+                            }
+                            runtime.tcp_connection_count.fetch_add(1, Ordering::Relaxed);
                             let runtime = runtime.clone();
                             thread::spawn(move || {
                                 let _ = stream.set_nodelay(true);
                                 if let Err(err) = runtime.handle_tcp_session(stream) {
                                     debug!("TCP session closed for {}: {}", addr, err);
                                 }
+                                runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
                             });
                         }
                         Err(err) => error!("TCP accept error on {}: {}", listen_addr, err),
@@ -270,6 +306,7 @@ impl BalanceDnsRuntime {
             TlsApplicationProtocol::Dns,
         )?);
         info!("DoT listener is ready on {}", listen_addr);
+        let max_tcp = self.config.max_tcp_clients;
         thread::Builder::new()
             .name("balancedns_dot".to_string())
             .spawn({
@@ -277,6 +314,13 @@ impl BalanceDnsRuntime {
                 move || loop {
                     match listener.accept() {
                         Ok((stream, addr)) => {
+                            let current = runtime.tcp_connection_count.load(Ordering::Relaxed);
+                            if current >= max_tcp {
+                                debug!("DoT connection limit reached ({}/{}), rejecting {}", current, max_tcp, addr);
+                                drop(stream);
+                                continue;
+                            }
+                            runtime.tcp_connection_count.fetch_add(1, Ordering::Relaxed);
                             let runtime = runtime.clone();
                             let tls_config = tls_config.clone();
                             thread::spawn(move || {
@@ -291,6 +335,7 @@ impl BalanceDnsRuntime {
                                     }
                                     Err(err) => debug!("DoT TLS error for {}: {}", addr, err),
                                 }
+                                runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
                             });
                         }
                         Err(err) => error!("DoT accept error on {}: {}", listen_addr, err),
@@ -306,6 +351,7 @@ impl BalanceDnsRuntime {
             TlsApplicationProtocol::Http11,
         )?);
         info!("DoH listener is ready on https://{}/dns-query", listen_addr);
+        let max_tcp = self.config.max_tcp_clients;
         thread::Builder::new()
             .name("balancedns_doh".to_string())
             .spawn({
@@ -313,6 +359,13 @@ impl BalanceDnsRuntime {
                 move || loop {
                     match listener.accept() {
                         Ok((stream, addr)) => {
+                            let current = runtime.tcp_connection_count.load(Ordering::Relaxed);
+                            if current >= max_tcp {
+                                debug!("DoH connection limit reached ({}/{}), rejecting {}", current, max_tcp, addr);
+                                drop(stream);
+                                continue;
+                            }
+                            runtime.tcp_connection_count.fetch_add(1, Ordering::Relaxed);
                             let runtime = runtime.clone();
                             let tls_config = tls_config.clone();
                             thread::spawn(move || {
@@ -327,6 +380,7 @@ impl BalanceDnsRuntime {
                                     }
                                     Err(err) => debug!("DoH TLS error for {}: {}", addr, err),
                                 }
+                                runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
                             });
                         }
                         Err(err) => error!("DoH accept error on {}: {}", listen_addr, err),
@@ -600,6 +654,16 @@ impl BalanceDnsRuntime {
             inflight.insert(cache_key.clone());
         }
 
+        // Limit the number of concurrent stale refresh threads
+        let active = self.stale_refresh_active.load(Ordering::Relaxed);
+        if active >= MAX_STALE_REFRESH_THREADS {
+            debug!("Stale refresh thread limit reached ({}/{}), skipping refresh", active, MAX_STALE_REFRESH_THREADS);
+            let mut inflight = self.stale_refresh_inflight.lock();
+            inflight.remove(&cache_key);
+            return;
+        }
+        self.stale_refresh_active.fetch_add(1, Ordering::Relaxed);
+
         let runtime = self.clone();
         thread::spawn(move || {
             let _guard = StaleRefreshGuard {
@@ -623,6 +687,7 @@ impl BalanceDnsRuntime {
                 .unwrap_or(runtime.config.cache_ttl_seconds);
                 let _ = runtime.cache.insert(cache_key.clone(), response, ttl);
             }
+            runtime.stale_refresh_active.fetch_sub(1, Ordering::Relaxed);
         });
     }
 
@@ -772,11 +837,9 @@ impl BalanceDnsRuntime {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing upstream addr"))?
             .parse()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid upstream addr"))?;
-        let bind_addr = match remote_addr {
-            SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-            SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
-        };
-        let socket = UdpSocket::bind(bind_addr)?;
+        // Use a socket from the pre-allocated pool instead of binding a new one per query
+        let pool_idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % self.upstream_udp_sockets.len();
+        let socket = &self.upstream_udp_sockets[pool_idx];
         socket.set_read_timeout(Some(timeout))?;
         socket.set_write_timeout(Some(timeout))?;
         socket.send_to(query_packet, remote_addr)?;
@@ -1054,9 +1117,9 @@ struct HttpRequest {
 }
 
 fn read_http_request<S: Read>(stream: &mut S) -> io::Result<HttpRequest> {
-    let mut raw = Vec::new();
-    let mut buf = [0u8; 1];
-    while !raw.ends_with(b"\r\n\r\n") {
+    let mut raw = Vec::with_capacity(4096);
+    let mut buf = [0u8; 4096];
+    loop {
         let count = stream.read(&mut buf)?;
         if count == 0 {
             return Err(io::Error::new(
@@ -1064,14 +1127,24 @@ fn read_http_request<S: Read>(stream: &mut S) -> io::Result<HttpRequest> {
                 "Unexpected EOF while reading HTTP headers",
             ));
         }
-        raw.push(buf[0]);
+        raw.extend_from_slice(&buf[..count]);
         if raw.len() > 65_536 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "HTTP headers are too large",
             ));
         }
+        if raw.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
     }
+    // Split header from any body bytes that were read along with the last chunk
+    let header_end = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    let extra_body_bytes = raw.split_off(header_end);
     let header_text = String::from_utf8(raw).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1104,9 +1177,19 @@ fn read_http_request<S: Read>(stream: &mut S) -> io::Result<HttpRequest> {
         .get("content-length")
         .and_then(|x| x.parse::<usize>().ok())
         .unwrap_or(0);
+    if content_length > DOH_MAX_BODY_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Content-Length {} exceeds maximum allowed size {}", content_length, DOH_MAX_BODY_SIZE),
+        ));
+    }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
-        stream.read_exact(&mut body)?;
+        let already_read = extra_body_bytes.len().min(content_length);
+        body[..already_read].copy_from_slice(&extra_body_bytes[..already_read]);
+        if already_read < content_length {
+            stream.read_exact(&mut body[already_read..])?;
+        }
     }
     Ok(HttpRequest {
         method,
