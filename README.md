@@ -52,6 +52,15 @@ cargo build --release
 ./scripts/install-wizard.sh
 ```
 
+Миграция с Knot Resolver (`kresd.conf`) в BalanceDNS:
+
+```bash
+./scripts/migrate-from-knot.sh --knot-config /etc/knot-resolver/kresd.conf --output ./balancedns.migrated.toml
+./scripts/migrate-from-knot.sh --knot-config /etc/knot-resolver/kresd.conf --output ./balancedns.migrated.toml --deploy --config-path /etc/balancedns.toml
+```
+
+Примечание: скрипт миграции поддерживает Knot Resolver (forwarding/recursive). Конфиг Knot DNS authoritative напрямую не конвертируется.
+
 # Admin CLI
 
 Добавлен админский CLI с live-графиками и техстатусом:
@@ -474,3 +483,4 @@ cargo fmt -- --check
 - `balancedns.service` — пример unit-файла
 - `scripts/autosetup.sh` — интерактивная автонастройка конфига/сборки
 - `scripts/install-wizard.sh` — конструктор конфига + автоинсталлер/deploy
+- `scripts/migrate-from-knot.sh` — миграция с Knot Resolver в BalanceDNS
