@@ -1,4 +1,5 @@
 use libloading::Library;
+use std::panic::AssertUnwindSafe;
 use std::slice;
 
 pub enum PacketAction {
@@ -59,7 +60,7 @@ impl PluginManager {
         let mut current: Option<Vec<u8>> = None;
         for plugin in &self.plugins {
             let input = current.as_deref().unwrap_or(packet);
-            match plugin.call_hook(b"balancedns_plugin_pre_query", input) {
+            match plugin.call_hook_safe(b"balancedns_plugin_pre_query", input) {
                 None => {}
                 Some(PacketAction::Continue(updated)) => {
                     current = Some(updated);
@@ -81,7 +82,7 @@ impl PluginManager {
         }
         let mut current = packet.to_vec();
         for plugin in &self.plugins {
-            match plugin.call_hook(b"balancedns_plugin_post_response", &current) {
+            match plugin.call_hook_safe(b"balancedns_plugin_post_response", &current) {
                 None => {}
                 Some(PacketAction::Continue(updated)) | Some(PacketAction::Respond(updated)) => {
                     current = updated;
@@ -93,47 +94,69 @@ impl PluginManager {
 }
 
 impl PluginLibrary {
-    fn call_hook(&self, symbol_name: &[u8], packet: &[u8]) -> Option<PacketAction> {
+    /// Safely call the plugin hook with panic isolation
+    fn call_hook_safe(&self, symbol_name: &[u8], packet: &[u8]) -> Option<PacketAction> {
         let hook = match unsafe { self.library.get::<HookFn>(symbol_name) } {
             Ok(hook) => hook,
             Err(_) => return None,
         };
-        let mut output = PluginOutput {
-            ptr: std::ptr::null_mut(),
-            len: 0,
-        };
-        let result = unsafe { hook(packet.as_ptr(), packet.len(), &mut output) };
+        
+        // Use catch_unwind to isolate plugin panics from the DNS server
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut output = PluginOutput {
+                ptr: std::ptr::null_mut(),
+                len: 0,
+            };
+            let status = unsafe { hook(packet.as_ptr(), packet.len(), &mut output) };
+            (status, output)
+        }));
+        
         match result {
-            0 => {
-                if output.ptr.is_null() || output.len == 0 {
-                    None
-                } else {
-                    Some(PacketAction::Continue(self.take_output(output)))
+            Ok((status, output)) => {
+                match status {
+                    0 => {
+                        if output.ptr.is_null() || output.len == 0 {
+                            None
+                        } else {
+                            Some(PacketAction::Continue(self.take_output(output)))
+                        }
+                    }
+                    1 => {
+                        if output.ptr.is_null() || output.len == 0 {
+                            error!("Plugin [{}] returned an empty response", self.path);
+                            None
+                        } else {
+                            Some(PacketAction::Respond(self.take_output(output)))
+                        }
+                    }
+                    _ => {
+                        error!("Plugin [{}] returned an unsupported status", self.path);
+                        None
+                    }
                 }
             }
-            1 => {
-                if output.ptr.is_null() || output.len == 0 {
-                    error!("Plugin [{}] returned an empty response", self.path);
-                    None
-                } else {
-                    Some(PacketAction::Respond(self.take_output(output)))
-                }
-            }
-            _ => {
-                error!("Plugin [{}] returned an unsupported status", self.path);
+            Err(panic_info) => {
+                error!("Plugin [{}] panicked: {:?}", self.path, panic_info);
                 None
             }
         }
     }
 
     fn take_output(&self, output: PluginOutput) -> Vec<u8> {
-        let free_fn = unsafe { self.library.get::<FreeFn>(b"balancedns_plugin_free" ) }.map_err(
-            |_| format!("Plugin [{}] does not export balancedns_plugin_free", self.path),
-        ).ok();
-        let bytes = unsafe { slice::from_raw_parts(output.ptr, output.len) }.to_vec();
-        if let Some(free_fn) = free_fn {
-            unsafe { free_fn(output.ptr, output.len) };
-        }
-        bytes
+        // Wrap unsafe operations in catch_unwind to prevent plugin memory errors
+        // from crashing the DNS server
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let free_fn = unsafe { self.library.get::<FreeFn>(b"balancedns_plugin_free" ) }.map_err(
+                |_| format!("Plugin [{}] does not export balancedns_plugin_free", self.path),
+            ).ok();
+            let bytes = unsafe { slice::from_raw_parts(output.ptr, output.len) }.to_vec();
+            if let Some(free_fn) = free_fn {
+                unsafe { free_fn(output.ptr, output.len) };
+            }
+            bytes
+        })).unwrap_or_else(|panic_info| {
+            error!("Plugin [{}] caused memory error in take_output: {:?}", self.path, panic_info);
+            Vec::new()
+        })
     }
 }

@@ -65,19 +65,17 @@ pool = "default"
 weight = 5
 
 [[upstreams]]
-name = "cloudflare-udp"
+name = "upstream-yandex"
 proto = "udp"
-addr = "1.1.1.1:53"
-pool = "default"
-weight = 3
+addr = "77.88.8.8:53"
+pool = "ru-zone"
+weight = 1
 
-[[upstreams]]
-name = "google-udp"
-proto = "udp"
-addr = "8.8.8.8:53"
-pool = "default"
-weight = 3
 
 [[routing_rules]]
 suffix = "."
-upstreams = ["upstream-1", "upstream-2", "cloudflare-udp", "google-udp"]
+upstreams = ["upstream-1", "upstream-2"]
+
+[[routing_rules]]
+suffix = ".ru."
+upstreams = ["upstream-yandex"]
