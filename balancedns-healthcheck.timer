@@ -1,0 +1,13 @@
+[Unit]
+Description=BalanceDNS Health Check Timer - Runs health check every 30 seconds
+Requires=balancedns.service
+After=balancedns.service
+
+[Timer]
+OnBootSec=15
+OnUnitActiveSec=30
+AccuracySec=5
+Unit=balancedns-healthcheck.service
+
+[Install]
+WantedBy=timers.target

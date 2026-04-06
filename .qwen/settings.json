@@ -2,7 +2,22 @@
   "permissions": {
     "allow": [
       "WebSearch",
-      "Bash(cargo build *)"
+      "Bash(cargo build *)",
+      "Bash(cargo check)",
+      "Bash(cargo test)",
+      "Bash(chmod *)",
+      "Bash(systemctl *)",
+      "Bash(journalctl *)",
+      "Bash(sudo *)",
+      "Bash(sleep *)",
+      "Bash(/usr/local/bin/balancedns-healthcheck.sh)",
+      "Bash(/root/balancedns/scripts/status.sh)",
+      "Bash(cat)",
+      "Bash(eof)",
+      "Bash(bash *)",
+      "Bash(timeout *)",
+      "Bash(git add *)",
+      "Bash(git reset *)"
     ]
   },
   "$version": 3

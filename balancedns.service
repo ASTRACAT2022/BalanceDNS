@@ -2,12 +2,14 @@
 Description=BalanceDNS DNS proxy
 After=network.target
 Before=nss-lookup.target
+Wants=balancedns-healthcheck.timer
 
 [Install]
 WantedBy=multi-user.target
 
 [Service]
 Type=simple
+WatchdogSec=60
 Restart=always
 RestartSec=2
 User=balancedns
@@ -34,3 +36,14 @@ ReadOnlyPaths=/etc/balancedns.toml
 StateDirectory=balancedns
 WorkingDirectory=/var/lib/balancedns
 ExecStart=/usr/sbin/balancedns --config /etc/balancedns.toml
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+MemoryMax=2G
+TasksMax=256
+
+# Additional security
+ProtectKernelLogs=true
+ProtectProc=invisible
+ProcSubset=pid

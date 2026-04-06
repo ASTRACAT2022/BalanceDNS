@@ -6,7 +6,7 @@ use crate::dns;
 use crate::odoh::OdohServer;
 use crate::plugins::{PacketAction, PluginManager};
 use crate::varz::Varz;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use parking_lot::{Mutex, RwLock};
 use prometheus::{Encoder, TextEncoder};
 use rand::Rng;
@@ -29,6 +29,8 @@ use crossbeam_channel::bounded;
 
 const TCP_SESSION_PREFETCH_MAX: usize = 4;
 const TCP_SESSION_PREFETCH_READ_TIMEOUT_MS: u64 = 5;
+const TCP_SESSION_MAX_QUERIES: usize = 1000; // Max queries per TCP/DoT/DoH session
+const TCP_SESSION_IDLE_TIMEOUT_MS: u64 = 30000; // 30 seconds idle timeout
 
 // Upstream query timeouts
 const UPSTREAM_QUERY_MIN_TIMEOUT_MS: u64 = 100;
@@ -196,21 +198,25 @@ impl BalanceDnsRuntime {
     fn spawn_refreshers(self: &Arc<Self>) {
         if self.config.hosts_remote.is_some() {
             let runtime = self.clone();
-            thread::Builder::new()
+            match thread::Builder::new()
                 .name("remote_hosts_refresh".to_string())
                 .spawn(move || {
                     runtime.refresh_remote_hosts_loop();
-                })
-                .unwrap();
+                }) {
+                Ok(_) => {},
+                Err(e) => error!("Failed to spawn remote hosts refresh thread: {}", e),
+            }
         }
         if self.config.blocklist_remote.is_some() {
             let runtime = self.clone();
-            thread::Builder::new()
+            match thread::Builder::new()
                 .name("remote_blocklist_refresh".to_string())
                 .spawn(move || {
                     runtime.refresh_remote_blocklist_loop();
-                })
-                .unwrap();
+                }) {
+                Ok(_) => {},
+                Err(e) => error!("Failed to spawn blocklist refresh thread: {}", e),
+            }
         }
     }
 
@@ -234,9 +240,9 @@ impl BalanceDnsRuntime {
         let (tx, rx) = bounded::<(SocketAddr, Vec<u8>)>(worker_count * 1024);
         let rx = Arc::new(Mutex::new(rx));
         for worker_id in 0..worker_count {
-            let runtime = self.clone();
             let socket = sender_socket.try_clone()?;
             let rx = rx.clone();
+            let runtime = self.clone();
             thread::Builder::new()
                 .name(format!("balancedns_udp_worker_{}", worker_id))
                 .spawn(move || loop {
@@ -244,16 +250,24 @@ impl BalanceDnsRuntime {
                         Ok(job) => job,
                         Err(_) => break,
                     };
-                    runtime.varz.client_queries.inc();
-                    runtime.varz.client_queries_udp.inc();
-                    match runtime.process_query(&packet) {
-                        Ok(response) => {
-                            let _ = socket.send_to(&response, addr);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        runtime.varz.client_queries.inc();
+                        runtime.varz.client_queries_udp.inc();
+                        match runtime.process_query(&packet) {
+                            Ok(response) => {
+                                if let Err(e) = socket.send_to(&response, addr) {
+                                    runtime.varz.client_queries_errors.inc();
+                                    debug!("UDP send error to {}: {}", addr, e);
+                                }
+                            }
+                            Err(err) => {
+                                runtime.varz.client_queries_errors.inc();
+                                debug!("UDP query failed from {}: {}", addr, err);
+                            }
                         }
-                        Err(err) => {
-                            runtime.varz.client_queries_errors.inc();
-                            debug!("UDP query failed from {}: {}", addr, err);
-                        }
+                    }));
+                    if let Err(panic_err) = result {
+                        error!("UDP worker thread panicked for {}: {:?}", addr, panic_err);
                     }
                 })
                 .unwrap();
@@ -293,16 +307,21 @@ impl BalanceDnsRuntime {
                         Ok((stream, addr)) => {
                             let current = runtime.tcp_connection_count.load(Ordering::Relaxed);
                             if current >= max_tcp {
-                                debug!("TCP connection limit reached ({}/{}), rejecting {}", current, max_tcp, addr);
+                                warn!("TCP connection limit reached ({}/{}), rejecting {}", current, max_tcp, addr);
                                 drop(stream);
                                 continue;
                             }
                             runtime.tcp_connection_count.fetch_add(1, Ordering::Relaxed);
                             let runtime = runtime.clone();
                             thread::spawn(move || {
-                                let _ = stream.set_nodelay(true);
-                                if let Err(err) = runtime.handle_tcp_session(stream) {
-                                    debug!("TCP session closed for {}: {}", addr, err);
+                                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    let _ = stream.set_nodelay(true);
+                                    if let Err(err) = runtime.handle_tcp_session(stream) {
+                                        debug!("TCP session closed for {}: {}", addr, err);
+                                    }
+                                }));
+                                if let Err(panic_err) = result {
+                                    error!("TCP session thread panicked for {}: {:?}", addr, panic_err);
                                 }
                                 runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
                             });
@@ -330,7 +349,7 @@ impl BalanceDnsRuntime {
                         Ok((stream, addr)) => {
                             let current = runtime.tcp_connection_count.load(Ordering::Relaxed);
                             if current >= max_tcp {
-                                debug!("DoT connection limit reached ({}/{}), rejecting {}", current, max_tcp, addr);
+                                warn!("DoT connection limit reached ({}/{}), rejecting {}", current, max_tcp, addr);
                                 drop(stream);
                                 continue;
                             }
@@ -338,16 +357,21 @@ impl BalanceDnsRuntime {
                             let runtime = runtime.clone();
                             let tls_config = tls_config.clone();
                             thread::spawn(move || {
-                                let _ = stream.set_nodelay(true);
-                                let connection = ServerConnection::new(tls_config).map_err(io::Error::other);
-                                match connection {
-                                    Ok(connection) => {
-                                        let tls_stream = StreamOwned::new(connection, stream);
-                                        if let Err(err) = runtime.handle_tls_session(tls_stream) {
-                                            debug!("DoT session closed for {}: {}", addr, err);
+                                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    let _ = stream.set_nodelay(true);
+                                    let connection = ServerConnection::new(tls_config).map_err(io::Error::other);
+                                    match connection {
+                                        Ok(connection) => {
+                                            let tls_stream = StreamOwned::new(connection, stream);
+                                            if let Err(err) = runtime.handle_tls_session(tls_stream) {
+                                                debug!("DoT session closed for {}: {}", addr, err);
+                                            }
                                         }
+                                        Err(err) => debug!("DoT TLS error for {}: {}", addr, err),
                                     }
-                                    Err(err) => debug!("DoT TLS error for {}: {}", addr, err),
+                                }));
+                                if let Err(panic_err) = result {
+                                    error!("DoT session thread panicked for {}: {:?}", addr, panic_err);
                                 }
                                 runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
                             });
@@ -375,7 +399,7 @@ impl BalanceDnsRuntime {
                         Ok((stream, addr)) => {
                             let current = runtime.tcp_connection_count.load(Ordering::Relaxed);
                             if current >= max_tcp {
-                                debug!("DoH connection limit reached ({}/{}), rejecting {}", current, max_tcp, addr);
+                                warn!("DoH connection limit reached ({}/{}), rejecting {}", current, max_tcp, addr);
                                 drop(stream);
                                 continue;
                             }
@@ -383,16 +407,21 @@ impl BalanceDnsRuntime {
                             let runtime = runtime.clone();
                             let tls_config = tls_config.clone();
                             thread::spawn(move || {
-                                let _ = stream.set_nodelay(true);
-                                let connection = ServerConnection::new(tls_config).map_err(io::Error::other);
-                                match connection {
-                                    Ok(connection) => {
-                                        let mut tls_stream = StreamOwned::new(connection, stream);
-                                        if let Err(err) = runtime.handle_doh_session(&mut tls_stream) {
-                                            debug!("DoH session closed for {}: {}", addr, err);
+                                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    let _ = stream.set_nodelay(true);
+                                    let connection = ServerConnection::new(tls_config).map_err(io::Error::other);
+                                    match connection {
+                                        Ok(connection) => {
+                                            let mut tls_stream = StreamOwned::new(connection, stream);
+                                            if let Err(err) = runtime.handle_doh_session(&mut tls_stream) {
+                                                debug!("DoH session closed for {}: {}", addr, err);
+                                            }
                                         }
+                                        Err(err) => debug!("DoH TLS error for {}: {}", addr, err),
                                     }
-                                    Err(err) => debug!("DoH TLS error for {}: {}", addr, err),
+                                }));
+                                if let Err(panic_err) = result {
+                                    error!("DoH session thread panicked for {}: {:?}", addr, panic_err);
                                 }
                                 runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
                             });
@@ -515,8 +544,21 @@ impl BalanceDnsRuntime {
         let mut pending_bytes = Vec::new();
         let mut prefetched_packets = VecDeque::new();
         let mut stream_ended = false;
+        let mut query_count = 0;
+        let session_start = Instant::now();
+        let idle_timeout = StdDuration::from_millis(TCP_SESSION_IDLE_TIMEOUT_MS);
 
         loop {
+            // Check session limits
+            if query_count >= TCP_SESSION_MAX_QUERIES {
+                info!("TCP session ended due to max queries limit");
+                return Ok(());
+            }
+            if session_start.elapsed() > idle_timeout {
+                // Update timeout to idle timeout after initial prefetch
+                stream.set_read_timeout(Some(idle_timeout))?;
+            }
+
             prefetch_tcp_packets(
                 &mut stream,
                 &mut pending_bytes,
@@ -556,6 +598,7 @@ impl BalanceDnsRuntime {
                 }
             };
 
+            query_count += 1;
             self.varz.client_queries.inc();
             self.varz.client_queries_tcp.inc();
             let response = self.process_query(&packet)?;
@@ -563,13 +606,27 @@ impl BalanceDnsRuntime {
         }
     }
 
-    fn handle_tls_session<S: Read + Write>(self: &Arc<Self>, mut stream: S) -> io::Result<()> {
+    fn handle_tls_session<S: SessionStream>(self: &Arc<Self>, mut stream: S) -> io::Result<()> {
+        let mut query_count = 0;
+        let session_start = Instant::now();
+        let idle_timeout = StdDuration::from_millis(TCP_SESSION_IDLE_TIMEOUT_MS);
+
         loop {
+            // Check session limits
+            if query_count >= TCP_SESSION_MAX_QUERIES {
+                info!("DoT session ended due to max queries limit");
+                return Ok(());
+            }
+            if session_start.elapsed() > idle_timeout {
+                stream.set_read_timeout(Some(idle_timeout))?;
+            }
+
             let packet = match read_tcp_query_frame(&mut stream) {
                 Ok(packet) => packet,
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(err) => return Err(err),
             };
+            query_count += 1;
             self.varz.client_queries.inc();
             self.varz.client_queries_dot.inc();
             let response = self.process_query(&packet)?;
@@ -664,48 +721,65 @@ impl BalanceDnsRuntime {
         cache_key: dns::NormalizedQuestionKey,
         fqdn: String,
     ) {
-        {
+        // Atomically check and set inflight status with active count check
+        let should_spawn = {
             let mut inflight = self.stale_refresh_inflight.lock();
             if inflight.contains(&cache_key) {
-                return;
+                false
+            } else {
+                // Check active count before allowing spawn
+                let active = self.stale_refresh_active.load(Ordering::Relaxed);
+                if active >= MAX_STALE_REFRESH_THREADS {
+                    debug!("Stale refresh thread limit reached ({}/{}), skipping refresh", active, MAX_STALE_REFRESH_THREADS);
+                    false
+                } else {
+                    // Mark as inflight and increment active count atomically
+                    inflight.insert(cache_key.clone());
+                    self.stale_refresh_active.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
             }
-            inflight.insert(cache_key.clone());
-        }
+        };
 
-        // Limit the number of concurrent stale refresh threads
-        let active = self.stale_refresh_active.load(Ordering::Relaxed);
-        if active >= MAX_STALE_REFRESH_THREADS {
-            debug!("Stale refresh thread limit reached ({}/{}), skipping refresh", active, MAX_STALE_REFRESH_THREADS);
-            let mut inflight = self.stale_refresh_inflight.lock();
-            inflight.remove(&cache_key);
+        if !should_spawn {
             return;
         }
-        self.stale_refresh_active.fetch_add(1, Ordering::Relaxed);
 
         let runtime = self.clone();
-        thread::spawn(move || {
-            let _guard = StaleRefreshGuard {
-                runtime: &runtime,
-                cache_key: cache_key.clone(),
-            };
-            let refresh_result = runtime
-                .resolve_via_upstreams(&normalized_question, &fqdn)
-                .and_then(|response| {
-                    let processed = runtime.apply_post_response_plugins(response);
-                    Ok(processed)
-                });
+        let cache_key_clone = cache_key.clone();
+        match thread::Builder::new()
+            .name("stale_refresh".to_string())
+            .spawn(move || {
+                let _guard = StaleRefreshGuard {
+                    runtime: &runtime,
+                    cache_key: cache_key.clone(),
+                };
+                let refresh_result = runtime
+                    .resolve_via_upstreams(&normalized_question, &fqdn)
+                    .and_then(|response| {
+                        let processed = runtime.apply_post_response_plugins(response);
+                        Ok(processed)
+                    });
 
-            if let Ok(response) = refresh_result {
-                let ttl = dns::min_ttl(
-                    &response,
-                    runtime.config.min_ttl,
-                    runtime.config.max_ttl,
-                    runtime.config.cache_ttl_seconds,
-                )
-                .unwrap_or(runtime.config.cache_ttl_seconds);
-                let _ = runtime.cache.insert(cache_key.clone(), response, ttl);
+                if let Ok(response) = refresh_result {
+                    let ttl = dns::min_ttl(
+                        &response,
+                        runtime.config.min_ttl,
+                        runtime.config.max_ttl,
+                        runtime.config.cache_ttl_seconds,
+                    )
+                    .unwrap_or(runtime.config.cache_ttl_seconds);
+                    let _ = runtime.cache.insert(cache_key.clone(), response, ttl);
+                }
+            }) {
+            Ok(_) => {},
+            Err(e) => {
+                error!("Failed to spawn stale refresh thread: {}", e);
+                // Rollback on failure
+                self.stale_refresh_inflight.lock().remove(&cache_key_clone);
+                self.stale_refresh_active.fetch_sub(1, Ordering::Relaxed);
             }
-        });
+        }
     }
 
     fn handle_metrics_session<S: Read + Write>(&self, stream: &mut S) -> io::Result<()> {
@@ -1207,7 +1281,12 @@ fn read_http_request<S: Read>(stream: &mut S) -> io::Result<HttpRequest> {
     let header_end = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
-        .unwrap()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HTTP request headers malformed: no header terminator found",
+            )
+        })?
         + 4;
     let extra_body_bytes = raw.split_off(header_end);
     let header_text = String::from_utf8(raw).map_err(|_| {

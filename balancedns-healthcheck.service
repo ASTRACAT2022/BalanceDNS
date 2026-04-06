@@ -1,0 +1,10 @@
+[Unit]
+Description=BalanceDNS Health Check Service
+After=balancedns.service
+Wants=balancedns-healthcheck.timer
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/balancedns-healthcheck.sh
+Nice=10
+IOSchedulingClass=idle

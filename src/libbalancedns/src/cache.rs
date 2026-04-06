@@ -19,6 +19,7 @@
 use clockpro_cache::*;
 use coarsetime::{Duration, Instant};
 use crate::config::Config;
+use log::error;
 use crate::dns;
 use crate::dns::{NormalizedQuestion, NormalizedQuestionKey, DNS_CLASS_IN, DNS_RCODE_NXDOMAIN};
 use parking_lot::Mutex;
@@ -61,7 +62,8 @@ pub struct CacheStats {
 impl Cache {
     #[inline]
     pub fn new(config: Config) -> Cache {
-        let arc = ClockProCache::new(config.cache_size).unwrap();
+        let arc = ClockProCache::new(config.cache_size)
+            .expect("Failed to initialize CLOCK-Pro cache");
         let arc_mx = Arc::new(Mutex::new(arc));
         Cache { config, arc_mx }
     }
@@ -121,10 +123,16 @@ impl Cache {
                 packet: special_packet,
             })
         } else if normalized_question.qclass != DNS_CLASS_IN {
-            Some(CacheEntry {
-                expiration: Instant::recent() + Duration::from_secs(self.config.max_ttl as u64),
-                packet: dns::build_refused_packet(normalized_question).unwrap(),
-            })
+            match dns::build_refused_packet(normalized_question) {
+                Ok(packet) => Some(CacheEntry {
+                    expiration: Instant::recent() + Duration::from_secs(self.config.max_ttl as u64),
+                    packet,
+                }),
+                Err(err) => {
+                    error!("Failed to build REFUSED packet: {}", err);
+                    None
+                }
+            }
         } else {
             let normalized_question_key = normalized_question.key();
             let cache_entry = self.get(&normalized_question_key);
@@ -151,10 +159,18 @@ impl Cache {
                             && dns::rcode(&shifted_packet) == DNS_RCODE_NXDOMAIN
                         {
                             debug!("Shifted query returned NXDOMAIN");
-                            return Some(CacheEntry {
-                                expiration: shifted_cache_entry.expiration,
-                                packet: dns::build_nxdomain_packet(normalized_question).unwrap(),
-                            });
+                            match dns::build_nxdomain_packet(normalized_question) {
+                                Ok(packet) => {
+                                    return Some(CacheEntry {
+                                        expiration: shifted_cache_entry.expiration,
+                                        packet,
+                                    });
+                                }
+                                Err(err) => {
+                                    error!("Failed to build NXDOMAIN packet: {}", err);
+                                    return None;
+                                }
+                            }
                         }
                     }
                 }
@@ -168,17 +184,26 @@ impl Cache {
             && normalized_question.qtype == dns::DNS_TYPE_ANY
         {
             debug!("ANY query");
-            let packet = dns::build_any_packet(normalized_question, self.config.max_ttl).unwrap();
-            return Some(packet);
-        }
-        if normalized_question.qclass == dns::DNS_CLASS_CH
+            match dns::build_any_packet(normalized_question, self.config.max_ttl) {
+                Ok(packet) => Some(packet),
+                Err(err) => {
+                    error!("Failed to build ANY packet: {}", err);
+                    None
+                }
+            }
+        } else if normalized_question.qclass == dns::DNS_CLASS_CH
             && normalized_question.qtype == dns::DNS_TYPE_TXT
         {
             debug!("CHAOS TXT");
-            let packet =
-                dns::build_version_packet(normalized_question, self.config.max_ttl).unwrap();
-            return Some(packet);
+            match dns::build_version_packet(normalized_question, self.config.max_ttl) {
+                Ok(packet) => Some(packet),
+                Err(err) => {
+                    error!("Failed to build VERSION packet: {}", err);
+                    None
+                }
+            }
+        } else {
+            None
         }
-        None
     }
 }

@@ -24,7 +24,7 @@ log = "0.4"
 
 [profile.release]
 lto = "fat"
-panic = "abort"
+panic = "unwind"
 opt-level = 3
 codegen-units = 1
 strip = true
