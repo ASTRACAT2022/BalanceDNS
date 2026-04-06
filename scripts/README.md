@@ -29,7 +29,7 @@ journalctl -u balancedns -f
 
 ## 📍 Your Configuration
 
-- **DNS Server**: 144.31.151.64:53
+- **DNS Server**: 0.0.0.0:53
 - **Metrics**: http://127.0.0.1:9100/metrics
 - **Health Check**: Every 30 seconds
 
