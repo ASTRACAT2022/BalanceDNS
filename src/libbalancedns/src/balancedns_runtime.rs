@@ -21,6 +21,7 @@ use rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -99,6 +100,19 @@ struct UpstreamSelectionState {
 
 struct TcpConnectionGuard {
     runtime: Arc<BalanceDnsRuntime>,
+}
+
+#[derive(Clone, Copy)]
+struct TokioHyperExecutor;
+
+impl<F> hyper::rt::Executor<F> for TokioHyperExecutor
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn execute(&self, future: F) {
+        tokio::spawn(future);
+    }
 }
 
 impl TcpConnectionGuard {
@@ -742,6 +756,7 @@ impl BalanceDnsRuntime {
         });
 
         if let Err(err) = Http::new()
+            .with_executor(TokioHyperExecutor)
             .http1_keep_alive(true)
             .serve_connection(tls_stream, service)
             .await
