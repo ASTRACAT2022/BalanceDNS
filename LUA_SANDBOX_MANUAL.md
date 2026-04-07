@@ -189,6 +189,13 @@ Use this split:
 - controlled packet rewrites
 - safe experimentation before moving logic into Rust
 
+Important:
+
+- if you need to answer from a remote hosts file refreshed on a timer, use
+  `[hosts_remote]` in the main config instead of Lua
+- Lua scripts in the sandbox do not fetch HTTP sources or manage their own
+  periodic refresh loop
+
 ### Bad Lua Use Cases
 
 - very heavy per-packet parsing

@@ -51,10 +51,7 @@ refresh_seconds = 600
 libraries = []
 
 [lua]
-scripts = [
-  # Для remote hosts Lua не нужен: используй [hosts_remote], он сам
-  # обновляет внешний список и отвечает из встроенного fast path.
-]
+scripts = []
 
 [[upstreams]]
 name = "upstream-1"
@@ -76,7 +73,6 @@ proto = "udp"
 addr = "77.88.8.8:53"
 pool = "ru-zone"
 weight = 1
-
 
 [[routing_rules]]
 suffix = "."

@@ -227,6 +227,14 @@ http://127.0.0.1:9100/metrics
 - `refresh_seconds` — период обновления
 - `ttl_seconds` — TTL для ответов из remote hosts
 
+Для сценария "отвечать из удаленного hosts-файла и обновлять его каждый час"
+используй именно `[hosts_remote]`, а не Lua или native plugin. Этот путь уже
+встроен в runtime, работает в fast path и обновляет карту доменов в фоне.
+
+Пример production-конфига под публичный сервер:
+
+- [production-144.31.151.64.toml](/Users/astracat/BalanceDNS/examples/configs/production-144.31.151.64.toml)
+
 Поддерживаются типичные форматы:
 
 - `1.2.3.4 example.com`
