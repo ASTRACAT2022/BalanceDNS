@@ -742,7 +742,6 @@ impl BalanceDnsRuntime {
         });
 
         if let Err(err) = Http::new()
-            .http1_only(true)
             .http1_keep_alive(true)
             .serve_connection(tls_stream, service)
             .await
@@ -1725,7 +1724,7 @@ fn load_tls_server_config(
         .with_single_cert(cert_chain, private_key)
         .map_err(io::Error::other)?;
     if let TlsApplicationProtocol::Http11 = application_protocol {
-        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     }
     Ok(server_config)
 }
