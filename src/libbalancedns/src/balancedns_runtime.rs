@@ -7,12 +7,17 @@ use crate::varz::Varz;
 use base64;
 use base64::Engine;
 use crossbeam_channel::{bounded, Sender, TrySendError};
+use hyper::body::to_bytes;
+use hyper::header::CONTENT_TYPE as HYPER_CONTENT_TYPE;
+use hyper::server::conn::Http;
+use hyper::service::service_fn;
+use hyper::{Body, Method, Request, Response, StatusCode};
 use log::{debug, error, info, warn};
 use parking_lot::{Mutex, RwLock};
 use prometheus::{Encoder, TextEncoder};
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
-use rustls::{Certificate, PrivateKey, ServerConfig, ServerConnection, StreamOwned};
+use rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -24,6 +29,12 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration as StdDuration;
 use std::time::Instant;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener as TokioTcpListener, TcpStream as TokioTcpStream};
+use tokio::runtime::Builder as TokioRuntimeBuilder;
+use tokio::task;
+use tokio::time::timeout;
+use tokio_rustls::TlsAcceptor;
 use url::Url;
 
 const TCP_SESSION_PREFETCH_MAX: usize = 4;
@@ -52,12 +63,6 @@ trait SessionStream: Read + Write {
 impl SessionStream for TcpStream {
     fn set_read_timeout(&self, timeout: Option<StdDuration>) -> io::Result<()> {
         TcpStream::set_read_timeout(self, timeout)
-    }
-}
-
-impl SessionStream for StreamOwned<ServerConnection, TcpStream> {
-    fn set_read_timeout(&self, timeout: Option<StdDuration>) -> io::Result<()> {
-        self.sock.set_read_timeout(timeout)
     }
 }
 
@@ -90,6 +95,24 @@ struct UpstreamSelectionState {
     cumulative_weights: Vec<usize>,
     total_weight: usize,
     fallback_indices: Vec<usize>,
+}
+
+struct TcpConnectionGuard {
+    runtime: Arc<BalanceDnsRuntime>,
+}
+
+impl TcpConnectionGuard {
+    fn new(runtime: Arc<BalanceDnsRuntime>) -> Self {
+        Self { runtime }
+    }
+}
+
+impl Drop for TcpConnectionGuard {
+    fn drop(&mut self) {
+        self.runtime
+            .tcp_connection_count
+            .fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl UpstreamSelectionState {
@@ -462,77 +485,65 @@ impl BalanceDnsRuntime {
         listen_addr: String,
     ) -> io::Result<thread::JoinHandle<()>> {
         let listener = TcpListener::bind(&listen_addr)?;
-        let tls_config = Arc::new(load_tls_server_config(
-            &self.config,
-            TlsApplicationProtocol::Dns,
-        )?);
-        info!("DoT listener is ready on {}", listen_addr);
+        listener.set_nonblocking(true)?;
+        let tls_config = load_tls_server_config(&self.config, TlsApplicationProtocol::Dns)?;
         let max_tcp = self.config.max_tcp_clients;
         let worker_count = stream_worker_count(self.config.tcp_acceptor_threads);
-        let queue_capacity = stream_queue_capacity(worker_count, max_tcp);
-        let (tx, rx) = bounded::<(TcpStream, SocketAddr)>(queue_capacity);
-
-        for worker_id in 0..worker_count {
-            let runtime = self.clone();
-            let rx = rx.clone();
-            let tls_config = tls_config.clone();
-            thread::Builder::new()
-                .name(format!("balancedns_dot_worker_{}", worker_id))
-                .spawn(move || {
-                    while let Ok((stream, addr)) = rx.recv() {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let connection =
-                                ServerConnection::new(tls_config.clone()).map_err(io::Error::other);
-                            match connection {
-                                Ok(connection) => {
-                                    let tls_stream = StreamOwned::new(connection, stream);
-                                    if let Err(err) = runtime.handle_tls_session(tls_stream) {
-                                        debug!("DoT session closed for {}: {}", addr, err);
-                                    }
-                                }
-                                Err(err) => debug!("DoT TLS error for {}: {}", addr, err),
-                            }
-                        }));
-                        if let Err(panic_err) = result {
-                            error!("DoT session worker panicked for {}: {:?}", addr, panic_err);
-                        }
-                        runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
-                    }
-                })
-                .map_err(|err| io::Error::other(format!("Unable to spawn DoT worker: {}", err)))?;
-        }
         thread::Builder::new()
             .name("balancedns_dot".to_string())
             .spawn({
                 let runtime = self.clone();
                 move || loop {
-                    match listener.accept() {
-                        Ok((stream, addr)) => {
-                            let current = runtime.tcp_connection_count.load(Ordering::Relaxed);
-                            if current >= max_tcp {
-                                warn!(
-                                    "DoT connection limit reached ({}/{}), rejecting {}",
-                                    current, max_tcp, addr
-                                );
-                                runtime.varz.client_connections_rejected.inc();
-                                drop(stream);
-                                continue;
-                            }
-                            if let Err(err) = configure_accepted_stream(&stream) {
-                                runtime.varz.client_connections_rejected.inc();
-                                debug!("Failed to configure DoT stream for {}: {}", addr, err);
-                                drop(stream);
-                                continue;
-                            }
-                            runtime.tcp_connection_count.fetch_add(1, Ordering::Relaxed);
-                            if let Err(err) = enqueue_stream(&tx, stream, addr) {
-                                runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
-                                runtime.varz.client_connections_rejected.inc();
-                                debug!("DoT queue rejected {}: {}", addr, err);
+                    let async_runtime = match TokioRuntimeBuilder::new_multi_thread()
+                        .enable_all()
+                        .worker_threads(worker_count)
+                        .thread_name("balancedns_dot_async")
+                        .build()
+                    {
+                        Ok(async_runtime) => async_runtime,
+                        Err(err) => {
+                            error!("Unable to build DoT runtime on {}: {}", listen_addr, err);
+                            return;
+                        }
+                    };
+                    let acceptor = TlsAcceptor::from(Arc::new(tls_config.clone()));
+                    let listener = match TokioTcpListener::from_std(listener) {
+                        Ok(listener) => listener,
+                        Err(err) => {
+                            error!("Unable to start DoT listener on {}: {}", listen_addr, err);
+                            return;
+                        }
+                    };
+                    info!("DoT listener is ready on {}", listen_addr);
+                    async_runtime.block_on(async move {
+                        loop {
+                            match listener.accept().await {
+                                Ok((stream, addr)) => {
+                                    let previous = runtime
+                                        .tcp_connection_count
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    if previous >= max_tcp {
+                                        runtime
+                                            .tcp_connection_count
+                                            .fetch_sub(1, Ordering::Relaxed);
+                                        runtime.varz.client_connections_rejected.inc();
+                                        warn!(
+                                            "DoT connection limit reached ({}/{}), rejecting {}",
+                                            previous, max_tcp, addr
+                                        );
+                                        continue;
+                                    }
+                                    let runtime = runtime.clone();
+                                    let acceptor = acceptor.clone();
+                                    tokio::spawn(async move {
+                                        runtime.handle_dot_connection(acceptor, stream, addr).await;
+                                    });
+                                }
+                                Err(err) => error!("DoT accept error on {}: {}", listen_addr, err),
                             }
                         }
-                        Err(err) => error!("DoT accept error on {}: {}", listen_addr, err),
-                    }
+                    });
+                    return;
                 }
             })
     }
@@ -542,79 +553,283 @@ impl BalanceDnsRuntime {
         listen_addr: String,
     ) -> io::Result<thread::JoinHandle<()>> {
         let listener = TcpListener::bind(&listen_addr)?;
-        let tls_config = Arc::new(load_tls_server_config(
-            &self.config,
-            TlsApplicationProtocol::Http11,
-        )?);
-        info!("DoH listener is ready on https://{}/dns-query", listen_addr);
+        listener.set_nonblocking(true)?;
+        let tls_config = load_tls_server_config(&self.config, TlsApplicationProtocol::Http11)?;
         let max_tcp = self.config.max_tcp_clients;
         let worker_count = stream_worker_count(self.config.tcp_acceptor_threads);
-        let queue_capacity = stream_queue_capacity(worker_count, max_tcp);
-        let (tx, rx) = bounded::<(TcpStream, SocketAddr)>(queue_capacity);
-
-        for worker_id in 0..worker_count {
-            let runtime = self.clone();
-            let rx = rx.clone();
-            let tls_config = tls_config.clone();
-            thread::Builder::new()
-                .name(format!("balancedns_doh_worker_{}", worker_id))
-                .spawn(move || {
-                    while let Ok((stream, addr)) = rx.recv() {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let connection =
-                                ServerConnection::new(tls_config.clone()).map_err(io::Error::other);
-                            match connection {
-                                Ok(connection) => {
-                                    let mut tls_stream = StreamOwned::new(connection, stream);
-                                    if let Err(err) = runtime.handle_doh_session(&mut tls_stream) {
-                                        debug!("DoH session closed for {}: {}", addr, err);
-                                    }
-                                }
-                                Err(err) => debug!("DoH TLS error for {}: {}", addr, err),
-                            }
-                        }));
-                        if let Err(panic_err) = result {
-                            error!("DoH session worker panicked for {}: {:?}", addr, panic_err);
-                        }
-                        runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
-                    }
-                })
-                .map_err(|err| io::Error::other(format!("Unable to spawn DoH worker: {}", err)))?;
-        }
         thread::Builder::new()
             .name("balancedns_doh".to_string())
             .spawn({
                 let runtime = self.clone();
                 move || loop {
-                    match listener.accept() {
-                        Ok((stream, addr)) => {
-                            let current = runtime.tcp_connection_count.load(Ordering::Relaxed);
-                            if current >= max_tcp {
-                                warn!(
-                                    "DoH connection limit reached ({}/{}), rejecting {}",
-                                    current, max_tcp, addr
-                                );
-                                runtime.varz.client_connections_rejected.inc();
-                                drop(stream);
-                                continue;
-                            }
-                            if let Err(err) = configure_accepted_stream(&stream) {
-                                runtime.varz.client_connections_rejected.inc();
-                                debug!("Failed to configure DoH stream for {}: {}", addr, err);
-                                drop(stream);
-                                continue;
-                            }
-                            runtime.tcp_connection_count.fetch_add(1, Ordering::Relaxed);
-                            if let Err(err) = enqueue_stream(&tx, stream, addr) {
-                                runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
-                                runtime.varz.client_connections_rejected.inc();
-                                debug!("DoH queue rejected {}: {}", addr, err);
+                    let async_runtime = match TokioRuntimeBuilder::new_multi_thread()
+                        .enable_all()
+                        .worker_threads(worker_count)
+                        .thread_name("balancedns_doh_async")
+                        .build()
+                    {
+                        Ok(async_runtime) => async_runtime,
+                        Err(err) => {
+                            error!("Unable to build DoH runtime on {}: {}", listen_addr, err);
+                            return;
+                        }
+                    };
+                    let acceptor = TlsAcceptor::from(Arc::new(tls_config.clone()));
+                    let listener = match TokioTcpListener::from_std(listener) {
+                        Ok(listener) => listener,
+                        Err(err) => {
+                            error!("Unable to start DoH listener on {}: {}", listen_addr, err);
+                            return;
+                        }
+                    };
+                    info!("DoH listener is ready on https://{}/dns-query", listen_addr);
+                    async_runtime.block_on(async move {
+                        loop {
+                            match listener.accept().await {
+                                Ok((stream, addr)) => {
+                                    let previous = runtime
+                                        .tcp_connection_count
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    if previous >= max_tcp {
+                                        runtime
+                                            .tcp_connection_count
+                                            .fetch_sub(1, Ordering::Relaxed);
+                                        runtime.varz.client_connections_rejected.inc();
+                                        warn!(
+                                            "DoH connection limit reached ({}/{}), rejecting {}",
+                                            previous, max_tcp, addr
+                                        );
+                                        continue;
+                                    }
+                                    let runtime = runtime.clone();
+                                    let acceptor = acceptor.clone();
+                                    tokio::spawn(async move {
+                                        runtime.handle_doh_connection(acceptor, stream, addr).await;
+                                    });
+                                }
+                                Err(err) => error!("DoH accept error on {}: {}", listen_addr, err),
                             }
                         }
-                        Err(err) => error!("DoH accept error on {}: {}", listen_addr, err),
-                    }
+                    });
+                    return;
                 }
             })
+    }
+
+    async fn handle_dot_connection(
+        self: Arc<Self>,
+        acceptor: TlsAcceptor,
+        stream: TokioTcpStream,
+        addr: SocketAddr,
+    ) {
+        let _connection_guard = TcpConnectionGuard::new(self.clone());
+        let idle_timeout = StdDuration::from_millis(TCP_SESSION_IDLE_TIMEOUT_MS);
+
+        if let Err(err) = stream.set_nodelay(true) {
+            debug!("Failed to configure DoT stream for {}: {}", addr, err);
+            self.varz.client_connections_rejected.inc();
+            return;
+        }
+
+        let mut tls_stream = match timeout(idle_timeout, acceptor.accept(stream)).await {
+            Ok(Ok(tls_stream)) => tls_stream,
+            Ok(Err(err)) => {
+                debug!("DoT TLS handshake failed for {}: {}", addr, err);
+                return;
+            }
+            Err(_) => {
+                debug!("DoT TLS handshake timed out for {}", addr);
+                return;
+            }
+        };
+
+        for _ in 0..TCP_SESSION_MAX_QUERIES {
+            let packet = match timeout(idle_timeout, read_tcp_query_frame_async(&mut tls_stream)).await
+            {
+                Ok(Ok(Some(packet))) => packet,
+                Ok(Ok(None)) => return,
+                Ok(Err(err)) => {
+                    debug!("DoT session closed for {}: {}", addr, err);
+                    return;
+                }
+                Err(_) => {
+                    debug!("DoT session idle timeout reached for {}", addr);
+                    return;
+                }
+            };
+
+            self.varz.client_queries.inc();
+            self.varz.client_queries_dot.inc();
+
+            let runtime = self.clone();
+            let response = match task::spawn_blocking(move || runtime.process_query(&packet)).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(err)) => {
+                    debug!("DoT query failed for {}: {}", addr, err);
+                    return;
+                }
+                Err(err) => {
+                    error!("DoT blocking worker join error for {}: {}", addr, err);
+                    return;
+                }
+            };
+
+            match timeout(idle_timeout, write_tcp_response_frame_async(&mut tls_stream, &response)).await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    debug!("DoT response write failed for {}: {}", addr, err);
+                    return;
+                }
+                Err(_) => {
+                    debug!("DoT response write timed out for {}", addr);
+                    return;
+                }
+            }
+        }
+
+        info!("DoT session ended due to max queries limit for {}", addr);
+    }
+
+    async fn handle_doh_connection(
+        self: Arc<Self>,
+        acceptor: TlsAcceptor,
+        stream: TokioTcpStream,
+        addr: SocketAddr,
+    ) {
+        let _connection_guard = TcpConnectionGuard::new(self.clone());
+        let idle_timeout = StdDuration::from_millis(TCP_SESSION_IDLE_TIMEOUT_MS);
+
+        if let Err(err) = stream.set_nodelay(true) {
+            debug!("Failed to configure DoH stream for {}: {}", addr, err);
+            self.varz.client_connections_rejected.inc();
+            return;
+        }
+
+        let tls_stream = match timeout(idle_timeout, acceptor.accept(stream)).await {
+            Ok(Ok(tls_stream)) => tls_stream,
+            Ok(Err(err)) => {
+                debug!("DoH TLS handshake failed for {}: {}", addr, err);
+                return;
+            }
+            Err(_) => {
+                debug!("DoH TLS handshake timed out for {}", addr);
+                return;
+            }
+        };
+
+        let service = service_fn({
+            let runtime = self.clone();
+            move |request| {
+                let runtime = runtime.clone();
+                async move { runtime.handle_doh_request(request).await }
+            }
+        });
+
+        if let Err(err) = Http::new()
+            .http1_only(true)
+            .http1_keep_alive(true)
+            .serve_connection(tls_stream, service)
+            .await
+        {
+            debug!("DoH session closed for {}: {}", addr, err);
+        }
+    }
+
+    async fn handle_doh_request(
+        self: Arc<Self>,
+        request: Request<Body>,
+    ) -> Result<Response<Body>, hyper::Error> {
+        let path = request.uri().path().to_owned();
+
+        if path == "/dns-query" {
+            let body = match *request.method() {
+                Method::GET => {
+                    let target = request
+                        .uri()
+                        .path_and_query()
+                        .map(|path_and_query| path_and_query.as_str())
+                        .unwrap_or("/dns-query");
+                    match parse_doh_get_request(target) {
+                        Ok(body) => body,
+                        Err(err) => {
+                            return Ok(http_text_response(
+                                StatusCode::BAD_REQUEST,
+                                err.to_string(),
+                            ))
+                        }
+                    }
+                }
+                Method::POST => {
+                    let content_type = request
+                        .headers()
+                        .get(HYPER_CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default();
+                    if !content_type.contains("application/dns-message") {
+                        return Ok(http_text_response(
+                            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                            "unsupported content-type",
+                        ));
+                    }
+                    let bytes = to_bytes(request.into_body()).await?;
+                    if bytes.len() > DOH_MAX_BODY_SIZE {
+                        return Ok(http_text_response(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            format!(
+                                "request body exceeds maximum allowed size {}",
+                                DOH_MAX_BODY_SIZE
+                            ),
+                        ));
+                    }
+                    bytes.to_vec()
+                }
+                _ => {
+                    return Ok(http_text_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "method not allowed",
+                    ))
+                }
+            };
+
+            self.varz.client_queries.inc();
+            self.varz.client_queries_doh.inc();
+
+            let runtime = self.clone();
+            let response = match task::spawn_blocking(move || runtime.process_query(&body)).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(err)) => {
+                    return Ok(http_text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        err.to_string(),
+                    ))
+                }
+                Err(err) => {
+                    return Ok(http_text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("blocking worker join error: {}", err),
+                    ))
+                }
+            };
+
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(HYPER_CONTENT_TYPE, "application/dns-message")
+                .body(Body::from(response))
+                .unwrap_or_else(|_| Response::new(Body::from(Vec::new()))))
+        } else if path == "/odoh/configs" && request.method() == Method::GET {
+            Ok(http_text_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "oDoH is not implemented yet",
+            ))
+        } else if path == "/odoh" && request.method() == Method::POST {
+            Ok(http_text_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "oDoH is not implemented yet",
+            ))
+        } else {
+            Ok(http_text_response(StatusCode::NOT_FOUND, "not found"))
+        }
     }
 
     fn handle_doh_session<S: Read + Write>(self: &Arc<Self>, stream: &mut S) -> io::Result<()> {
@@ -1500,6 +1715,17 @@ fn load_tls_server_config(
     Ok(server_config)
 }
 
+fn http_text_response(
+    status: StatusCode,
+    body: impl Into<String>,
+) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(HYPER_CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(body.into()))
+        .unwrap_or_else(|_| Response::new(Body::from(Vec::new())))
+}
+
 struct HttpRequest {
     method: String,
     target: String,
@@ -1628,6 +1854,44 @@ fn map_http_client_error(err: reqwest::Error) -> io::Error {
     } else {
         io::Error::new(io::ErrorKind::Other, err.to_string())
     }
+}
+
+async fn read_tcp_query_frame_async<S>(stream: &mut S) -> io::Result<Option<Vec<u8>>>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut len_buf = [0u8; 2];
+    match stream.read_exact(&mut len_buf).await {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err) => return Err(err),
+    }
+    let packet_len = ((len_buf[0] as usize) << 8) | len_buf[1] as usize;
+    if !(12..=65535).contains(&packet_len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Suspicious DNS packet size",
+        ));
+    }
+    let mut packet = vec![0u8; packet_len];
+    stream.read_exact(&mut packet).await?;
+    Ok(Some(packet))
+}
+
+async fn write_tcp_response_frame_async<S>(stream: &mut S, response: &[u8]) -> io::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    if response.len() > 65535 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS response exceeds TCP frame limit",
+        ));
+    }
+    let len_buf = [(response.len() >> 8) as u8, response.len() as u8];
+    stream.write_all(&len_buf).await?;
+    stream.write_all(response).await?;
+    stream.flush().await
 }
 
 #[inline]
