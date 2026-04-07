@@ -9,7 +9,7 @@ WantedBy=multi-user.target
 
 [Service]
 Type=simple
-WatchdogSec=60
+WatchdogSec=0
 Restart=always
 RestartSec=2
 User=balancedns
