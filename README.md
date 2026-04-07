@@ -78,7 +78,11 @@ astracatdnscli watch -c /etc/balancedns.toml
 
 # Конфиг
 
-Пример рабочего конфига находится в файле `balancedns.toml`.
+Пример рабочего конфига находится в файлах `balancedns.toml` и `balancedns.lua`.
+`balancedns.toml` удобен для статичных инсталляций, а `balancedns.lua` подходит для вычисляемых и шаблонизируемых настроек.
+
+Lua-конфиг должен возвращать таблицу через `return { ... }` и загружается только для основного конфига.
+Это доверенный локальный файл, поэтому он не sandboxed; sandbox применяется только к Lua-компонентам из секции `lua`.
 
 Полный пример:
 
@@ -262,17 +266,37 @@ libraries = [
 ## [lua]
 
 - `scripts` — список Lua-компонентов, которые загружаются при старте
+- `settings` — общие настройки, которые попадают в `balancedns.config`
+- `sandbox` — лимиты Lua sandbox
+- `[[lua.components]]` — компоненты с отдельными `settings` и флагом `enabled`
 
 Пример:
 
 ```toml
 [lua]
-scripts = [
-  "examples/lua/query_logger.lua"
-]
+scripts = ["examples/lua/query_logger.lua"]
+
+[lua.settings]
+mode = "observe"
+sample_rate = 100
+
+[lua.sandbox]
+max_packet_bytes = 4096
+disable_after_failures = 8
+init_instruction_limit = 500000
+hook_instruction_limit = 100000
+
+[[lua.components]]
+path = "examples/lua/query_logger.lua"
+enabled = true
+
+[lua.components.settings]
+mode = "log-only"
+tags = ["edge", "prod"]
 ```
 
 Lua-компоненты выполняются внутри встроенного Lua runtime и предназначены для безопасной кастомной логики на hot path.
+Внутри Lua эти настройки доступны как `balancedns.config`.
 
 ## [global]
 

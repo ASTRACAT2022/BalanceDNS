@@ -21,8 +21,8 @@ use rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::future::Future;
 use std::fs::File;
+use std::future::Future;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -263,7 +263,11 @@ impl BalanceDnsRuntime {
             remote_blocklist: RwLock::new(HashSet::new()),
             routing_rules,
             upstream_selection,
-            plugins: PluginManager::from_config(&config.plugin_libraries, &config.lua_scripts),
+            plugins: PluginManager::from_config(
+                &config.plugin_libraries,
+                &config.lua_components,
+                &config.lua_sandbox,
+            ),
             rr_counter: AtomicUsize::new(0),
             udp_socket_rr_counter: AtomicUsize::new(0),
             varz,
@@ -673,25 +677,26 @@ impl BalanceDnsRuntime {
         };
 
         for _ in 0..TCP_SESSION_MAX_QUERIES {
-            let packet = match timeout(idle_timeout, read_tcp_query_frame_async(&mut tls_stream)).await
-            {
-                Ok(Ok(Some(packet))) => packet,
-                Ok(Ok(None)) => return,
-                Ok(Err(err)) => {
-                    debug!("DoT session closed for {}: {}", addr, err);
-                    return;
-                }
-                Err(_) => {
-                    debug!("DoT session idle timeout reached for {}", addr);
-                    return;
-                }
-            };
+            let packet =
+                match timeout(idle_timeout, read_tcp_query_frame_async(&mut tls_stream)).await {
+                    Ok(Ok(Some(packet))) => packet,
+                    Ok(Ok(None)) => return,
+                    Ok(Err(err)) => {
+                        debug!("DoT session closed for {}: {}", addr, err);
+                        return;
+                    }
+                    Err(_) => {
+                        debug!("DoT session idle timeout reached for {}", addr);
+                        return;
+                    }
+                };
 
             self.varz.client_queries.inc();
             self.varz.client_queries_dot.inc();
 
             let runtime = self.clone();
-            let response = match task::spawn_blocking(move || runtime.process_query(&packet)).await {
+            let response = match task::spawn_blocking(move || runtime.process_query(&packet)).await
+            {
                 Ok(Ok(response)) => response,
                 Ok(Err(err)) => {
                     debug!("DoT query failed for {}: {}", addr, err);
@@ -703,7 +708,11 @@ impl BalanceDnsRuntime {
                 }
             };
 
-            match timeout(idle_timeout, write_tcp_response_frame_async(&mut tls_stream, &response)).await
+            match timeout(
+                idle_timeout,
+                write_tcp_response_frame_async(&mut tls_stream, &response),
+            )
+            .await
             {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
@@ -782,10 +791,7 @@ impl BalanceDnsRuntime {
                     match parse_doh_get_request(target) {
                         Ok(body) => body,
                         Err(err) => {
-                            return Ok(http_text_response(
-                                StatusCode::BAD_REQUEST,
-                                err.to_string(),
-                            ))
+                            return Ok(http_text_response(StatusCode::BAD_REQUEST, err.to_string()))
                         }
                     }
                 }
@@ -1744,10 +1750,7 @@ fn load_tls_server_config(
     Ok(server_config)
 }
 
-fn http_text_response(
-    status: StatusCode,
-    body: impl Into<String>,
-) -> Response<Body> {
+fn http_text_response(status: StatusCode, body: impl Into<String>) -> Response<Body> {
     Response::builder()
         .status(status)
         .header(HYPER_CONTENT_TYPE, "text/plain; charset=utf-8")

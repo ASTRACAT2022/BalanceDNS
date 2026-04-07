@@ -1,3 +1,4 @@
+use crate::lua_config::load_lua_config_value;
 use coarsetime::Duration;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -53,6 +54,21 @@ pub struct RoutingRuleConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct LuaSandboxConfig {
+    pub max_packet_bytes: usize,
+    pub disable_after_failures: usize,
+    pub init_instruction_limit: u32,
+    pub hook_instruction_limit: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct LuaComponentConfig {
+    pub path: String,
+    pub enabled: bool,
+    pub settings: Value,
+}
+
+#[derive(Clone, Debug)]
 pub struct Config {
     pub decrement_ttl: bool,
     pub upstream_servers: Vec<String>,
@@ -99,15 +115,21 @@ pub struct Config {
     pub blocklist_remote: Option<RemoteBlocklistConfig>,
     pub plugin_libraries: Vec<String>,
     pub lua_scripts: Vec<String>,
+    pub lua_components: Vec<LuaComponentConfig>,
+    pub lua_sandbox: LuaSandboxConfig,
     pub routing_rules: Vec<RoutingRuleConfig>,
 }
 
 impl Config {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Config, Error> {
+        let path = path.as_ref();
         let mut fd = File::open(path)?;
         let mut toml = String::new();
         fd.read_to_string(&mut toml)?;
-        Self::from_string(&toml)
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("lua") => Self::from_lua_string(&toml),
+            _ => Self::from_string(&toml),
+        }
     }
 
     pub fn from_string(toml: &str) -> Result<Config, Error> {
@@ -118,6 +140,11 @@ impl Config {
             ))
         })?;
         Self::parse(toml_config)
+    }
+
+    pub fn from_lua_string(lua: &str) -> Result<Config, Error> {
+        let lua_config = load_lua_config_value(lua, "config.lua")?;
+        Self::parse(lua_config)
     }
 
     fn parse(toml_config: Value) -> Result<Config, Error> {
@@ -165,6 +192,26 @@ impl Config {
         if config.udp_acceptor_threads == 0 || config.tcp_acceptor_threads == 0 {
             return Err(invalid_data(
                 "listener thread counts must be greater than 0",
+            ));
+        }
+        if config.lua_sandbox.max_packet_bytes == 0 {
+            return Err(invalid_data(
+                "lua.sandbox.max_packet_bytes must be greater than 0",
+            ));
+        }
+        if config.lua_sandbox.disable_after_failures == 0 {
+            return Err(invalid_data(
+                "lua.sandbox.disable_after_failures must be greater than 0",
+            ));
+        }
+        if config.lua_sandbox.init_instruction_limit == 0 {
+            return Err(invalid_data(
+                "lua.sandbox.init_instruction_limit must be greater than 0",
+            ));
+        }
+        if config.lua_sandbox.hook_instruction_limit == 0 {
+            return Err(invalid_data(
+                "lua.sandbox.hook_instruction_limit must be greater than 0",
             ));
         }
         if let Some(hosts_remote) = &config.hosts_remote {
@@ -340,7 +387,7 @@ impl Config {
         let hosts_remote = parse_remote_hosts_config(config_hosts_remote)?;
         let blocklist_remote = parse_remote_blocklist_config(config_blocklist_remote)?;
         let plugin_libraries = get_string_array(config_plugins, "libraries", "plugins.libraries")?;
-        let lua_scripts = get_string_array(config_lua, "scripts", "lua.scripts")?;
+        let (lua_scripts, lua_components, lua_sandbox) = parse_lua_config(config_lua)?;
         let routing_rules = parse_routing_rules(&toml_config)?;
 
         let user = get_string(config_global, "user");
@@ -476,6 +523,8 @@ impl Config {
             blocklist_remote,
             plugin_libraries,
             lua_scripts,
+            lua_components,
+            lua_sandbox,
             routing_rules,
         })
     }
@@ -623,6 +672,8 @@ impl Config {
             blocklist_remote: None,
             plugin_libraries: Vec::new(),
             lua_scripts: Vec::new(),
+            lua_components: Vec::new(),
+            lua_sandbox: default_lua_sandbox_config(),
             routing_rules: Vec::new(),
         })
     }
@@ -717,6 +768,152 @@ fn parse_routing_rules(toml_config: &Value) -> Result<Vec<RoutingRuleConfig>, Er
         });
     }
     Ok(parsed)
+}
+
+fn parse_lua_config(
+    table: Option<&TomlTable>,
+) -> Result<(Vec<String>, Vec<LuaComponentConfig>, LuaSandboxConfig), Error> {
+    let Some(table) = table else {
+        return Ok((Vec::new(), Vec::new(), default_lua_sandbox_config()));
+    };
+
+    let default_settings = match table.get("settings") {
+        Some(Value::Table(settings)) => Value::Table(settings.clone()),
+        Some(_) => return Err(invalid_data("lua.settings must be a table")),
+        None => Value::Table(TomlTable::new()),
+    };
+
+    let sandbox = match table.get("sandbox") {
+        Some(Value::Table(sandbox)) => parse_lua_sandbox_config(Some(sandbox))?,
+        Some(_) => return Err(invalid_data("lua.sandbox must be a table")),
+        None => default_lua_sandbox_config(),
+    };
+
+    let script_paths = get_string_array(Some(table), "scripts", "lua.scripts")?;
+    let mut components = Vec::new();
+    for path in &script_paths {
+        upsert_lua_component(
+            &mut components,
+            LuaComponentConfig {
+                path: path.clone(),
+                enabled: true,
+                settings: default_settings.clone(),
+            },
+        );
+    }
+
+    if let Some(component_values) = table.get("components") {
+        let component_values = component_values
+            .as_array()
+            .ok_or_else(|| invalid_data("lua.components must be an array of tables"))?;
+        for component_value in component_values {
+            let component_table = component_value
+                .as_table()
+                .ok_or_else(|| invalid_data("Each lua.components entry must be a table"))?;
+            let path = get_required_string(
+                component_table,
+                "path",
+                "lua.components.path must be a string",
+            )?;
+            let enabled = get_bool(
+                Some(component_table),
+                "enabled",
+                true,
+                "lua.components.enabled",
+            )?;
+            let component_settings = match component_table.get("settings") {
+                Some(Value::Table(settings)) => Value::Table(settings.clone()),
+                Some(_) => return Err(invalid_data("lua.components.settings must be a table")),
+                None => Value::Table(TomlTable::new()),
+            };
+            let mut merged_settings = default_settings.clone();
+            merge_toml_value(&mut merged_settings, &component_settings);
+            upsert_lua_component(
+                &mut components,
+                LuaComponentConfig {
+                    path,
+                    enabled,
+                    settings: merged_settings,
+                },
+            );
+        }
+    }
+
+    let lua_scripts = components
+        .iter()
+        .filter(|component| component.enabled)
+        .map(|component| component.path.clone())
+        .collect::<Vec<_>>();
+
+    Ok((lua_scripts, components, sandbox))
+}
+
+fn parse_lua_sandbox_config(table: Option<&TomlTable>) -> Result<LuaSandboxConfig, Error> {
+    let defaults = default_lua_sandbox_config();
+    Ok(LuaSandboxConfig {
+        max_packet_bytes: get_usize(
+            table,
+            "max_packet_bytes",
+            defaults.max_packet_bytes,
+            "lua.sandbox.max_packet_bytes",
+        )?,
+        disable_after_failures: get_usize(
+            table,
+            "disable_after_failures",
+            defaults.disable_after_failures,
+            "lua.sandbox.disable_after_failures",
+        )?,
+        init_instruction_limit: get_u32(
+            table,
+            "init_instruction_limit",
+            defaults.init_instruction_limit,
+            "lua.sandbox.init_instruction_limit",
+        )?,
+        hook_instruction_limit: get_u32(
+            table,
+            "hook_instruction_limit",
+            defaults.hook_instruction_limit,
+            "lua.sandbox.hook_instruction_limit",
+        )?,
+    })
+}
+
+fn default_lua_sandbox_config() -> LuaSandboxConfig {
+    LuaSandboxConfig {
+        max_packet_bytes: 4096,
+        disable_after_failures: 8,
+        init_instruction_limit: 500_000,
+        hook_instruction_limit: 100_000,
+    }
+}
+
+fn upsert_lua_component(components: &mut Vec<LuaComponentConfig>, component: LuaComponentConfig) {
+    if let Some(existing) = components
+        .iter_mut()
+        .find(|existing| existing.path == component.path)
+    {
+        *existing = component;
+    } else {
+        components.push(component);
+    }
+}
+
+fn merge_toml_value(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Table(base_table), Value::Table(overlay_table)) => {
+            for (key, overlay_value) in overlay_table {
+                match base_table.get_mut(key) {
+                    Some(base_value) => merge_toml_value(base_value, overlay_value),
+                    None => {
+                        base_table.insert(key.clone(), overlay_value.clone());
+                    }
+                }
+            }
+        }
+        (base_value, overlay_value) => {
+            *base_value = overlay_value.clone();
+        }
+    }
 }
 
 fn get_table<'a>(value: &'a Value, key: &str) -> Option<&'a TomlTable> {

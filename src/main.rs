@@ -20,7 +20,7 @@ fn main() -> ExitCode {
                 .short('c')
                 .long("config")
                 .value_name("FILE")
-                .help("Path to the BalanceDNS TOML config file")
+                .help("Path to the BalanceDNS TOML or Lua config file")
                 .num_args(1)
                 .required(true),
         )

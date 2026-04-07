@@ -1,3 +1,4 @@
+use crate::config::{LuaComponentConfig, LuaSandboxConfig};
 use crate::dns;
 use libloading::Library;
 use std::ffi::{c_char, c_int, c_void, CString};
@@ -7,6 +8,7 @@ use std::ptr;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use toml::Value as TomlValue;
 
 const LUA_OK: c_int = 0;
 const LUA_MULTRET: c_int = -1;
@@ -20,6 +22,7 @@ const LUA_INIT_INSTRUCTION_LIMIT: c_int = 500_000;
 const LUA_HOOK_INSTRUCTION_LIMIT: c_int = 100_000;
 
 type LuaInteger = i64;
+type LuaNumber = f64;
 
 enum LuaState {}
 enum LuaDebug {}
@@ -41,9 +44,11 @@ type LuaSetGlobalFn = unsafe extern "C" fn(*mut LuaState, *const c_char);
 type LuaPushLStringFn = unsafe extern "C" fn(*mut LuaState, *const c_char, usize) -> *const c_char;
 type LuaPushBooleanFn = unsafe extern "C" fn(*mut LuaState, c_int);
 type LuaPushIntegerFn = unsafe extern "C" fn(*mut LuaState, LuaInteger);
+type LuaPushNumberFn = unsafe extern "C" fn(*mut LuaState, LuaNumber);
 type LuaPushNilFn = unsafe extern "C" fn(*mut LuaState);
 type LuaPushCClosureFn = unsafe extern "C" fn(*mut LuaState, LuaCFunction, c_int);
 type LuaNewTableFn = unsafe extern "C" fn(*mut LuaState);
+type LuaRawSetIFn = unsafe extern "C" fn(*mut LuaState, c_int, LuaInteger);
 type LuaSetFieldFn = unsafe extern "C" fn(*mut LuaState, c_int, *const c_char);
 type LuaToLStringFn = unsafe extern "C" fn(*mut LuaState, c_int, *mut usize) -> *const c_char;
 type LuaToBooleanFn = unsafe extern "C" fn(*mut LuaState, c_int) -> c_int;
@@ -68,6 +73,10 @@ pub struct LuaScriptEngine {
     state: Mutex<LuaStateHandle>,
     disabled: AtomicBool,
     consecutive_failures: AtomicUsize,
+    max_packet_bytes: usize,
+    failure_disable_threshold: usize,
+    init_instruction_limit: c_int,
+    hook_instruction_limit: c_int,
 }
 
 struct LuaApi {
@@ -82,9 +91,11 @@ struct LuaApi {
     push_lstring: LuaPushLStringFn,
     push_boolean: LuaPushBooleanFn,
     push_integer: LuaPushIntegerFn,
+    push_number: LuaPushNumberFn,
     push_nil: LuaPushNilFn,
     push_cclosure: LuaPushCClosureFn,
     new_table: LuaNewTableFn,
+    raw_set_i: LuaRawSetIFn,
     set_field: LuaSetFieldFn,
     to_lstring: LuaToLStringFn,
     to_boolean: LuaToBooleanFn,
@@ -128,6 +139,24 @@ static LUA_HOOK_API: OnceLock<LuaHookApi> = OnceLock::new();
 
 impl LuaScriptEngine {
     pub fn from_path(path: &str) -> io::Result<Self> {
+        let component = LuaComponentConfig {
+            path: path.to_owned(),
+            enabled: true,
+            settings: TomlValue::Table(Default::default()),
+        };
+        let sandbox = LuaSandboxConfig {
+            max_packet_bytes: LUA_MAX_PACKET_BYTES,
+            disable_after_failures: LUA_FAILURE_DISABLE_THRESHOLD,
+            init_instruction_limit: LUA_INIT_INSTRUCTION_LIMIT as u32,
+            hook_instruction_limit: LUA_HOOK_INSTRUCTION_LIMIT as u32,
+        };
+        Self::from_config(&component, &sandbox)
+    }
+
+    pub fn from_config(
+        component: &LuaComponentConfig,
+        sandbox: &LuaSandboxConfig,
+    ) -> io::Result<Self> {
         let api = Arc::new(LuaApi::load()?);
         let state = unsafe { (api.new_state)() };
         if state.is_null() {
@@ -139,13 +168,17 @@ impl LuaScriptEngine {
             api: api.clone(),
         };
         let engine = Self {
-            path: path.to_owned(),
+            path: component.path.clone(),
             api,
             state: Mutex::new(handle),
             disabled: AtomicBool::new(false),
             consecutive_failures: AtomicUsize::new(0),
+            max_packet_bytes: sandbox.max_packet_bytes.min(dns::DNS_MAX_PACKET_SIZE),
+            failure_disable_threshold: sandbox.disable_after_failures,
+            init_instruction_limit: lua_limit(sandbox.init_instruction_limit),
+            hook_instruction_limit: lua_limit(sandbox.hook_instruction_limit),
         };
-        engine.initialize(path)?;
+        engine.initialize(component)?;
         Ok(engine)
     }
 
@@ -162,8 +195,8 @@ impl LuaScriptEngine {
         self.call_hook("balancedns_post_response", packet)
     }
 
-    fn initialize(&self, path: &str) -> io::Result<()> {
-        let source = fs::read(path)?;
+    fn initialize(&self, component: &LuaComponentConfig) -> io::Result<()> {
+        let source = fs::read(&component.path)?;
         let handle = self.state.lock().unwrap();
         let state = handle.state;
 
@@ -171,8 +204,8 @@ impl LuaScriptEngine {
             (self.api.open_libs)(state);
         }
         self.sandbox_globals(state)?;
-        self.register_balancedns_api(state)?;
-        self.load_chunk(state, &source, path, LUA_INIT_INSTRUCTION_LIMIT)
+        self.register_balancedns_api(state, component)?;
+        self.load_chunk(state, &source, &component.path, self.init_instruction_limit)
     }
 
     fn sandbox_globals(&self, state: *mut LuaState) -> io::Result<()> {
@@ -183,6 +216,7 @@ impl LuaScriptEngine {
             "debug",
             "dofile",
             "loadfile",
+            "load",
             "require",
             "collectgarbage",
         ] {
@@ -195,7 +229,11 @@ impl LuaScriptEngine {
         Ok(())
     }
 
-    fn register_balancedns_api(&self, state: *mut LuaState) -> io::Result<()> {
+    fn register_balancedns_api(
+        &self,
+        state: *mut LuaState,
+        component: &LuaComponentConfig,
+    ) -> io::Result<()> {
         unsafe {
             (self.api.new_table)(state);
             self.set_callback(state, "qname", lua_balancedns_qname)?;
@@ -206,6 +244,19 @@ impl LuaScriptEngine {
             self.set_callback(state, "hex", lua_balancedns_hex)?;
             self.set_callback(state, "from_hex", lua_balancedns_from_hex)?;
             self.set_callback(state, "log", lua_balancedns_log)?;
+            self.push_toml_value(state, &component.settings)?;
+            let config_field = c_string("config")?;
+            (self.api.set_field)(state, -2, config_field.as_ptr());
+            (self.api.new_table)(state);
+            let path_field = c_string("path")?;
+            (self.api.push_lstring)(
+                state,
+                component.path.as_ptr() as *const c_char,
+                component.path.len(),
+            );
+            (self.api.set_field)(state, -2, path_field.as_ptr());
+            let component_field = c_string("component")?;
+            (self.api.set_field)(state, -2, component_field.as_ptr());
             let table_name = c_string("balancedns")?;
             (self.api.set_global)(state, table_name.as_ptr());
         }
@@ -269,7 +320,7 @@ impl LuaScriptEngine {
         if self.is_disabled() {
             return None;
         }
-        if packet.len() > LUA_MAX_PACKET_BYTES {
+        if packet.len() > self.max_packet_bytes {
             self.record_failure("input packet exceeds Lua sandbox limit");
             return None;
         }
@@ -304,7 +355,7 @@ impl LuaScriptEngine {
                 state,
                 Some(lua_instruction_limit_hook),
                 LUA_MASKCOUNT,
-                LUA_HOOK_INSTRUCTION_LIMIT,
+                self.hook_instruction_limit,
             );
             let status = (self.api.pcall)(state, 1, 2, 0, 0, ptr::null());
             (self.api.set_hook)(state, None, 0, 0);
@@ -320,7 +371,7 @@ impl LuaScriptEngine {
                 LUA_TNIL => None,
                 LUA_TSTRING => {
                     let output = self.to_vec(state, -2)?;
-                    if output.len() > LUA_MAX_PACKET_BYTES {
+                    if output.len() > self.max_packet_bytes {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "Lua component returned a packet that exceeds the sandbox limit",
@@ -371,7 +422,7 @@ impl LuaScriptEngine {
 
     fn record_failure(&self, message: &str) {
         let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        if failures >= LUA_FAILURE_DISABLE_THRESHOLD {
+        if failures >= self.failure_disable_threshold {
             if !self.disabled.swap(true, Ordering::Relaxed) {
                 error!(
                     "Lua component [{}] was disabled after {} consecutive failures: {}",
@@ -381,9 +432,46 @@ impl LuaScriptEngine {
         } else {
             error!(
                 "Lua component [{}] failed (#{}/{}): {}",
-                self.path, failures, LUA_FAILURE_DISABLE_THRESHOLD, message
+                self.path, failures, self.failure_disable_threshold, message
             );
         }
+    }
+
+    unsafe fn push_toml_value(&self, state: *mut LuaState, value: &TomlValue) -> io::Result<()> {
+        match value {
+            TomlValue::String(value) => {
+                (self.api.push_lstring)(state, value.as_ptr() as *const c_char, value.len());
+            }
+            TomlValue::Integer(value) => {
+                (self.api.push_integer)(state, *value as LuaInteger);
+            }
+            TomlValue::Float(value) => {
+                (self.api.push_number)(state, *value as LuaNumber);
+            }
+            TomlValue::Boolean(value) => {
+                (self.api.push_boolean)(state, if *value { 1 } else { 0 });
+            }
+            TomlValue::Datetime(value) => {
+                let text = value.to_string();
+                (self.api.push_lstring)(state, text.as_ptr() as *const c_char, text.len());
+            }
+            TomlValue::Array(values) => {
+                (self.api.new_table)(state);
+                for (idx, item) in values.iter().enumerate() {
+                    self.push_toml_value(state, item)?;
+                    (self.api.raw_set_i)(state, -2, (idx + 1) as LuaInteger);
+                }
+            }
+            TomlValue::Table(values) => {
+                (self.api.new_table)(state);
+                for (key, item) in values {
+                    self.push_toml_value(state, item)?;
+                    let key = c_string(key)?;
+                    (self.api.set_field)(state, -2, key.as_ptr());
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -421,9 +509,11 @@ impl LuaApi {
                     push_lstring: load_symbol(&library, b"lua_pushlstring")?,
                     push_boolean: load_symbol(&library, b"lua_pushboolean")?,
                     push_integer: load_symbol(&library, b"lua_pushinteger")?,
+                    push_number: load_symbol(&library, b"lua_pushnumber")?,
                     push_nil: load_symbol(&library, b"lua_pushnil")?,
                     push_cclosure: load_symbol(&library, b"lua_pushcclosure")?,
                     new_table: load_symbol(&library, b"lua_newtable")?,
+                    raw_set_i: load_symbol(&library, b"lua_rawseti")?,
                     set_field: load_symbol(&library, b"lua_setfield")?,
                     to_lstring: load_symbol(&library, b"lua_tolstring")?,
                     to_boolean: load_symbol(&library, b"lua_toboolean")?,
@@ -645,4 +735,8 @@ fn hex_value(byte: u8) -> Option<u8> {
 fn c_string(value: &str) -> io::Result<CString> {
     CString::new(value)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "string contains NUL byte"))
+}
+
+fn lua_limit(value: u32) -> c_int {
+    value.min(c_int::MAX as u32) as c_int
 }

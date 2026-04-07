@@ -1,3 +1,4 @@
+use crate::config::{LuaComponentConfig, LuaSandboxConfig};
 use crate::dns;
 use crate::lua_plugin::{HookOutcome, LuaScriptEngine};
 use libloading::Library;
@@ -42,7 +43,11 @@ pub struct PluginManager {
 }
 
 impl PluginManager {
-    pub fn from_config(plugin_paths: &[String], lua_scripts: &[String]) -> Self {
+    pub fn from_config(
+        plugin_paths: &[String],
+        lua_components: &[LuaComponentConfig],
+        lua_sandbox: &LuaSandboxConfig,
+    ) -> Self {
         let mut components = Vec::new();
 
         for path in plugin_paths {
@@ -62,14 +67,18 @@ impl PluginManager {
             }
         }
 
-        for path in lua_scripts {
-            match LuaScriptEngine::from_path(path) {
+        for component in lua_components {
+            if !component.enabled {
+                info!("Skipping disabled Lua component [{}]", component.path);
+                continue;
+            }
+            match LuaScriptEngine::from_config(component, lua_sandbox) {
                 Ok(script) => {
-                    info!("Loaded Lua component [{}]", path);
+                    info!("Loaded Lua component [{}]", component.path);
                     components.push(PluginComponent::Lua(script));
                 }
                 Err(err) => {
-                    error!("Unable to load Lua component [{}]: {}", path, err);
+                    error!("Unable to load Lua component [{}]: {}", component.path, err);
                 }
             }
         }

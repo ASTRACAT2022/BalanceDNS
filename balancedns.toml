@@ -47,10 +47,25 @@ ttl_seconds = 3600
 libraries = []
 
 [lua]
-scripts = [
-  # Для remote hosts Lua не нужен: используй [hosts_remote], он сам
-  # обновляет внешний список и отвечает из встроенного fast path.
-]
+scripts = []
+
+[lua.settings]
+# mode = "observe"
+# sample_rate = 100
+
+[lua.sandbox]
+max_packet_bytes = 4096
+disable_after_failures = 8
+init_instruction_limit = 500000
+hook_instruction_limit = 100000
+
+[[lua.components]]
+# path = "/var/lib/balancedns/lua/policy.lua"
+# enabled = true
+
+[lua.components.settings]
+# mode = "block"
+# reply_ip = "127.0.0.1"
 
 [[upstreams]]
 name = "upstream-1"

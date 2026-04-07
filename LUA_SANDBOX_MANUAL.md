@@ -95,9 +95,26 @@ Add a `[lua]` section to the config:
 scripts = [
   "/var/lib/balancedns/lua/query_logger.lua"
 ]
+
+[lua.settings]
+mode = "observe"
+
+[lua.sandbox]
+max_packet_bytes = 4096
+disable_after_failures = 8
+init_instruction_limit = 500000
+hook_instruction_limit = 100000
+
+[[lua.components]]
+path = "/var/lib/balancedns/lua/query_logger.lua"
+enabled = true
+
+[lua.components.settings]
+mode = "log-only"
 ```
 
 Lua components are loaded during startup. If a script fails to load, the resolver keeps starting, but the broken script is skipped.
+`lua.settings` are shared defaults. `lua.components.settings` override them per script.
 
 ## Lua Hooks
 
@@ -143,6 +160,11 @@ Available helpers:
 - `balancedns.hex(packet)` -> lowercase hex string
 - `balancedns.from_hex(hex_string)` -> raw byte string or `nil`
 - `balancedns.log(message)` -> write to resolver logs
+
+Configuration values from TOML are available in:
+
+- `balancedns.config`
+- `balancedns.component.path`
 
 ## Example Script
 

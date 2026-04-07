@@ -17,6 +17,7 @@ mod balancedns_runtime;
 mod cache;
 mod config;
 pub mod dns;
+mod lua_config;
 mod lua_plugin;
 mod odoh;
 mod plugins;
@@ -24,7 +25,8 @@ mod varz;
 
 use balancedns_runtime::BalanceDnsRuntime;
 pub use config::{
-    Config, RemoteBlocklistConfig, RemoteHostsConfig, UpstreamConfig, UpstreamProtocol,
+    Config, LuaComponentConfig, LuaSandboxConfig, RemoteBlocklistConfig, RemoteHostsConfig,
+    UpstreamConfig, UpstreamProtocol,
 };
 use privdrop::PrivDrop;
 use std::io;

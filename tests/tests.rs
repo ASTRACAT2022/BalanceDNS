@@ -3,6 +3,8 @@ extern crate libbalancedns;
 #[cfg(test)]
 mod test {
     use libbalancedns::{dns, Config, UpstreamProtocol};
+    use std::io::Write;
+    use tempfile::Builder;
 
     #[test]
     fn parse_balancedns_config() {
@@ -103,6 +105,9 @@ threads_tcp = 4
         );
         assert_eq!(config.plugin_libraries.len(), 1);
         assert_eq!(config.lua_scripts, vec!["lua/query_logger.lua"]);
+        assert_eq!(config.lua_components.len(), 1);
+        assert_eq!(config.lua_components[0].path, "lua/query_logger.lua");
+        assert_eq!(config.lua_sandbox.max_packet_bytes, 4096);
         assert_eq!(config.upstreams.len(), 2);
         assert_eq!(config.upstreams[0].proto, UpstreamProtocol::Doh);
         assert_eq!(
@@ -217,6 +222,291 @@ weight = 1
         assert!(err
             .to_string()
             .contains("hosts_remote.refresh_seconds must be greater than 0"));
+    }
+
+    #[test]
+    fn parse_structured_lua_config() {
+        let cfg = r#"
+[server]
+udp_listen = "127.0.0.1:5353"
+
+[lua]
+scripts = ["lua/default.lua"]
+
+[lua.settings]
+mode = "observe"
+sample_rate = 5
+
+[lua.sandbox]
+max_packet_bytes = 2048
+disable_after_failures = 3
+init_instruction_limit = 123456
+hook_instruction_limit = 654321
+
+[[lua.components]]
+path = "lua/filter.lua"
+enabled = true
+
+[lua.components.settings]
+mode = "block"
+reply_code = 3
+tags = ["ads", "telemetry"]
+
+[[lua.components]]
+path = "lua/off.lua"
+enabled = false
+
+[[upstreams]]
+name = "cloudflare-udp"
+proto = "udp"
+addr = "1.1.1.1:53"
+pool = "default"
+weight = 1
+"#;
+
+        let config = Config::from_string(cfg).unwrap();
+        assert_eq!(
+            config.lua_scripts,
+            vec!["lua/default.lua", "lua/filter.lua"]
+        );
+        assert_eq!(config.lua_components.len(), 3);
+        assert_eq!(config.lua_sandbox.max_packet_bytes, 2048);
+        assert_eq!(config.lua_sandbox.disable_after_failures, 3);
+        assert_eq!(config.lua_sandbox.init_instruction_limit, 123456);
+        assert_eq!(config.lua_sandbox.hook_instruction_limit, 654321);
+
+        let default_component = config
+            .lua_components
+            .iter()
+            .find(|component| component.path == "lua/default.lua")
+            .unwrap();
+        let default_settings = default_component.settings.as_table().unwrap();
+        assert_eq!(
+            default_settings
+                .get("mode")
+                .and_then(|value| value.as_str()),
+            Some("observe")
+        );
+        assert_eq!(
+            default_settings
+                .get("sample_rate")
+                .and_then(|value| value.as_integer()),
+            Some(5)
+        );
+
+        let filter_component = config
+            .lua_components
+            .iter()
+            .find(|component| component.path == "lua/filter.lua")
+            .unwrap();
+        let filter_settings = filter_component.settings.as_table().unwrap();
+        assert_eq!(
+            filter_settings.get("mode").and_then(|value| value.as_str()),
+            Some("block")
+        );
+        assert_eq!(
+            filter_settings
+                .get("reply_code")
+                .and_then(|value| value.as_integer()),
+            Some(3)
+        );
+        assert_eq!(
+            filter_settings
+                .get("tags")
+                .and_then(|value| value.as_array())
+                .map(|items| items.len()),
+            Some(2)
+        );
+
+        let disabled_component = config
+            .lua_components
+            .iter()
+            .find(|component| component.path == "lua/off.lua")
+            .unwrap();
+        assert!(!disabled_component.enabled);
+    }
+
+    #[test]
+    fn parse_balancedns_lua_config() {
+        let cfg = r#"
+local edge_ip = "0.0.0.0"
+
+return {
+    server = {
+        udp_listen = edge_ip .. ":5353",
+        tcp_listen = edge_ip .. ":5353",
+        dot_listen = edge_ip .. ":8853",
+        doh_listen = edge_ip .. ":8443",
+    },
+    tls = {
+        cert_pem = "tls/server.crt",
+        key_pem = "tls/server.key",
+    },
+    balancing = {
+        algorithm = "round_robin",
+    },
+    security = {
+        deny_any = true,
+        deny_dnskey = true,
+        request_timeout_ms = 3000,
+    },
+    cache = {
+        enabled = true,
+        max_size = 20000,
+        ttl_seconds = 600,
+        stale_refresh_enabled = true,
+        stale_ttl_seconds = 30,
+    },
+    metrics = {
+        listen = "127.0.0.1:9100",
+    },
+    hosts_local = {
+        ["example.com."] = "1.2.3.4",
+    },
+    plugins = {
+        libraries = { "plugins/libsample.dylib" },
+    },
+    lua = {
+        settings = {
+            mode = "observe",
+            sample_rate = 10,
+        },
+        sandbox = {
+            max_packet_bytes = 2048,
+            disable_after_failures = 4,
+            init_instruction_limit = 111111,
+            hook_instruction_limit = 222222,
+        },
+        components = {
+            {
+                path = "lua/default.lua",
+                enabled = true,
+            },
+            {
+                path = "lua/filter.lua",
+                enabled = true,
+                settings = {
+                    mode = "block",
+                    reply_code = 3,
+                    tags = { "ads", "telemetry" },
+                },
+            },
+        },
+    },
+    upstreams = {
+        {
+            name = "cloudflare-doh",
+            proto = "doh",
+            url = "https://1.1.1.1/dns-query",
+            pool = "default",
+            weight = 5,
+        },
+        {
+            name = "cloudflare-udp",
+            proto = "udp",
+            addr = "1.1.1.1:53",
+            pool = "default",
+            weight = 1,
+        },
+    },
+    routing_rules = {
+        {
+            suffix = ".ru.",
+            upstreams = { "cloudflare-udp" },
+        },
+    },
+    global = {
+        threads_udp = 6,
+        threads_tcp = 4,
+    },
+}
+"#;
+
+        let config = match Config::from_lua_string(cfg) {
+            Ok(config) => config,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    && err.to_string().contains("Lua shared library") =>
+            {
+                eprintln!("Skipping Lua config test: {}", err);
+                return;
+            }
+            Err(err) => panic!("Lua config parse failed: {}", err),
+        };
+
+        assert_eq!(config.udp_listen_addr.as_deref(), Some("0.0.0.0:5353"));
+        assert_eq!(config.dot_listen_addr.as_deref(), Some("0.0.0.0:8853"));
+        assert_eq!(
+            config.lua_scripts,
+            vec!["lua/default.lua", "lua/filter.lua"]
+        );
+        assert_eq!(config.lua_sandbox.max_packet_bytes, 2048);
+        assert_eq!(config.lua_sandbox.disable_after_failures, 4);
+        assert_eq!(config.lua_sandbox.init_instruction_limit, 111111);
+        assert_eq!(config.lua_sandbox.hook_instruction_limit, 222222);
+        assert_eq!(config.hosts_local.get("example.com.").unwrap(), "1.2.3.4");
+        assert_eq!(config.upstreams[0].proto, UpstreamProtocol::Doh);
+        assert_eq!(config.upstreams[1].proto, UpstreamProtocol::Udp);
+        assert_eq!(config.routing_rules[0].suffix, ".ru.");
+
+        let filter_component = config
+            .lua_components
+            .iter()
+            .find(|component| component.path == "lua/filter.lua")
+            .unwrap();
+        let settings = filter_component.settings.as_table().unwrap();
+        assert_eq!(
+            settings.get("mode").and_then(|value| value.as_str()),
+            Some("block")
+        );
+        assert_eq!(
+            settings
+                .get("reply_code")
+                .and_then(|value| value.as_integer()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn from_path_detects_lua_config_extension() {
+        let cfg = r#"
+return {
+    server = {
+        udp_listen = "0.0.0.0:5353",
+    },
+    tls = {
+        cert_pem = "tls/server.crt",
+        key_pem = "tls/server.key",
+    },
+    upstreams = {
+        {
+            name = "cloudflare-udp",
+            proto = "udp",
+            addr = "1.1.1.1:53",
+            pool = "default",
+            weight = 1,
+        },
+    },
+}
+"#;
+
+        let mut file = Builder::new().suffix(".lua").tempfile().unwrap();
+        write!(file, "{}", cfg).unwrap();
+
+        let config = match Config::from_path(file.path()) {
+            Ok(config) => config,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    && err.to_string().contains("Lua shared library") =>
+            {
+                eprintln!("Skipping Lua config path test: {}", err);
+                return;
+            }
+            Err(err) => panic!("Lua config path parse failed: {}", err),
+        };
+
+        assert_eq!(config.udp_listen_addr.as_deref(), Some("0.0.0.0:5353"));
+        assert_eq!(config.upstreams.len(), 1);
     }
 
     #[test]
