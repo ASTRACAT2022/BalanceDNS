@@ -2,7 +2,7 @@ extern crate libbalancedns;
 
 #[cfg(test)]
 mod test {
-    use libbalancedns::{Config, UpstreamProtocol};
+    use libbalancedns::{dns, Config, UpstreamProtocol};
 
     #[test]
     fn parse_balancedns_config() {
@@ -49,6 +49,9 @@ refresh_seconds = 300
 
 [plugins]
 libraries = ["plugins/libsample.dylib"]
+
+[lua]
+scripts = [" lua/query_logger.lua "]
 
 [[upstreams]]
 name = "cloudflare-doh"
@@ -99,6 +102,7 @@ threads_tcp = 4
             "https://example.com/blocklist"
         );
         assert_eq!(config.plugin_libraries.len(), 1);
+        assert_eq!(config.lua_scripts, vec!["lua/query_logger.lua"]);
         assert_eq!(config.upstreams.len(), 2);
         assert_eq!(config.upstreams[0].proto, UpstreamProtocol::Doh);
         assert_eq!(
@@ -164,5 +168,93 @@ weight = 1
         assert_eq!(config.request_timeout_ms, 1500);
         assert!(!config.stale_refresh_enabled);
         assert_eq!(config.stale_ttl_seconds, 30);
+    }
+
+    #[test]
+    fn balancedns_rejects_unknown_routing_upstream() {
+        let cfg = r#"
+[server]
+udp_listen = "127.0.0.1:5353"
+
+[[upstreams]]
+name = "cloudflare-udp"
+proto = "udp"
+addr = "1.1.1.1:53"
+pool = "default"
+weight = 1
+
+[[routing_rules]]
+suffix = ".ru."
+upstreams = ["missing-upstream"]
+"#;
+
+        let err = Config::from_string(cfg).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("references unknown upstream [missing-upstream]"));
+    }
+
+    #[test]
+    fn balancedns_rejects_zero_refresh_interval() {
+        let cfg = r#"
+[server]
+udp_listen = "127.0.0.1:5353"
+
+[hosts_remote]
+url = "https://example.com/hosts"
+refresh_seconds = 0
+ttl_seconds = 60
+
+[[upstreams]]
+name = "cloudflare-udp"
+proto = "udp"
+addr = "1.1.1.1:53"
+pool = "default"
+weight = 1
+"#;
+
+        let err = Config::from_string(cfg).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("hosts_remote.refresh_seconds must be greater than 0"));
+    }
+
+    #[test]
+    fn balancedns_requires_tls_files_for_dot_or_doh() {
+        let cfg = r#"
+[server]
+dot_listen = "127.0.0.1:8853"
+
+[[upstreams]]
+name = "cloudflare-udp"
+proto = "udp"
+addr = "1.1.1.1:53"
+pool = "default"
+weight = 1
+"#;
+
+        let err = Config::from_string(cfg).unwrap_err();
+        assert!(err.to_string().contains("tls.cert_pem is required"));
+    }
+
+    #[test]
+    fn dns_helpers_reject_malformed_question_without_panicking() {
+        let packet = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+
+        let question_result = std::panic::catch_unwind(|| dns::question(&packet));
+        let min_ttl_result = std::panic::catch_unwind(|| dns::min_ttl(&packet, 0, 60, 30));
+        let set_ttl_result = std::panic::catch_unwind(|| {
+            let mut packet = packet.clone();
+            dns::set_ttl(&mut packet, 30)
+        });
+
+        assert!(question_result.is_ok());
+        assert!(min_ttl_result.is_ok());
+        assert!(set_ttl_result.is_ok());
+        assert!(question_result.unwrap().is_err());
+        assert!(min_ttl_result.unwrap().is_err());
+        assert!(set_ttl_result.unwrap().is_err());
     }
 }

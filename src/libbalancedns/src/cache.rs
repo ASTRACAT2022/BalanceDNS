@@ -16,14 +16,21 @@
 //! The `test` and `recent` section act as a security valve when a spike of
 //! previously unknown queries is observed.
 
-use clockpro_cache::*;
-use coarsetime::{Duration, Instant};
 use crate::config::Config;
-use log::error;
 use crate::dns;
 use crate::dns::{NormalizedQuestion, NormalizedQuestionKey, DNS_CLASS_IN, DNS_RCODE_NXDOMAIN};
+use clockpro_cache::*;
+use coarsetime::{Duration, Instant};
+use log::error;
 use parking_lot::Mutex;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::io;
 use std::sync::Arc;
+use std::thread;
+
+const CACHE_SHARD_MIN: usize = 4;
+const CACHE_SHARD_MAX: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct CacheEntry {
@@ -48,7 +55,7 @@ impl CacheEntry {
 #[derive(Clone)]
 pub struct Cache {
     config: Config,
-    arc_mx: Arc<Mutex<ClockProCache<NormalizedQuestionKey, CacheEntry>>>,
+    shards: Arc<Vec<Mutex<ClockProCache<NormalizedQuestionKey, CacheEntry>>>>,
 }
 
 pub struct CacheStats {
@@ -61,27 +68,48 @@ pub struct CacheStats {
 
 impl Cache {
     #[inline]
-    pub fn new(config: Config) -> Cache {
-        let arc = ClockProCache::new(config.cache_size)
-            .expect("Failed to initialize CLOCK-Pro cache");
-        let arc_mx = Arc::new(Mutex::new(arc));
-        Cache { config, arc_mx }
+    pub fn new(config: Config) -> io::Result<Cache> {
+        let shard_count = shard_count_for_capacity(config.cache_size);
+        let mut shards = Vec::with_capacity(shard_count);
+        for shard_index in 0..shard_count {
+            let shard_capacity = shard_capacity(config.cache_size, shard_count, shard_index);
+            let shard = ClockProCache::new(shard_capacity)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+            shards.push(Mutex::new(shard));
+        }
+        Ok(Cache {
+            config,
+            shards: Arc::new(shards),
+        })
     }
 
     #[inline]
     pub fn stats(&self) -> CacheStats {
-        let cache = self.arc_mx.lock();
-        CacheStats {
-            frequent_len: cache.frequent_len(),
-            recent_len: cache.recent_len(),
-            test_len: cache.test_len(),
-            inserted: cache.inserted(),
-            evicted: cache.evicted(),
+        let mut stats = CacheStats {
+            frequent_len: 0,
+            recent_len: 0,
+            test_len: 0,
+            inserted: 0,
+            evicted: 0,
+        };
+        for shard in self.shards.iter() {
+            let cache = shard.lock();
+            stats.frequent_len += cache.frequent_len();
+            stats.recent_len += cache.recent_len();
+            stats.test_len += cache.test_len();
+            stats.inserted += cache.inserted();
+            stats.evicted += cache.evicted();
         }
+        stats
     }
 
     #[inline]
-    pub fn insert(&self, normalized_question_key: NormalizedQuestionKey, packet: Vec<u8>, ttl: u32) -> bool {
+    pub fn insert(
+        &self,
+        normalized_question_key: NormalizedQuestionKey,
+        packet: Vec<u8>,
+        ttl: u32,
+    ) -> bool {
         debug_assert!(packet.len() >= dns::DNS_HEADER_SIZE);
         if packet.len() < dns::DNS_HEADER_SIZE {
             return false;
@@ -90,13 +118,13 @@ impl Cache {
         let duration = Duration::from_secs(ttl as u64);
         let expiration = now + duration;
         let cache_entry = CacheEntry { expiration, packet };
-        let mut cache = self.arc_mx.lock();
+        let mut cache = self.shard_for_key(&normalized_question_key).lock();
         cache.insert(normalized_question_key, cache_entry)
     }
 
     #[inline]
     pub fn get(&self, normalized_question_key: &NormalizedQuestionKey) -> Option<CacheEntry> {
-        let mut cache = self.arc_mx.lock();
+        let mut cache = self.shard_for_key(normalized_question_key).lock();
         cache
             .get_mut(normalized_question_key)
             .map(|res| res.clone())
@@ -206,4 +234,38 @@ impl Cache {
             None
         }
     }
+
+    #[inline]
+    fn shard_for_key(
+        &self,
+        normalized_question_key: &NormalizedQuestionKey,
+    ) -> &Mutex<ClockProCache<NormalizedQuestionKey, CacheEntry>> {
+        let shard_index = shard_index(normalized_question_key, self.shards.len());
+        &self.shards[shard_index]
+    }
+}
+
+fn shard_count_for_capacity(cache_size: usize) -> usize {
+    let available_parallelism = thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4);
+    let desired = (available_parallelism * 4).clamp(CACHE_SHARD_MIN, CACHE_SHARD_MAX);
+    desired.min(cache_size.max(1))
+}
+
+fn shard_capacity(total_capacity: usize, shard_count: usize, shard_index: usize) -> usize {
+    let base = total_capacity / shard_count;
+    let remainder = total_capacity % shard_count;
+    let capacity = if shard_index < remainder {
+        base + 1
+    } else {
+        base
+    };
+    capacity.max(1)
+}
+
+fn shard_index(normalized_question_key: &NormalizedQuestionKey, shard_count: usize) -> usize {
+    let mut hasher = DefaultHasher::new();
+    normalized_question_key.hash(&mut hasher);
+    (hasher.finish() as usize) % shard_count
 }

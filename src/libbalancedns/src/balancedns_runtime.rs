@@ -1,31 +1,30 @@
-use base64;
-use base64::Engine;
 use crate::cache::Cache;
 use crate::config::{Config, RoutingRuleConfig, UpstreamConfig, UpstreamProtocol};
 use crate::dns;
 use crate::odoh::OdohServer;
 use crate::plugins::{PacketAction, PluginManager};
 use crate::varz::Varz;
+use base64;
+use base64::Engine;
+use crossbeam_channel::{bounded, Sender, TrySendError};
 use log::{debug, error, info, warn};
 use parking_lot::{Mutex, RwLock};
 use prometheus::{Encoder, TextEncoder};
-use rand::Rng;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use rustls::{Certificate, PrivateKey, ServerConfig, ServerConnection, StreamOwned};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
-use std::collections::{HashMap, HashSet, VecDeque};
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
 use std::time::Duration as StdDuration;
+use std::time::Instant;
 use url::Url;
-use crossbeam_channel::bounded;
 
 const TCP_SESSION_PREFETCH_MAX: usize = 4;
 const TCP_SESSION_PREFETCH_READ_TIMEOUT_MS: u64 = 5;
@@ -41,6 +40,10 @@ const MAX_STALE_REFRESH_THREADS: usize = 8;
 const DOH_MAX_BODY_SIZE: usize = 65535;
 const UDP_UPSTREAM_SOCKET_POOL_MIN: usize = 32;
 const UDP_UPSTREAM_SOCKET_POOL_MAX: usize = 256;
+const UDP_WORK_QUEUE_PER_WORKER: usize = 1024;
+const STREAM_WORK_QUEUE_MULTIPLIER: usize = 256;
+const STREAM_WORK_QUEUE_MIN: usize = 256;
+const STREAM_WORK_QUEUE_MAX: usize = 8192;
 
 trait SessionStream: Read + Write {
     fn set_read_timeout(&self, timeout: Option<StdDuration>) -> io::Result<()>;
@@ -64,8 +67,11 @@ pub struct BalanceDnsRuntime {
     local_hosts: HashMap<String, IpAddr>,
     remote_hosts: RwLock<HashMap<String, IpAddr>>,
     remote_blocklist: RwLock<HashSet<String>>,
+    routing_rules: Vec<RuntimeRoutingRule>,
+    upstream_selection: UpstreamSelectionState,
     plugins: PluginManager,
     rr_counter: AtomicUsize,
+    udp_socket_rr_counter: AtomicUsize,
     varz: Arc<Varz>,
     http_client: Client,
     stale_refresh_inflight: Mutex<HashSet<dns::NormalizedQuestionKey>>,
@@ -73,6 +79,66 @@ pub struct BalanceDnsRuntime {
     tcp_connection_count: AtomicUsize,
     upstream_udp_sockets: Vec<Mutex<UdpSocket>>,
     odoh_server: OdohServer,
+}
+
+struct RuntimeRoutingRule {
+    suffix: String,
+    prioritized_indices: Vec<usize>,
+}
+
+struct UpstreamSelectionState {
+    cumulative_weights: Vec<usize>,
+    total_weight: usize,
+    fallback_indices: Vec<usize>,
+}
+
+impl UpstreamSelectionState {
+    fn new(upstreams: &[UpstreamConfig]) -> Self {
+        let mut cumulative_weights = Vec::with_capacity(upstreams.len());
+        let mut total_weight = 0usize;
+        for upstream in upstreams {
+            total_weight = total_weight.saturating_add(upstream.weight.max(1));
+            cumulative_weights.push(total_weight);
+        }
+
+        let mut fallback_indices = (0..upstreams.len()).collect::<Vec<_>>();
+        fallback_indices.sort_by(|left, right| {
+            upstreams[*right]
+                .weight
+                .cmp(&upstreams[*left].weight)
+                .then_with(|| left.cmp(right))
+        });
+
+        Self {
+            cumulative_weights,
+            total_weight,
+            fallback_indices,
+        }
+    }
+
+    #[inline]
+    fn ordered_indices(&self, balancing_algorithm: &str, rr_counter: &AtomicUsize) -> Vec<usize> {
+        if self.fallback_indices.is_empty() {
+            return Vec::new();
+        }
+
+        let primary_index = match balancing_algorithm {
+            "round_robin" if self.total_weight > 0 => {
+                let slot = rr_counter.fetch_add(1, Ordering::Relaxed) % self.total_weight;
+                self.cumulative_weights.partition_point(|end| *end <= slot)
+            }
+            _ => 0,
+        };
+
+        let mut ordered = Vec::with_capacity(self.fallback_indices.len());
+        ordered.push(primary_index);
+        for &index in &self.fallback_indices {
+            if index != primary_index {
+                ordered.push(index);
+            }
+        }
+        ordered
+    }
 }
 
 struct InflightQueryGuard<'a> {
@@ -99,36 +165,48 @@ struct StaleRefreshGuard<'a> {
 
 impl<'a> Drop for StaleRefreshGuard<'a> {
     fn drop(&mut self) {
-        self.runtime.stale_refresh_inflight.lock().remove(&self.cache_key);
-        self.runtime.stale_refresh_active.fetch_sub(1, Ordering::Relaxed);
+        self.runtime
+            .stale_refresh_inflight
+            .lock()
+            .remove(&self.cache_key);
+        self.runtime
+            .stale_refresh_active
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
 impl BalanceDnsRuntime {
-    pub fn new(config: Config, varz: Arc<Varz>) -> Arc<Self> {
+    pub fn new(config: Config, varz: Arc<Varz>) -> io::Result<Arc<Self>> {
         let local_hosts = config
             .hosts_local
             .iter()
             .filter_map(|(name, ip)| ip.parse().ok().map(|ip| (name.clone(), ip)))
             .collect::<HashMap<String, IpAddr>>();
+        let routing_rules = compile_routing_rules(&config.routing_rules, &config.upstreams);
+        let upstream_selection = UpstreamSelectionState::new(&config.upstreams);
         let http_client = Client::builder()
-            .connect_timeout(StdDuration::from_millis((config.request_timeout_ms / 2).max(500)))
+            .connect_timeout(StdDuration::from_millis(
+                (config.request_timeout_ms / 2).max(500),
+            ))
             .pool_max_idle_per_host(16)
             .pool_idle_timeout(Some(StdDuration::from_secs(90)))
             .tcp_keepalive(Some(StdDuration::from_secs(30)))
             .timeout(StdDuration::from_millis(config.request_timeout_ms))
             .build()
-            .expect("Unable to initialize HTTP client");
+            .map_err(io::Error::other)?;
 
         let odoh_server = OdohServer::new();
 
         // Pre-create a pool of UDP sockets for upstream queries
         let socket_pool_size = thread::available_parallelism()
-            .map(|parallelism| (parallelism.get() * 8).clamp(UDP_UPSTREAM_SOCKET_POOL_MIN, UDP_UPSTREAM_SOCKET_POOL_MAX))
+            .map(|parallelism| {
+                (parallelism.get() * 8)
+                    .clamp(UDP_UPSTREAM_SOCKET_POOL_MIN, UDP_UPSTREAM_SOCKET_POOL_MAX)
+            })
             .unwrap_or(64);
         let mut upstream_udp_sockets = Vec::with_capacity(socket_pool_size);
         for _ in 0..socket_pool_size {
-            match UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))) {
+            match bind_upstream_udp_socket() {
                 Ok(sock) => upstream_udp_sockets.push(Mutex::new(sock)),
                 Err(err) => {
                     log::warn!("Failed to pre-allocate upstream UDP socket: {}", err);
@@ -137,22 +215,20 @@ impl BalanceDnsRuntime {
         }
         if upstream_udp_sockets.is_empty() {
             // Fallback: at least one
-            upstream_udp_sockets.push(
-                Mutex::new(
-                    UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
-                        .expect("Unable to bind any UDP socket for upstream queries"),
-                ),
-            );
+            upstream_udp_sockets.push(Mutex::new(bind_upstream_udp_socket()?));
         }
 
-        Arc::new(BalanceDnsRuntime {
-            cache: Cache::new(config.clone()),
+        Ok(Arc::new(BalanceDnsRuntime {
+            cache: Cache::new(config.clone())?,
             config: config.clone(),
             local_hosts,
             remote_hosts: RwLock::new(HashMap::new()),
             remote_blocklist: RwLock::new(HashSet::new()),
-            plugins: PluginManager::from_paths(&config.plugin_libraries),
+            routing_rules,
+            upstream_selection,
+            plugins: PluginManager::from_config(&config.plugin_libraries, &config.lua_scripts),
             rr_counter: AtomicUsize::new(0),
+            udp_socket_rr_counter: AtomicUsize::new(0),
             varz,
             http_client,
             stale_refresh_inflight: Mutex::new(HashSet::new()),
@@ -160,7 +236,7 @@ impl BalanceDnsRuntime {
             tcp_connection_count: AtomicUsize::new(0),
             upstream_udp_sockets,
             odoh_server,
-        })
+        }))
     }
 
     pub fn run(self: &Arc<Self>) -> io::Result<()> {
@@ -203,7 +279,7 @@ impl BalanceDnsRuntime {
                 .spawn(move || {
                     runtime.refresh_remote_hosts_loop();
                 }) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => error!("Failed to spawn remote hosts refresh thread: {}", e),
             }
         }
@@ -214,7 +290,7 @@ impl BalanceDnsRuntime {
                 .spawn(move || {
                     runtime.refresh_remote_blocklist_loop();
                 }) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => error!("Failed to spawn blocklist refresh thread: {}", e),
             }
         }
@@ -225,9 +301,13 @@ impl BalanceDnsRuntime {
         self.refresh_remote_blocklist_once();
     }
 
-    fn spawn_udp_listener(self: &Arc<Self>, listen_addr: String) -> io::Result<thread::JoinHandle<()>> {
+    fn spawn_udp_listener(
+        self: &Arc<Self>,
+        listen_addr: String,
+    ) -> io::Result<thread::JoinHandle<()>> {
         let socket = UdpSocket::bind(&listen_addr)?;
         let sender_socket = socket.try_clone()?;
+        configure_udp_listener_socket(&socket)?;
         let default_workers = thread::available_parallelism()
             .map(|parallelism| parallelism.get())
             .unwrap_or(4)
@@ -237,8 +317,7 @@ impl BalanceDnsRuntime {
         } else {
             default_workers.max(2)
         };
-        let (tx, rx) = bounded::<(SocketAddr, Vec<u8>)>(worker_count * 1024);
-        let rx = Arc::new(Mutex::new(rx));
+        let (tx, rx) = bounded::<(SocketAddr, Vec<u8>)>(worker_count * UDP_WORK_QUEUE_PER_WORKER);
         for worker_id in 0..worker_count {
             let socket = sender_socket.try_clone()?;
             let rx = rx.clone();
@@ -246,7 +325,7 @@ impl BalanceDnsRuntime {
             thread::Builder::new()
                 .name(format!("balancedns_udp_worker_{}", worker_id))
                 .spawn(move || loop {
-                    let (addr, packet) = match rx.lock().recv() {
+                    let (addr, packet) = match rx.recv() {
                         Ok(job) => job,
                         Err(_) => break,
                     };
@@ -270,34 +349,78 @@ impl BalanceDnsRuntime {
                         error!("UDP worker thread panicked for {}: {:?}", addr, panic_err);
                     }
                 })
-                .unwrap();
+                .map_err(|err| io::Error::other(format!("Unable to spawn UDP worker: {}", err)))?;
         }
         info!("UDP listener is ready on {}", listen_addr);
         thread::Builder::new()
             .name("balancedns_udp".to_string())
-            .spawn(move || {
-                let mut buf = [0u8; 65535];
-                loop {
-                    match socket.recv_from(&mut buf) {
-                        Ok((len, addr)) => {
-                            let packet = buf[..len].to_vec();
-                            if tx.send((addr, packet)).is_err() {
-                                error!("UDP worker queue unexpectedly closed on {}", listen_addr);
-                                break;
+            .spawn({
+                let runtime = self.clone();
+                move || {
+                    let mut buf = [0u8; 65535];
+                    loop {
+                        match socket.recv_from(&mut buf) {
+                            Ok((len, addr)) => {
+                                let packet = buf[..len].to_vec();
+                                match tx.try_send((addr, packet)) {
+                                    Ok(()) => {}
+                                    Err(TrySendError::Full((_addr, _packet))) => {
+                                        runtime.varz.client_queries_dropped.inc();
+                                        debug!(
+                                            "UDP worker queue is full on {}, dropping packet",
+                                            listen_addr
+                                        );
+                                    }
+                                    Err(TrySendError::Disconnected((_addr, _packet))) => {
+                                        error!(
+                                            "UDP worker queue unexpectedly closed on {}",
+                                            listen_addr
+                                        );
+                                        break;
+                                    }
+                                }
                             }
-                        }
-                        Err(err) => {
-                            error!("UDP listener error on {}: {}", listen_addr, err);
+                            Err(err) => {
+                                error!("UDP listener error on {}: {}", listen_addr, err);
+                            }
                         }
                     }
                 }
             })
     }
 
-    fn spawn_tcp_listener(self: &Arc<Self>, listen_addr: String) -> io::Result<thread::JoinHandle<()>> {
+    fn spawn_tcp_listener(
+        self: &Arc<Self>,
+        listen_addr: String,
+    ) -> io::Result<thread::JoinHandle<()>> {
         let listener = TcpListener::bind(&listen_addr)?;
         info!("TCP listener is ready on {}", listen_addr);
         let max_tcp = self.config.max_tcp_clients;
+        let worker_count = stream_worker_count(self.config.tcp_acceptor_threads);
+        let queue_capacity = stream_queue_capacity(worker_count, max_tcp);
+        let (tx, rx) = bounded::<(TcpStream, SocketAddr)>(queue_capacity);
+
+        for worker_id in 0..worker_count {
+            let runtime = self.clone();
+            let rx = rx.clone();
+            thread::Builder::new()
+                .name(format!("balancedns_tcp_worker_{}", worker_id))
+                .spawn(move || {
+                    while let Ok((stream, addr)) = rx.recv() {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if let Err(err) = runtime.handle_tcp_session(stream) {
+                                debug!("TCP session closed for {}: {}", addr, err);
+                            }
+                        }));
+                        if let Err(panic_err) = result {
+                            error!("TCP session worker panicked for {}: {:?}", addr, panic_err);
+                        }
+                        runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
+                    }
+                })
+                .map_err(|err| io::Error::other(format!("Unable to spawn TCP worker: {}", err)))?;
+        }
+
         thread::Builder::new()
             .name("balancedns_tcp".to_string())
             .spawn({
@@ -307,24 +430,26 @@ impl BalanceDnsRuntime {
                         Ok((stream, addr)) => {
                             let current = runtime.tcp_connection_count.load(Ordering::Relaxed);
                             if current >= max_tcp {
-                                warn!("TCP connection limit reached ({}/{}), rejecting {}", current, max_tcp, addr);
+                                warn!(
+                                    "TCP connection limit reached ({}/{}), rejecting {}",
+                                    current, max_tcp, addr
+                                );
+                                runtime.varz.client_connections_rejected.inc();
+                                drop(stream);
+                                continue;
+                            }
+                            if let Err(err) = configure_accepted_stream(&stream) {
+                                runtime.varz.client_connections_rejected.inc();
+                                debug!("Failed to configure TCP stream for {}: {}", addr, err);
                                 drop(stream);
                                 continue;
                             }
                             runtime.tcp_connection_count.fetch_add(1, Ordering::Relaxed);
-                            let runtime = runtime.clone();
-                            thread::spawn(move || {
-                                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    let _ = stream.set_nodelay(true);
-                                    if let Err(err) = runtime.handle_tcp_session(stream) {
-                                        debug!("TCP session closed for {}: {}", addr, err);
-                                    }
-                                }));
-                                if let Err(panic_err) = result {
-                                    error!("TCP session thread panicked for {}: {:?}", addr, panic_err);
-                                }
+                            if let Err(err) = enqueue_stream(&tx, stream, addr) {
                                 runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
-                            });
+                                runtime.varz.client_connections_rejected.inc();
+                                debug!("TCP queue rejected {}: {}", addr, err);
+                            }
                         }
                         Err(err) => error!("TCP accept error on {}: {}", listen_addr, err),
                     }
@@ -332,7 +457,10 @@ impl BalanceDnsRuntime {
             })
     }
 
-    fn spawn_dot_listener(self: &Arc<Self>, listen_addr: String) -> io::Result<thread::JoinHandle<()>> {
+    fn spawn_dot_listener(
+        self: &Arc<Self>,
+        listen_addr: String,
+    ) -> io::Result<thread::JoinHandle<()>> {
         let listener = TcpListener::bind(&listen_addr)?;
         let tls_config = Arc::new(load_tls_server_config(
             &self.config,
@@ -340,6 +468,39 @@ impl BalanceDnsRuntime {
         )?);
         info!("DoT listener is ready on {}", listen_addr);
         let max_tcp = self.config.max_tcp_clients;
+        let worker_count = stream_worker_count(self.config.tcp_acceptor_threads);
+        let queue_capacity = stream_queue_capacity(worker_count, max_tcp);
+        let (tx, rx) = bounded::<(TcpStream, SocketAddr)>(queue_capacity);
+
+        for worker_id in 0..worker_count {
+            let runtime = self.clone();
+            let rx = rx.clone();
+            let tls_config = tls_config.clone();
+            thread::Builder::new()
+                .name(format!("balancedns_dot_worker_{}", worker_id))
+                .spawn(move || {
+                    while let Ok((stream, addr)) = rx.recv() {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let connection =
+                                ServerConnection::new(tls_config.clone()).map_err(io::Error::other);
+                            match connection {
+                                Ok(connection) => {
+                                    let tls_stream = StreamOwned::new(connection, stream);
+                                    if let Err(err) = runtime.handle_tls_session(tls_stream) {
+                                        debug!("DoT session closed for {}: {}", addr, err);
+                                    }
+                                }
+                                Err(err) => debug!("DoT TLS error for {}: {}", addr, err),
+                            }
+                        }));
+                        if let Err(panic_err) = result {
+                            error!("DoT session worker panicked for {}: {:?}", addr, panic_err);
+                        }
+                        runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
+                    }
+                })
+                .map_err(|err| io::Error::other(format!("Unable to spawn DoT worker: {}", err)))?;
+        }
         thread::Builder::new()
             .name("balancedns_dot".to_string())
             .spawn({
@@ -349,32 +510,26 @@ impl BalanceDnsRuntime {
                         Ok((stream, addr)) => {
                             let current = runtime.tcp_connection_count.load(Ordering::Relaxed);
                             if current >= max_tcp {
-                                warn!("DoT connection limit reached ({}/{}), rejecting {}", current, max_tcp, addr);
+                                warn!(
+                                    "DoT connection limit reached ({}/{}), rejecting {}",
+                                    current, max_tcp, addr
+                                );
+                                runtime.varz.client_connections_rejected.inc();
+                                drop(stream);
+                                continue;
+                            }
+                            if let Err(err) = configure_accepted_stream(&stream) {
+                                runtime.varz.client_connections_rejected.inc();
+                                debug!("Failed to configure DoT stream for {}: {}", addr, err);
                                 drop(stream);
                                 continue;
                             }
                             runtime.tcp_connection_count.fetch_add(1, Ordering::Relaxed);
-                            let runtime = runtime.clone();
-                            let tls_config = tls_config.clone();
-                            thread::spawn(move || {
-                                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    let _ = stream.set_nodelay(true);
-                                    let connection = ServerConnection::new(tls_config).map_err(io::Error::other);
-                                    match connection {
-                                        Ok(connection) => {
-                                            let tls_stream = StreamOwned::new(connection, stream);
-                                            if let Err(err) = runtime.handle_tls_session(tls_stream) {
-                                                debug!("DoT session closed for {}: {}", addr, err);
-                                            }
-                                        }
-                                        Err(err) => debug!("DoT TLS error for {}: {}", addr, err),
-                                    }
-                                }));
-                                if let Err(panic_err) = result {
-                                    error!("DoT session thread panicked for {}: {:?}", addr, panic_err);
-                                }
+                            if let Err(err) = enqueue_stream(&tx, stream, addr) {
                                 runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
-                            });
+                                runtime.varz.client_connections_rejected.inc();
+                                debug!("DoT queue rejected {}: {}", addr, err);
+                            }
                         }
                         Err(err) => error!("DoT accept error on {}: {}", listen_addr, err),
                     }
@@ -382,7 +537,10 @@ impl BalanceDnsRuntime {
             })
     }
 
-    fn spawn_doh_listener(self: &Arc<Self>, listen_addr: String) -> io::Result<thread::JoinHandle<()>> {
+    fn spawn_doh_listener(
+        self: &Arc<Self>,
+        listen_addr: String,
+    ) -> io::Result<thread::JoinHandle<()>> {
         let listener = TcpListener::bind(&listen_addr)?;
         let tls_config = Arc::new(load_tls_server_config(
             &self.config,
@@ -390,6 +548,39 @@ impl BalanceDnsRuntime {
         )?);
         info!("DoH listener is ready on https://{}/dns-query", listen_addr);
         let max_tcp = self.config.max_tcp_clients;
+        let worker_count = stream_worker_count(self.config.tcp_acceptor_threads);
+        let queue_capacity = stream_queue_capacity(worker_count, max_tcp);
+        let (tx, rx) = bounded::<(TcpStream, SocketAddr)>(queue_capacity);
+
+        for worker_id in 0..worker_count {
+            let runtime = self.clone();
+            let rx = rx.clone();
+            let tls_config = tls_config.clone();
+            thread::Builder::new()
+                .name(format!("balancedns_doh_worker_{}", worker_id))
+                .spawn(move || {
+                    while let Ok((stream, addr)) = rx.recv() {
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let connection =
+                                ServerConnection::new(tls_config.clone()).map_err(io::Error::other);
+                            match connection {
+                                Ok(connection) => {
+                                    let mut tls_stream = StreamOwned::new(connection, stream);
+                                    if let Err(err) = runtime.handle_doh_session(&mut tls_stream) {
+                                        debug!("DoH session closed for {}: {}", addr, err);
+                                    }
+                                }
+                                Err(err) => debug!("DoH TLS error for {}: {}", addr, err),
+                            }
+                        }));
+                        if let Err(panic_err) = result {
+                            error!("DoH session worker panicked for {}: {:?}", addr, panic_err);
+                        }
+                        runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
+                    }
+                })
+                .map_err(|err| io::Error::other(format!("Unable to spawn DoH worker: {}", err)))?;
+        }
         thread::Builder::new()
             .name("balancedns_doh".to_string())
             .spawn({
@@ -399,32 +590,26 @@ impl BalanceDnsRuntime {
                         Ok((stream, addr)) => {
                             let current = runtime.tcp_connection_count.load(Ordering::Relaxed);
                             if current >= max_tcp {
-                                warn!("DoH connection limit reached ({}/{}), rejecting {}", current, max_tcp, addr);
+                                warn!(
+                                    "DoH connection limit reached ({}/{}), rejecting {}",
+                                    current, max_tcp, addr
+                                );
+                                runtime.varz.client_connections_rejected.inc();
+                                drop(stream);
+                                continue;
+                            }
+                            if let Err(err) = configure_accepted_stream(&stream) {
+                                runtime.varz.client_connections_rejected.inc();
+                                debug!("Failed to configure DoH stream for {}: {}", addr, err);
                                 drop(stream);
                                 continue;
                             }
                             runtime.tcp_connection_count.fetch_add(1, Ordering::Relaxed);
-                            let runtime = runtime.clone();
-                            let tls_config = tls_config.clone();
-                            thread::spawn(move || {
-                                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                    let _ = stream.set_nodelay(true);
-                                    let connection = ServerConnection::new(tls_config).map_err(io::Error::other);
-                                    match connection {
-                                        Ok(connection) => {
-                                            let mut tls_stream = StreamOwned::new(connection, stream);
-                                            if let Err(err) = runtime.handle_doh_session(&mut tls_stream) {
-                                                debug!("DoH session closed for {}: {}", addr, err);
-                                            }
-                                        }
-                                        Err(err) => debug!("DoH TLS error for {}: {}", addr, err),
-                                    }
-                                }));
-                                if let Err(panic_err) = result {
-                                    error!("DoH session thread panicked for {}: {:?}", addr, panic_err);
-                                }
+                            if let Err(err) = enqueue_stream(&tx, stream, addr) {
                                 runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
-                            });
+                                runtime.varz.client_connections_rejected.inc();
+                                debug!("DoH queue rejected {}: {}", addr, err);
+                            }
                         }
                         Err(err) => error!("DoH accept error on {}: {}", listen_addr, err),
                     }
@@ -469,12 +654,9 @@ impl BalanceDnsRuntime {
             self.varz.client_queries.inc();
             self.varz.client_queries_doh.inc();
             match self.process_query(&body) {
-                Ok(response) => write_http_response(
-                    stream,
-                    "200 OK",
-                    "application/dns-message",
-                    &response,
-                ),
+                Ok(response) => {
+                    write_http_response(stream, "200 OK", "application/dns-message", &response)
+                }
                 Err(err) => write_http_response(
                     stream,
                     "500 Internal Server Error",
@@ -509,9 +691,15 @@ impl BalanceDnsRuntime {
         }
     }
 
-    fn spawn_metrics_listener(self: &Arc<Self>, listen_addr: String) -> io::Result<thread::JoinHandle<()>> {
+    fn spawn_metrics_listener(
+        self: &Arc<Self>,
+        listen_addr: String,
+    ) -> io::Result<thread::JoinHandle<()>> {
         let listener = TcpListener::bind(&listen_addr)?;
-        info!("Metrics listener is ready on http://{}/metrics", listen_addr);
+        info!(
+            "Metrics listener is ready on http://{}/metrics",
+            listen_addr
+        );
         thread::Builder::new()
             .name("balancedns_metrics".to_string())
             .spawn({
@@ -610,6 +798,7 @@ impl BalanceDnsRuntime {
         let mut query_count = 0;
         let session_start = Instant::now();
         let idle_timeout = StdDuration::from_millis(TCP_SESSION_IDLE_TIMEOUT_MS);
+        stream.set_read_timeout(Some(idle_timeout))?;
 
         loop {
             // Check session limits
@@ -651,6 +840,7 @@ impl BalanceDnsRuntime {
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         let fqdn = dns::qname_to_fqdn(&normalized_question.qname)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        let fqdn = fqdn.to_ascii_lowercase();
 
         if self.config.deny_any && normalized_question.qtype == dns::DNS_TYPE_ANY {
             return Ok(dns::build_refused_packet(&normalized_question)
@@ -730,7 +920,10 @@ impl BalanceDnsRuntime {
                 // Check active count before allowing spawn
                 let active = self.stale_refresh_active.load(Ordering::Relaxed);
                 if active >= MAX_STALE_REFRESH_THREADS {
-                    debug!("Stale refresh thread limit reached ({}/{}), skipping refresh", active, MAX_STALE_REFRESH_THREADS);
+                    debug!(
+                        "Stale refresh thread limit reached ({}/{}), skipping refresh",
+                        active, MAX_STALE_REFRESH_THREADS
+                    );
                     false
                 } else {
                     // Mark as inflight and increment active count atomically
@@ -772,7 +965,7 @@ impl BalanceDnsRuntime {
                     let _ = runtime.cache.insert(cache_key.clone(), response, ttl);
                 }
             }) {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 error!("Failed to spawn stale refresh thread: {}", e);
                 // Rollback on failure
@@ -902,7 +1095,10 @@ impl BalanceDnsRuntime {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Upstream [{}] returned a mismatched response", upstream.name),
+                format!(
+                    "Upstream [{}] returned a mismatched response",
+                    upstream.name
+                ),
             ));
         }
         let sample_rtt = started_at.elapsed().as_secs_f64();
@@ -932,7 +1128,8 @@ impl BalanceDnsRuntime {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing upstream addr"))?
             .parse()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid upstream addr"))?;
-        let pool_idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % self.upstream_udp_sockets.len();
+        let pool_idx = self.udp_socket_rr_counter.fetch_add(1, Ordering::Relaxed)
+            % self.upstream_udp_sockets.len();
         let socket = self.upstream_udp_sockets[pool_idx].lock();
 
         // Serialize request/response per pooled socket to avoid reply mixups under concurrent load.
@@ -992,10 +1189,10 @@ impl BalanceDnsRuntime {
 
     #[inline]
     fn ordered_upstream_indices(&self, fqdn: &str) -> Vec<usize> {
-        route_upstream_indices_for_fqdn(
+        route_upstream_indices_for_fqdn_compiled(
             fqdn,
-            &self.config.routing_rules,
-            self.config.upstreams.as_slice(),
+            &self.routing_rules,
+            &self.upstream_selection,
             &self.config.balancing_algorithm,
             &self.rr_counter,
         )
@@ -1006,18 +1203,14 @@ impl BalanceDnsRuntime {
         if let Some(ip_addr) = self.local_hosts.get(fqdn).copied() {
             return Some((ip_addr, self.config.cache_ttl_seconds));
         }
-        self.remote_hosts
-            .read()
-            .get(fqdn)
-            .copied()
-            .map(|ip| {
-                let ttl = self
-                    .config
-                    .hosts_remote
-                    .as_ref()
-                    .map_or(self.config.cache_ttl_seconds, |cfg| cfg.ttl_seconds);
-                (ip, ttl)
-            })
+        self.remote_hosts.read().get(fqdn).copied().map(|ip| {
+            let ttl = self
+                .config
+                .hosts_remote
+                .as_ref()
+                .map_or(self.config.cache_ttl_seconds, |cfg| cfg.ttl_seconds);
+            (ip, ttl)
+        })
     }
 
     #[inline]
@@ -1055,7 +1248,10 @@ impl BalanceDnsRuntime {
             Ok(body) => {
                 let hosts = parse_hosts_mapping(&body);
                 *self.remote_hosts.write() = hosts;
-                info!("Loaded {} remote host overrides", self.remote_hosts.read().len());
+                info!(
+                    "Loaded {} remote host overrides",
+                    self.remote_hosts.read().len()
+                );
             }
             Err(err) => error!("Unable to refresh remote hosts [{}]: {}", config.url, err),
         }
@@ -1069,7 +1265,10 @@ impl BalanceDnsRuntime {
             Ok(body) => {
                 let entries = parse_blocklist(&body);
                 *self.remote_blocklist.write() = entries;
-                info!("Loaded {} remote blocked domains", self.remote_blocklist.read().len());
+                info!(
+                    "Loaded {} remote blocked domains",
+                    self.remote_blocklist.read().len()
+                );
             }
             Err(err) => error!("Unable to refresh blocklist [{}]: {}", config.url, err),
         }
@@ -1142,7 +1341,8 @@ fn parse_blocklist(body: &str) -> HashSet<String> {
             continue;
         }
         // Skip AdBlock-style rules (contain ##, ||, $, or start with special characters)
-        if line.contains("##") || line.contains("||") || line.contains('$') || line.starts_with('/') {
+        if line.contains("##") || line.contains("||") || line.contains('$') || line.starts_with('/')
+        {
             continue;
         }
         // Skip lines with commas (likely multi-domain rules or complex filters)
@@ -1198,6 +1398,58 @@ fn fetch_text(client: &Client, url: &str) -> io::Result<String> {
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?
         .text()
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
+}
+
+fn configure_udp_listener_socket(socket: &UdpSocket) -> io::Result<()> {
+    socket.set_nonblocking(false)?;
+    Ok(())
+}
+
+fn configure_accepted_stream(stream: &TcpStream) -> io::Result<()> {
+    let idle_timeout = Some(StdDuration::from_millis(TCP_SESSION_IDLE_TIMEOUT_MS));
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(idle_timeout)?;
+    stream.set_write_timeout(idle_timeout)?;
+    Ok(())
+}
+
+fn stream_worker_count(configured_threads: usize) -> usize {
+    if configured_threads > 0 {
+        configured_threads
+    } else {
+        thread::available_parallelism()
+            .map(|parallelism| parallelism.get().max(2))
+            .unwrap_or(4)
+    }
+}
+
+fn stream_queue_capacity(worker_count: usize, max_tcp_clients: usize) -> usize {
+    let per_worker = worker_count.saturating_mul(STREAM_WORK_QUEUE_MULTIPLIER);
+    per_worker
+        .clamp(STREAM_WORK_QUEUE_MIN, STREAM_WORK_QUEUE_MAX)
+        .min(max_tcp_clients.max(1))
+}
+
+fn enqueue_stream(
+    sender: &Sender<(TcpStream, SocketAddr)>,
+    stream: TcpStream,
+    addr: SocketAddr,
+) -> io::Result<()> {
+    match sender.try_send((stream, addr)) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full((_stream, _addr))) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "session queue is full",
+        )),
+        Err(TrySendError::Disconnected((_stream, _addr))) => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "session queue is disconnected",
+        )),
+    }
+}
+
+fn bind_upstream_udp_socket() -> io::Result<UdpSocket> {
+    UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
 }
 
 enum TlsApplicationProtocol {
@@ -1324,7 +1576,10 @@ fn read_http_request<S: Read>(stream: &mut S) -> io::Result<HttpRequest> {
     if content_length > DOH_MAX_BODY_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("Content-Length {} exceeds maximum allowed size {}", content_length, DOH_MAX_BODY_SIZE),
+            format!(
+                "Content-Length {} exceeds maximum allowed size {}",
+                content_length, DOH_MAX_BODY_SIZE
+            ),
         ));
     }
     let mut body = vec![0u8; content_length];
@@ -1348,7 +1603,13 @@ fn parse_doh_get_request(target: &str) -> io::Result<Vec<u8>> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid DoH target"))?;
     let dns_param = url
         .query_pairs()
-        .find_map(|(key, value)| if key == "dns" { Some(value.into_owned()) } else { None })
+        .find_map(|(key, value)| {
+            if key == "dns" {
+                Some(value.into_owned())
+            } else {
+                None
+            }
+        })
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing dns parameter"))?;
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(dns_param.as_bytes())
@@ -1371,7 +1632,10 @@ fn map_http_client_error(err: reqwest::Error) -> io::Error {
 
 #[inline]
 fn is_timeout_error(err: &io::Error) -> bool {
-    matches!(err.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+    matches!(
+        err.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
 }
 
 #[inline]
@@ -1380,79 +1644,56 @@ fn select_upstream_indices(
     balancing_algorithm: &str,
     rr_counter: &AtomicUsize,
 ) -> Vec<usize> {
-    if upstreams.is_empty() {
+    UpstreamSelectionState::new(upstreams).ordered_indices(balancing_algorithm, rr_counter)
+}
+
+fn compile_routing_rules(
+    routing_rules: &[RoutingRuleConfig],
+    upstreams: &[UpstreamConfig],
+) -> Vec<RuntimeRoutingRule> {
+    if routing_rules.is_empty() || upstreams.is_empty() {
         return Vec::new();
     }
 
-    let total_weight = upstreams
+    let upstream_indices = upstreams
         .iter()
-        .fold(0usize, |sum, upstream| sum.saturating_add(upstream.weight.max(1)));
-    let mut slot = match balancing_algorithm {
-        "round_robin" if total_weight > 0 => rr_counter.fetch_add(1, Ordering::Relaxed) % total_weight,
-        _ => 0,
-    };
-    let mut primary_index = 0usize;
-    for (index, upstream) in upstreams.iter().enumerate() {
-        let weight = upstream.weight.max(1);
-        if slot < weight {
-            primary_index = index;
-            break;
-        }
-        slot -= weight;
-    }
+        .enumerate()
+        .map(|(index, upstream)| (upstream.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
 
-    let mut remaining_indices = (0..upstreams.len())
-        .filter(|index| *index != primary_index)
-        .collect::<Vec<_>>();
-    remaining_indices.sort_by(|left, right| {
-        upstreams[*right]
-            .weight
-            .cmp(&upstreams[*left].weight)
-            .then_with(|| left.cmp(right))
-    });
-
-    let mut ordered = Vec::with_capacity(upstreams.len());
-    ordered.push(primary_index);
-    for index in remaining_indices {
-        ordered.push(index);
-    }
-    ordered
+    routing_rules
+        .iter()
+        .map(|rule| {
+            let mut prioritized_indices = Vec::new();
+            let mut seen = vec![false; upstreams.len()];
+            for upstream_name in &rule.upstreams {
+                if let Some(&index) = upstream_indices.get(upstream_name.as_str()) {
+                    if !seen[index] {
+                        seen[index] = true;
+                        prioritized_indices.push(index);
+                    }
+                }
+            }
+            RuntimeRoutingRule {
+                suffix: normalize_domain(&rule.suffix),
+                prioritized_indices,
+            }
+        })
+        .collect()
 }
 
-fn route_upstream_indices_for_fqdn(
-    fqdn: &str,
-    routing_rules: &[RoutingRuleConfig],
-    upstreams: &[UpstreamConfig],
-    balancing_algorithm: &str,
-    rr_counter: &AtomicUsize,
+fn prioritize_upstream_indices(
+    ordered_indices: Vec<usize>,
+    prioritized_indices: &[usize],
 ) -> Vec<usize> {
-    let ordered_indices = select_upstream_indices(upstreams, balancing_algorithm, rr_counter);
-    if ordered_indices.is_empty() {
-        return ordered_indices;
-    }
-    let matched_rule = routing_rules
-        .iter()
-        .find(|rule| fqdn_matches_suffix(fqdn, &rule.suffix));
-
-    let Some(rule) = matched_rule else {
-        return ordered_indices;
-    };
-
     let mut prioritized = Vec::with_capacity(ordered_indices.len());
-    let mut seen = vec![false; upstreams.len()];
-    for upstream_name in &rule.upstreams {
-        if let Some(index) = ordered_indices
-            .iter()
-            .copied()
-            .find(|index| upstreams[*index].name == *upstream_name)
-        {
-            if !seen[index] {
-                seen[index] = true;
-                prioritized.push(index);
-            }
+    let mut seen = vec![false; ordered_indices.len()];
+    for &index in prioritized_indices {
+        if index < seen.len() && !seen[index] {
+            seen[index] = true;
+            prioritized.push(index);
         }
     }
-
     for index in ordered_indices {
         if !seen[index] {
             seen[index] = true;
@@ -1462,10 +1703,48 @@ fn route_upstream_indices_for_fqdn(
     prioritized
 }
 
+fn route_upstream_indices_for_fqdn_compiled(
+    fqdn: &str,
+    routing_rules: &[RuntimeRoutingRule],
+    upstream_selection: &UpstreamSelectionState,
+    balancing_algorithm: &str,
+    rr_counter: &AtomicUsize,
+) -> Vec<usize> {
+    let ordered_indices = upstream_selection.ordered_indices(balancing_algorithm, rr_counter);
+    if ordered_indices.is_empty() {
+        return ordered_indices;
+    }
+
+    let Some(rule) = routing_rules
+        .iter()
+        .find(|rule| fqdn_matches_suffix(fqdn, &rule.suffix))
+    else {
+        return ordered_indices;
+    };
+
+    prioritize_upstream_indices(ordered_indices, &rule.prioritized_indices)
+}
+
+fn route_upstream_indices_for_fqdn(
+    fqdn: &str,
+    routing_rules: &[RoutingRuleConfig],
+    upstreams: &[UpstreamConfig],
+    balancing_algorithm: &str,
+    rr_counter: &AtomicUsize,
+) -> Vec<usize> {
+    let compiled_rules = compile_routing_rules(routing_rules, upstreams);
+    let upstream_selection = UpstreamSelectionState::new(upstreams);
+    route_upstream_indices_for_fqdn_compiled(
+        fqdn,
+        &compiled_rules,
+        &upstream_selection,
+        balancing_algorithm,
+        rr_counter,
+    )
+}
+
 #[inline]
 fn fqdn_matches_suffix(fqdn: &str, suffix: &str) -> bool {
-    let fqdn = fqdn.to_ascii_lowercase();
-    let suffix = suffix.to_ascii_lowercase();
     suffix == "." || fqdn.ends_with(&suffix)
 }
 
@@ -1491,7 +1770,8 @@ fn prefetch_tcp_packets<S: SessionStream>(
             }
             Ok(read_len) => pending_bytes.extend_from_slice(&buf[..read_len]),
             Err(err)
-                if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::TimedOut =>
+                if err.kind() == io::ErrorKind::WouldBlock
+                    || err.kind() == io::ErrorKind::TimedOut =>
             {
                 break;
             }
@@ -1607,7 +1887,10 @@ mod tests {
 
         assert_eq!(names[0], "udp-a");
         assert_eq!(names.len(), 3);
-        assert_eq!(names.iter().filter(|name| name.as_str() == "udp-a").count(), 1);
+        assert_eq!(
+            names.iter().filter(|name| name.as_str() == "udp-a").count(),
+            1
+        );
     }
 
     #[test]

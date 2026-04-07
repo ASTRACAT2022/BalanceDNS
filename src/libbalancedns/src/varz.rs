@@ -24,7 +24,9 @@ pub struct Varz {
     pub client_queries_cached: Counter,
     pub client_queries_expired: Counter,
     pub client_queries_offline: Counter,
+    pub client_queries_dropped: Counter,
     pub client_queries_errors: Counter,
+    pub client_connections_rejected: Counter,
     pub inflight_queries: Gauge,
     pub upstream_errors: Counter,
     pub upstream_sent: Counter,
@@ -132,9 +134,21 @@ impl Varz {
                 labels! {"handler" => "all",}
             ))
             .unwrap(),
+            client_queries_dropped: register_counter!(opts!(
+                "balancedns_client_queries_dropped",
+                "Number of client queries dropped due to overload or backpressure",
+                labels! {"handler" => "all",}
+            ))
+            .unwrap(),
             client_queries_errors: register_counter!(opts!(
                 "balancedns_client_queries_errors",
                 "Number of bogus client queries",
+                labels! {"handler" => "all",}
+            ))
+            .unwrap(),
+            client_connections_rejected: register_counter!(opts!(
+                "balancedns_client_connections_rejected",
+                "Number of TCP, DoT or DoH connections rejected due to overload or limits",
                 labels! {"handler" => "all",}
             ))
             .unwrap(),

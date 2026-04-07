@@ -50,6 +50,11 @@ refresh_seconds = 600
 [plugins]
 libraries = []
 
+[lua]
+scripts = [
+  # "/var/lib/balancedns/lua/query_logger.lua"
+]
+
 [[upstreams]]
 name = "upstream-1"
 proto = "udp"

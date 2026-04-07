@@ -1,14 +1,14 @@
 //! Import all the required crates, instanciate the main components and start
 //! the service.
-#![allow(dead_code, unused_imports, unused_variables)]
 
 #[macro_use]
 extern crate log;
 
-use clap::{Command, Arg};
+use clap::{Arg, Command};
 use libbalancedns::{BalanceDNS, Config};
+use std::process::ExitCode;
 
-fn main() {
+fn main() -> ExitCode {
     env_logger::init();
 
     let matches = Command::new("BalanceDNS")
@@ -29,7 +29,7 @@ fn main() {
     let config_file = match matches.get_one::<String>("config_file") {
         None => {
             error!("A path to the configuration file is required");
-            return;
+            return ExitCode::FAILURE;
         }
         Some(config_file) => config_file,
     };
@@ -39,9 +39,15 @@ fn main() {
                 "The configuration couldn't be loaded -- [{}]: [{}]",
                 config_file, err
             );
-            return;
+            return ExitCode::FAILURE;
         }
         Ok(config) => config,
     };
-    BalanceDNS::new(config);
+    match BalanceDNS::new(config) {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(err) => {
+            error!("Unable to start BalanceDNS: {}", err);
+            ExitCode::FAILURE
+        }
+    }
 }

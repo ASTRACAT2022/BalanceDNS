@@ -41,7 +41,7 @@ ExecStart=/usr/sbin/balancedns --config /etc/balancedns.toml
 LimitNOFILE=65536
 LimitNPROC=4096
 MemoryMax=2G
-TasksMax=256
+TasksMax=1024
 
 # Additional security
 ProtectKernelLogs=true

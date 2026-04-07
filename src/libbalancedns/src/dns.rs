@@ -3,7 +3,6 @@
 
 use rand::random;
 use std::fmt;
-use std::io::Write;
 use std::net::IpAddr;
 
 use super::{DNS_QUERY_MIN_SIZE, DNS_UDP_NOEDNS0_MAX_SIZE};
@@ -218,12 +217,14 @@ pub fn overwrite_qname(packet: &mut [u8], qname: &[u8]) {
     if packet_len <= DNS_OFFSET_QUESTION {
         return;
     }
-    let mut to = &mut packet[DNS_OFFSET_QUESTION..];
+    let to = &mut packet[DNS_OFFSET_QUESTION..];
     if to.len() <= qname_len {
         return;
     }
-    assert_eq!(to[qname_len], 0);
-    let _ = to.write(qname).unwrap();
+    if to[qname_len] != 0 {
+        return;
+    }
+    to[..qname_len].copy_from_slice(qname);
 }
 
 pub struct QuestionRR<'t> {
@@ -239,7 +240,9 @@ pub fn question(packet: &[u8]) -> Result<QuestionRR<'_>, &'static str> {
         return Err("Short packet");
     }
     let (offset, labels_count) = skip_name(packet, DNS_OFFSET_QUESTION)?;
-    assert!(offset > DNS_OFFSET_QUESTION);
+    if offset <= DNS_OFFSET_QUESTION {
+        return Err("Malformed question");
+    }
     let qname = &packet[DNS_OFFSET_QUESTION..offset - 1];
     if 4 > packet_len - offset {
         return Err("Short packet");
@@ -488,7 +491,9 @@ pub fn min_ttl(
         Ok(offset) => offset.0,
         Err(e) => return Err(e),
     };
-    assert!(offset > DNS_OFFSET_QUESTION);
+    if offset <= DNS_OFFSET_QUESTION {
+        return Err("Malformed question");
+    }
     if 4 > packet_len - offset {
         return Err("Short packet");
     }
@@ -552,7 +557,9 @@ pub fn set_ttl(packet: &mut [u8], ttl: u32) -> Result<(), &'static str> {
         Ok(offset) => offset.0,
         Err(e) => return Err(e),
     };
-    assert!(offset > DNS_OFFSET_QUESTION);
+    if offset <= DNS_OFFSET_QUESTION {
+        return Err("Malformed question");
+    }
     if 4 > packet_len - offset {
         return Err("Short packet");
     }
@@ -876,7 +883,10 @@ pub fn qname_to_fqdn(qname: &[u8]) -> Result<String, &'static str> {
         if !name.is_empty() {
             name.push('.');
         }
-        name.push_str(std::str::from_utf8(&qname[offset..offset + label_len]).map_err(|_| "Malformed qname")?);
+        name.push_str(
+            std::str::from_utf8(&qname[offset..offset + label_len])
+                .map_err(|_| "Malformed qname")?,
+        );
         offset += label_len;
     }
     name.push('.');

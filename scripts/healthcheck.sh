@@ -122,7 +122,7 @@ restart_service() {
 
 # Check service health metrics via HTTP API (if enabled)
 check_metrics_endpoint() {
-    local metrics_url="http://127.0.0.1:9153/metrics"
+    local metrics_url="http://127.0.0.1:9100/metrics"
     
     if command -v curl &> /dev/null; then
         local response
