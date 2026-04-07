@@ -117,10 +117,6 @@ url = "https://raw.githubusercontent.com/ASTRACAT2022/host-DNS/refs/heads/main/b
 refresh_seconds = 300
 ttl_seconds = 60
 
-[blocklist_remote]
-url = "https://raw.githubusercontent.com/Zalexanninev15/NoADS_RU/main/ads_list.txt"
-refresh_seconds = 300
-
 [plugins]
 libraries = []
 
