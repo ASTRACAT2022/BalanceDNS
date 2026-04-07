@@ -493,7 +493,7 @@ impl BalanceDnsRuntime {
             .name("balancedns_dot".to_string())
             .spawn({
                 let runtime = self.clone();
-                move || loop {
+                move || {
                     let async_runtime = match TokioRuntimeBuilder::new_multi_thread()
                         .enable_all()
                         .worker_threads(worker_count)
@@ -507,15 +507,19 @@ impl BalanceDnsRuntime {
                         }
                     };
                     let acceptor = TlsAcceptor::from(Arc::new(tls_config.clone()));
-                    let listener = match TokioTcpListener::from_std(listener) {
-                        Ok(listener) => listener,
-                        Err(err) => {
-                            error!("Unable to start DoT listener on {}: {}", listen_addr, err);
-                            return;
-                        }
-                    };
-                    info!("DoT listener is ready on {}", listen_addr);
+                    let listen_addr_for_runtime = listen_addr.clone();
                     async_runtime.block_on(async move {
+                        let listener = match TokioTcpListener::from_std(listener) {
+                            Ok(listener) => listener,
+                            Err(err) => {
+                                error!(
+                                    "Unable to start DoT listener on {}: {}",
+                                    listen_addr_for_runtime, err
+                                );
+                                return;
+                            }
+                        };
+                        info!("DoT listener is ready on {}", listen_addr_for_runtime);
                         loop {
                             match listener.accept().await {
                                 Ok((stream, addr)) => {
@@ -539,11 +543,13 @@ impl BalanceDnsRuntime {
                                         runtime.handle_dot_connection(acceptor, stream, addr).await;
                                     });
                                 }
-                                Err(err) => error!("DoT accept error on {}: {}", listen_addr, err),
+                                Err(err) => error!(
+                                    "DoT accept error on {}: {}",
+                                    listen_addr_for_runtime, err
+                                ),
                             }
                         }
                     });
-                    return;
                 }
             })
     }
@@ -561,7 +567,7 @@ impl BalanceDnsRuntime {
             .name("balancedns_doh".to_string())
             .spawn({
                 let runtime = self.clone();
-                move || loop {
+                move || {
                     let async_runtime = match TokioRuntimeBuilder::new_multi_thread()
                         .enable_all()
                         .worker_threads(worker_count)
@@ -575,15 +581,22 @@ impl BalanceDnsRuntime {
                         }
                     };
                     let acceptor = TlsAcceptor::from(Arc::new(tls_config.clone()));
-                    let listener = match TokioTcpListener::from_std(listener) {
-                        Ok(listener) => listener,
-                        Err(err) => {
-                            error!("Unable to start DoH listener on {}: {}", listen_addr, err);
-                            return;
-                        }
-                    };
-                    info!("DoH listener is ready on https://{}/dns-query", listen_addr);
+                    let listen_addr_for_runtime = listen_addr.clone();
                     async_runtime.block_on(async move {
+                        let listener = match TokioTcpListener::from_std(listener) {
+                            Ok(listener) => listener,
+                            Err(err) => {
+                                error!(
+                                    "Unable to start DoH listener on {}: {}",
+                                    listen_addr_for_runtime, err
+                                );
+                                return;
+                            }
+                        };
+                        info!(
+                            "DoH listener is ready on https://{}/dns-query",
+                            listen_addr_for_runtime
+                        );
                         loop {
                             match listener.accept().await {
                                 Ok((stream, addr)) => {
@@ -607,11 +620,13 @@ impl BalanceDnsRuntime {
                                         runtime.handle_doh_connection(acceptor, stream, addr).await;
                                     });
                                 }
-                                Err(err) => error!("DoH accept error on {}: {}", listen_addr, err),
+                                Err(err) => error!(
+                                    "DoH accept error on {}: {}",
+                                    listen_addr_for_runtime, err
+                                ),
                             }
                         }
                     });
-                    return;
                 }
             })
     }
