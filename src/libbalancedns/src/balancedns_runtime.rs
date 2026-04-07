@@ -1853,6 +1853,7 @@ fn parse_doh_get_request(target: &str) -> io::Result<Vec<u8>> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing dns parameter"))?;
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(dns_param.as_bytes())
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(dns_param.as_bytes()))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid DoH dns parameter"))
 }
 
