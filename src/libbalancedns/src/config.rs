@@ -143,7 +143,8 @@ impl Config {
     }
 
     pub fn from_lua_string(lua: &str) -> Result<Config, Error> {
-        let lua_config = load_lua_config_value(lua, "config.lua")?;
+        let mut lua_config = load_lua_config_value(lua, "config.lua")?;
+        normalize_lua_empty_arrays(&mut lua_config);
         Self::parse(lua_config)
     }
 
@@ -913,6 +914,33 @@ fn merge_toml_value(base: &mut Value, overlay: &Value) {
         (base_value, overlay_value) => {
             *base_value = overlay_value.clone();
         }
+    }
+}
+
+fn normalize_lua_empty_arrays(value: &mut Value) {
+    coerce_empty_table_to_array_at(value, &["plugins", "libraries"]);
+    coerce_empty_table_to_array_at(value, &["lua", "scripts"]);
+    coerce_empty_table_to_array_at(value, &["lua", "components"]);
+    coerce_empty_table_to_array_at(value, &["upstreams"]);
+    coerce_empty_table_to_array_at(value, &["routing_rules"]);
+}
+
+fn coerce_empty_table_to_array_at(value: &mut Value, path: &[&str]) {
+    if path.is_empty() {
+        return;
+    }
+    let mut current = value;
+    for segment in path {
+        let Some(table) = current.as_table_mut() else {
+            return;
+        };
+        let Some(next) = table.get_mut(*segment) else {
+            return;
+        };
+        current = next;
+    }
+    if matches!(current, Value::Table(table) if table.is_empty()) {
+        *current = Value::Array(Vec::new());
     }
 }
 

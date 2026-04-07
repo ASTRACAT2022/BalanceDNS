@@ -510,6 +510,54 @@ return {
     }
 
     #[test]
+    fn parse_balancedns_lua_config_accepts_empty_arrays() {
+        let cfg = r#"
+return {
+    server = {
+        udp_listen = "0.0.0.0:5353",
+    },
+    tls = {
+        cert_pem = "tls/server.crt",
+        key_pem = "tls/server.key",
+    },
+    plugins = {
+        libraries = {},
+    },
+    lua = {
+        scripts = {},
+        components = {},
+    },
+    upstreams = {
+        {
+            name = "cloudflare-udp",
+            proto = "udp",
+            addr = "1.1.1.1:53",
+            pool = "default",
+            weight = 1,
+        },
+    },
+}
+"#;
+
+        let config = match Config::from_lua_string(cfg) {
+            Ok(config) => config,
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    && err.to_string().contains("Lua shared library") =>
+            {
+                eprintln!("Skipping Lua empty-array test: {}", err);
+                return;
+            }
+            Err(err) => panic!("Lua config parse failed: {}", err),
+        };
+
+        assert!(config.plugin_libraries.is_empty());
+        assert!(config.lua_scripts.is_empty());
+        assert!(config.lua_components.is_empty());
+        assert_eq!(config.upstreams.len(), 1);
+    }
+
+    #[test]
     fn balancedns_requires_tls_files_for_dot_or_doh() {
         let cfg = r#"
 [server]

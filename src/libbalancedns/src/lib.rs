@@ -21,6 +21,7 @@ mod lua_config;
 mod lua_plugin;
 mod odoh;
 mod plugins;
+mod remote_refresh;
 mod varz;
 
 use balancedns_runtime::BalanceDnsRuntime;
@@ -29,6 +30,7 @@ pub use config::{
     UpstreamConfig, UpstreamProtocol,
 };
 use privdrop::PrivDrop;
+pub use remote_refresh::{run_remote_refresh_helper, RemoteRefreshKind};
 use std::io;
 use std::sync::Arc;
 use varz::*;

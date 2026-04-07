@@ -3,6 +3,7 @@ use std::ffi::{c_char, c_int, c_void, CString};
 use std::io;
 use std::ptr;
 use std::slice;
+use std::sync::OnceLock;
 use toml::value::Table as TomlTable;
 use toml::Value as TomlValue;
 
@@ -13,11 +14,14 @@ const LUA_TBOOLEAN: c_int = 1;
 const LUA_TNUMBER: c_int = 3;
 const LUA_TSTRING: c_int = 4;
 const LUA_TTABLE: c_int = 5;
+const LUA_MASKCOUNT: c_int = 1 << 3;
+const CONFIG_LUA_INSTRUCTION_LIMIT: c_int = 1_000_000;
 
 type LuaInteger = i64;
 type LuaNumber = f64;
 
 enum LuaState {}
+enum LuaDebug {}
 
 type LuaNewStateFn = unsafe extern "C" fn() -> *mut LuaState;
 type LuaCloseFn = unsafe extern "C" fn(*mut LuaState);
@@ -32,7 +36,9 @@ type LuaLoadBufferXFn = unsafe extern "C" fn(
 type LuaPCallKFn =
     unsafe extern "C" fn(*mut LuaState, c_int, c_int, c_int, isize, *const c_void) -> c_int;
 type LuaGetGlobalFn = unsafe extern "C" fn(*mut LuaState, *const c_char) -> c_int;
+type LuaSetGlobalFn = unsafe extern "C" fn(*mut LuaState, *const c_char);
 type LuaTypeFn = unsafe extern "C" fn(*mut LuaState, c_int) -> c_int;
+type LuaPushLStringFn = unsafe extern "C" fn(*mut LuaState, *const c_char, usize) -> *const c_char;
 type LuaToLStringFn = unsafe extern "C" fn(*mut LuaState, c_int, *mut usize) -> *const c_char;
 type LuaToBooleanFn = unsafe extern "C" fn(*mut LuaState, c_int) -> c_int;
 type LuaToIntegerXFn = unsafe extern "C" fn(*mut LuaState, c_int, *mut c_int) -> LuaInteger;
@@ -42,6 +48,10 @@ type LuaGetTopFn = unsafe extern "C" fn(*mut LuaState) -> c_int;
 type LuaSetTopFn = unsafe extern "C" fn(*mut LuaState, c_int);
 type LuaPushNilFn = unsafe extern "C" fn(*mut LuaState);
 type LuaNextFn = unsafe extern "C" fn(*mut LuaState, c_int) -> c_int;
+type LuaErrorFn = unsafe extern "C" fn(*mut LuaState) -> c_int;
+type LuaSetHookFn = unsafe extern "C" fn(*mut LuaState, Option<LuaHookFn>, c_int, c_int);
+
+type LuaHookFn = unsafe extern "C" fn(*mut LuaState, *mut LuaDebug);
 
 struct LuaConfigApi {
     _library: Library,
@@ -51,7 +61,9 @@ struct LuaConfigApi {
     load_buffer: LuaLoadBufferXFn,
     pcall: LuaPCallKFn,
     get_global: LuaGetGlobalFn,
+    set_global: LuaSetGlobalFn,
     type_of: LuaTypeFn,
+    push_lstring: LuaPushLStringFn,
     to_lstring: LuaToLStringFn,
     to_boolean: LuaToBooleanFn,
     to_integer: LuaToIntegerXFn,
@@ -61,6 +73,8 @@ struct LuaConfigApi {
     set_top: LuaSetTopFn,
     push_nil: LuaPushNilFn,
     next: LuaNextFn,
+    error: LuaErrorFn,
+    set_hook: LuaSetHookFn,
 }
 
 struct LuaStateHandle {
@@ -76,6 +90,13 @@ impl Drop for LuaStateHandle {
     }
 }
 
+struct LuaHookApi {
+    push_lstring: LuaPushLStringFn,
+    error: LuaErrorFn,
+}
+
+static LUA_CONFIG_HOOK_API: OnceLock<LuaHookApi> = OnceLock::new();
+
 pub(crate) fn load_lua_config_value(source: &str, chunk_name: &str) -> io::Result<TomlValue> {
     let api = LuaConfigApi::load()?;
     let state = unsafe { (api.new_state)() };
@@ -86,6 +107,8 @@ pub(crate) fn load_lua_config_value(source: &str, chunk_name: &str) -> io::Resul
 
     unsafe {
         (handle.api.open_libs)(handle.state);
+        sandbox_globals(&handle.api, handle.state)?;
+
         let chunk_name = c_string(chunk_name)?;
         let status = (handle.api.load_buffer)(
             handle.state,
@@ -99,7 +122,14 @@ pub(crate) fn load_lua_config_value(source: &str, chunk_name: &str) -> io::Resul
             return Err(io::Error::new(io::ErrorKind::InvalidData, err));
         }
 
+        (handle.api.set_hook)(
+            handle.state,
+            Some(lua_config_instruction_limit_hook),
+            LUA_MASKCOUNT,
+            CONFIG_LUA_INSTRUCTION_LIMIT,
+        );
         let status = (handle.api.pcall)(handle.state, 0, LUA_MULTRET, 0, 0, ptr::null());
+        (handle.api.set_hook)(handle.state, None, 0, 0);
         if status != LUA_OK {
             let err = lua_error_string(&handle.api, handle.state);
             return Err(io::Error::new(io::ErrorKind::InvalidData, err));
@@ -130,9 +160,11 @@ pub(crate) fn load_lua_config_value(source: &str, chunk_name: &str) -> io::Resul
 impl LuaConfigApi {
     fn load() -> io::Result<Self> {
         let candidates = [
+            "liblua5.4.so.0",
             "liblua5.4.so",
             "liblua5.4.dylib",
             "liblua.5.4.dylib",
+            "liblua5.3.so.0",
             "liblua5.3.so",
             "liblua5.3.dylib",
             "liblua.so",
@@ -157,7 +189,9 @@ impl LuaConfigApi {
                     load_buffer: load_symbol(&library, b"luaL_loadbufferx")?,
                     pcall: load_symbol(&library, b"lua_pcallk")?,
                     get_global: load_symbol(&library, b"lua_getglobal")?,
+                    set_global: load_symbol(&library, b"lua_setglobal")?,
                     type_of: load_symbol(&library, b"lua_type")?,
+                    push_lstring: load_symbol(&library, b"lua_pushlstring")?,
                     to_lstring: load_symbol(&library, b"lua_tolstring")?,
                     to_boolean: load_symbol(&library, b"lua_toboolean")?,
                     to_integer: load_symbol(&library, b"lua_tointegerx")?,
@@ -167,9 +201,15 @@ impl LuaConfigApi {
                     set_top: load_symbol(&library, b"lua_settop")?,
                     push_nil: load_symbol(&library, b"lua_pushnil")?,
                     next: load_symbol(&library, b"lua_next")?,
+                    error: load_symbol(&library, b"lua_error")?,
+                    set_hook: load_symbol(&library, b"lua_sethook")?,
                     _library: library,
                 }
             };
+            let _ = LUA_CONFIG_HOOK_API.set(LuaHookApi {
+                push_lstring: api.push_lstring,
+                error: api.error,
+            });
             info!("Loaded Lua runtime [{}] for config.lua support", candidate);
             return Ok(api);
         }
@@ -182,6 +222,25 @@ impl LuaConfigApi {
             ),
         ))
     }
+}
+
+unsafe fn sandbox_globals(api: &LuaConfigApi, state: *mut LuaState) -> io::Result<()> {
+    for global_name in [
+        "os",
+        "io",
+        "package",
+        "debug",
+        "dofile",
+        "loadfile",
+        "load",
+        "require",
+        "collectgarbage",
+    ] {
+        let global_name = c_string(global_name)?;
+        (api.push_nil)(state);
+        (api.set_global)(state, global_name.as_ptr());
+    }
+    Ok(())
 }
 
 unsafe fn lua_to_toml(
@@ -222,7 +281,7 @@ unsafe fn lua_to_toml(
         LUA_TTABLE => lua_table_to_toml(api, state, index),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "config.lua supports only nil, booleans, numbers, strings, arrays, and tables",
+            "config.lua supports only booleans, numbers, strings, arrays, and tables",
         )),
     }
 }
@@ -300,6 +359,17 @@ unsafe fn lua_table_to_toml(
 
 unsafe fn lua_error_string(api: &LuaConfigApi, state: *mut LuaState) -> String {
     lua_string(api, state, -1).unwrap_or_else(|_| "Unknown Lua error".to_owned())
+}
+
+unsafe extern "C" fn lua_config_instruction_limit_hook(
+    state: *mut LuaState,
+    _debug: *mut LuaDebug,
+) {
+    if let Some(api) = LUA_CONFIG_HOOK_API.get() {
+        let message = b"BalanceDNS config.lua sandbox: instruction limit exceeded";
+        (api.push_lstring)(state, message.as_ptr() as *const c_char, message.len());
+        (api.error)(state);
+    }
 }
 
 unsafe fn lua_string(api: &LuaConfigApi, state: *mut LuaState, index: c_int) -> io::Result<String> {

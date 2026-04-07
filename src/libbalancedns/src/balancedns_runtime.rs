@@ -3,6 +3,7 @@ use crate::config::{Config, RoutingRuleConfig, UpstreamConfig, UpstreamProtocol}
 use crate::dns;
 use crate::odoh::OdohServer;
 use crate::plugins::{PacketAction, PluginManager};
+use crate::remote_refresh::RemoteRefreshKind;
 use crate::varz::Varz;
 use base64;
 use base64::Engine;
@@ -21,10 +22,13 @@ use rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -56,6 +60,8 @@ const UDP_WORK_QUEUE_PER_WORKER: usize = 1024;
 const STREAM_WORK_QUEUE_MULTIPLIER: usize = 256;
 const STREAM_WORK_QUEUE_MIN: usize = 256;
 const STREAM_WORK_QUEUE_MAX: usize = 8192;
+const REMOTE_HOSTS_SNAPSHOT_FILE: &str = "remote_hosts.snapshot";
+const REMOTE_BLOCKLIST_SNAPSHOT_FILE: &str = "remote_blocklist.snapshot";
 
 trait SessionStream: Read + Write {
     fn set_read_timeout(&self, timeout: Option<StdDuration>) -> io::Result<()>;
@@ -318,7 +324,7 @@ impl BalanceDnsRuntime {
             match thread::Builder::new()
                 .name("remote_hosts_refresh".to_string())
                 .spawn(move || {
-                    runtime.refresh_remote_hosts_loop();
+                    runtime.refresh_remote_snapshot_loop(RemoteRefreshKind::Hosts);
                 }) {
                 Ok(_) => {}
                 Err(e) => error!("Failed to spawn remote hosts refresh thread: {}", e),
@@ -329,7 +335,7 @@ impl BalanceDnsRuntime {
             match thread::Builder::new()
                 .name("remote_blocklist_refresh".to_string())
                 .spawn(move || {
-                    runtime.refresh_remote_blocklist_loop();
+                    runtime.refresh_remote_snapshot_loop(RemoteRefreshKind::Blocklist);
                 }) {
                 Ok(_) => {}
                 Err(e) => error!("Failed to spawn blocklist refresh thread: {}", e),
@@ -338,8 +344,10 @@ impl BalanceDnsRuntime {
     }
 
     fn prime_remote_data_in_memory(&self) {
-        self.refresh_remote_hosts_once();
-        self.refresh_remote_blocklist_once();
+        self.load_remote_hosts_snapshot();
+        self.load_remote_blocklist_snapshot();
+        self.refresh_remote_snapshot_once(RemoteRefreshKind::Hosts);
+        self.refresh_remote_snapshot_once(RemoteRefreshKind::Blocklist);
     }
 
     fn spawn_udp_listener(
@@ -1468,60 +1476,138 @@ impl BalanceDnsRuntime {
         self.remote_blocklist.read().contains(fqdn)
     }
 
-    fn refresh_remote_hosts_loop(&self) {
-        let config = match self.config.hosts_remote.clone() {
-            Some(config) => config,
-            None => return,
+    fn refresh_remote_snapshot_loop(&self, kind: RemoteRefreshKind) {
+        let refresh_seconds = match kind {
+            RemoteRefreshKind::Hosts => match self.config.hosts_remote.as_ref() {
+                Some(config) => config.refresh_seconds,
+                None => return,
+            },
+            RemoteRefreshKind::Blocklist => match self.config.blocklist_remote.as_ref() {
+                Some(config) => config.refresh_seconds,
+                None => return,
+            },
         };
         loop {
-            self.refresh_remote_hosts_once();
-            thread::sleep(StdDuration::from_secs(config.refresh_seconds));
+            self.refresh_remote_snapshot_once(kind);
+            thread::sleep(StdDuration::from_secs(refresh_seconds));
         }
     }
 
-    fn refresh_remote_blocklist_loop(&self) {
-        let config = match self.config.blocklist_remote.clone() {
-            Some(config) => config,
-            None => return,
-        };
-        loop {
-            self.refresh_remote_blocklist_once();
-            thread::sleep(StdDuration::from_secs(config.refresh_seconds));
+    fn refresh_remote_snapshot_once(&self, kind: RemoteRefreshKind) {
+        match self.refresh_remote_snapshot_via_helper(kind) {
+            Ok(()) => match kind {
+                RemoteRefreshKind::Hosts => self.load_remote_hosts_snapshot(),
+                RemoteRefreshKind::Blocklist => self.load_remote_blocklist_snapshot(),
+            },
+            Err(err) => match kind {
+                RemoteRefreshKind::Hosts => error!("Unable to refresh remote hosts: {}", err),
+                RemoteRefreshKind::Blocklist => error!("Unable to refresh blocklist: {}", err),
+            },
         }
     }
 
-    fn refresh_remote_hosts_once(&self) {
-        let Some(config) = self.config.hosts_remote.as_ref() else {
-            return;
+    fn refresh_remote_snapshot_via_helper(&self, kind: RemoteRefreshKind) -> io::Result<()> {
+        let (url, output_path) = match kind {
+            RemoteRefreshKind::Hosts => {
+                let config = self
+                    .config
+                    .hosts_remote
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("hosts_remote is not configured"))?;
+                (config.url.clone(), self.remote_hosts_snapshot_path())
+            }
+            RemoteRefreshKind::Blocklist => {
+                let config = self
+                    .config
+                    .blocklist_remote
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("blocklist_remote is not configured"))?;
+                (config.url.clone(), self.remote_blocklist_snapshot_path())
+            }
         };
-        match fetch_text(&self.http_client, &config.url) {
+
+        let exe = env::current_exe()
+            .map_err(|err| io::Error::other(format!("Unable to resolve helper binary: {}", err)))?;
+        let output = Command::new(exe)
+            .arg("refresh-remote-state")
+            .arg("--kind")
+            .arg(kind.as_arg())
+            .arg("--url")
+            .arg(&url)
+            .arg("--output")
+            .arg(output_path.to_string_lossy().as_ref())
+            .arg("--timeout-ms")
+            .arg(self.config.request_timeout_ms.to_string())
+            .output()
+            .map_err(|err| io::Error::other(format!("Unable to spawn remote helper: {}", err)))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            return Err(io::Error::other(if stderr.is_empty() {
+                format!("Remote helper exited with status {}", output.status)
+            } else {
+                format!(
+                    "Remote helper exited with status {}: {}",
+                    output.status, stderr
+                )
+            }));
+        }
+        Ok(())
+    }
+
+    fn load_remote_hosts_snapshot(&self) {
+        let snapshot_path = self.remote_hosts_snapshot_path();
+        match std::fs::read_to_string(&snapshot_path) {
             Ok(body) => {
                 let hosts = parse_hosts_mapping(&body);
                 *self.remote_hosts.write() = hosts;
                 info!(
-                    "Loaded {} remote host overrides",
-                    self.remote_hosts.read().len()
+                    "Loaded {} remote host overrides from snapshot [{}]",
+                    self.remote_hosts.read().len(),
+                    snapshot_path.display()
                 );
             }
-            Err(err) => error!("Unable to refresh remote hosts [{}]: {}", config.url, err),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => error!(
+                "Unable to load remote hosts snapshot [{}]: {}",
+                snapshot_path.display(),
+                err
+            ),
         }
     }
 
-    fn refresh_remote_blocklist_once(&self) {
-        let Some(config) = self.config.blocklist_remote.as_ref() else {
-            return;
-        };
-        match fetch_text(&self.http_client, &config.url) {
+    fn load_remote_blocklist_snapshot(&self) {
+        let snapshot_path = self.remote_blocklist_snapshot_path();
+        match std::fs::read_to_string(&snapshot_path) {
             Ok(body) => {
                 let entries = parse_blocklist(&body);
                 *self.remote_blocklist.write() = entries;
                 info!(
-                    "Loaded {} remote blocked domains",
-                    self.remote_blocklist.read().len()
+                    "Loaded {} remote blocked domains from snapshot [{}]",
+                    self.remote_blocklist.read().len(),
+                    snapshot_path.display()
                 );
             }
-            Err(err) => error!("Unable to refresh blocklist [{}]: {}", config.url, err),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => error!(
+                "Unable to load remote blocklist snapshot [{}]: {}",
+                snapshot_path.display(),
+                err
+            ),
         }
+    }
+
+    fn remote_hosts_snapshot_path(&self) -> PathBuf {
+        self.state_snapshot_path(REMOTE_HOSTS_SNAPSHOT_FILE)
+    }
+
+    fn remote_blocklist_snapshot_path(&self) -> PathBuf {
+        self.state_snapshot_path(REMOTE_BLOCKLIST_SNAPSHOT_FILE)
+    }
+
+    fn state_snapshot_path(&self, file_name: &str) -> PathBuf {
+        env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("/var/lib/balancedns"))
+            .join(file_name)
     }
 
     fn update_cache_metrics(&self) {
@@ -1638,16 +1724,6 @@ fn normalize_domain(value: &str) -> String {
         normalized.push('.');
     }
     normalized
-}
-
-fn fetch_text(client: &Client, url: &str) -> io::Result<String> {
-    client
-        .get(url)
-        .send()
-        .and_then(|response| response.error_for_status())
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?
-        .text()
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
 }
 
 fn configure_udp_listener_socket(socket: &UdpSocket) -> io::Result<()> {
