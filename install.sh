@@ -1,11 +1,11 @@
 #!/bin/bash
 ###############################################################################
-# BalanceDNS - Automatic Installer
+# BalanceDNS - Automatic Installer (Lua Version)
 # 
 # This script does EVERYTHING automatically:
 # 1. Compiles BalanceDNS from source
 # 2. Creates system user and directories
-# 3. Generates configuration
+# 3. Generates Lua configuration
 # 4. Installs systemd service + watchdog
 # 5. Installs health check monitoring
 # 6. Starts and verifies the service
@@ -222,9 +222,9 @@ fi
 ###############################################################################
 # Step 5: Generate configuration
 ###############################################################################
-print_step "Generating configuration file"
+print_step "Generating Lua configuration file"
 
-CONFIG_FILE="$CONFIG_DIR/balancedns.toml"
+CONFIG_FILE="$CONFIG_DIR/balancedns.lua"
 BACKUP_FILE="$CONFIG_FILE.bak.$(date +%Y%m%d%H%M%S)"
 
 # Backup existing config
@@ -233,107 +233,121 @@ if [[ -f "$CONFIG_FILE" ]]; then
     warn "Backed up existing config to $BACKUP_FILE"
 fi
 
-# Generate new config
+# Generate new Lua config
 cat > "$CONFIG_FILE" << EOF
-###############################################################################
-# BalanceDNS Configuration
-# Generated: $(date '+%Y-%m-%d %H:%M:%S')
-# Server IP: $SERVER_IP
-###############################################################################
+-- BalanceDNS Configuration (Lua)
+-- Generated: $(date '+%Y-%m-%d %H:%M:%S')
 
-[server]
-# DNS listeners
-udp_listen = "${SERVER_IP}:53"
-tcp_listen = "${SERVER_IP}:53"
-dot_listen = "${SERVER_IP}:853"
-doh_listen = "${SERVER_IP}:443"
+return {
+    server = {
+        udp_listen = "${SERVER_IP}:53",
+        tcp_listen = "${SERVER_IP}:53",
+        dot_listen = "${SERVER_IP}:853",
+        doh_listen = "${SERVER_IP}:443",
+    },
 
-[tls]
-# TLS certificates for DoT/DoH
-cert_pem = "${DATA_DIR}/tls/server.crt"
-key_pem = "${DATA_DIR}/tls/server.key"
+    tls = {
+        cert_pem = "${DATA_DIR}/tls/server.crt",
+        key_pem = "${DATA_DIR}/tls/server.key",
+    },
 
-[balancing]
-# Load balancing algorithm: fastest, round_robin, random
-algorithm = "fastest"
+    balancing = {
+        algorithm = "fastest",
+    },
 
-[security]
-# Security settings
-deny_any = true
-deny_dnskey = true
-request_timeout_ms = 500
+    security = {
+        deny_any = true,
+        deny_dnskey = true,
+        request_timeout_ms = 500,
+    },
 
-[cache]
-# DNS cache settings
-enabled = true
-max_size = 100000
-ttl_seconds = 7200
-min_ttl = 60
-max_ttl = 86400
-decrement_ttl = true
+    cache = {
+        enabled = true,
+        max_size = 100000,
+        ttl_seconds = 7200,
+        min_ttl = 60,
+        max_ttl = 86400,
+        decrement_ttl = true,
+    },
 
-[metrics]
-# Prometheus metrics endpoint
-listen = "127.0.0.1:9100"
+    metrics = {
+        listen = "127.0.0.1:9100",
+    },
 
-[global]
-# Performance settings
-threads_udp = 8
-threads_tcp = 4
-max_tcp_clients = 4096
-max_waiting_clients = 1000000
-max_active_queries = 200000
-max_clients_waiting_for_query = 2000
+    global = {
+        threads_udp = 8,
+        threads_tcp = 4,
+        max_tcp_clients = 4096,
+        max_waiting_clients = 1000000,
+        max_active_queries = 200000,
+        max_clients_waiting_for_query = 2000,
+    },
 
-[hosts_local]
-# Local host overrides (uncomment to use)
-# "example.com." = "1.2.3.4"
+    hosts_local = {
+        -- ["example.com."] = "1.2.3.4",
+    },
 
-[hosts_remote]
-# Remote hosts list (updated periodically)
-url = "https://raw.githubusercontent.com/ASTRACAT2022/host-DNS/refs/heads/main/bypass"
-refresh_seconds = 300
-ttl_seconds = 300
+    hosts_remote = {
+        url = "https://raw.githubusercontent.com/ASTRACAT2022/host-DNS/refs/heads/main/bypass",
+        refresh_seconds = 3600,
+        ttl_seconds = 3600,
+    },
 
-[blocklist_remote]
-# Remote blocklist (ad blocking)
-url = "https://raw.githubusercontent.com/Zalexanninev15/NoADS_RU/main/ads_list.txt"
-refresh_seconds = 600
+    blocklist_remote = {
+        url = "https://raw.githubusercontent.com/Zalexanninev15/NoADS_RU/main/ads_list.txt",
+        refresh_seconds = 600,
+    },
 
-[plugins]
-# Plugin libraries (leave empty if not using plugins)
-libraries = []
+    plugins = {
+        libraries = {},
+    },
 
-# Upstream DNS servers
-[[upstreams]]
-name = "upstream-1"
-proto = "udp"
-addr = "${UPSTREAM_1}"
-pool = "default"
-weight = 5
+    lua = {
+        scripts = {},
+        sandbox = {
+            max_packet_bytes = 4096,
+            disable_after_failures = 8,
+            init_instruction_limit = 500000,
+            hook_instruction_limit = 100000,
+        },
+        components = {},
+    },
 
-[[upstreams]]
-name = "upstream-2"
-proto = "udp"
-addr = "${UPSTREAM_2}"
-pool = "default"
-weight = 5
+    upstreams = {
+        {
+            name = "upstream-1",
+            proto = "udp",
+            addr = "${UPSTREAM_1}",
+            pool = "default",
+            weight = 5,
+        },
+        {
+            name = "upstream-2",
+            proto = "udp",
+            addr = "${UPSTREAM_2}",
+            pool = "default",
+            weight = 5,
+        },
+        {
+            name = "upstream-yandex",
+            proto = "udp",
+            addr = "${UPSTREAM_RU}",
+            pool = "ru-zone",
+            weight = 1,
+        },
+    },
 
-[[upstreams]]
-name = "upstream-yandex"
-proto = "udp"
-addr = "${UPSTREAM_RU}"
-pool = "ru-zone"
-weight = 1
-
-# Routing rules
-[[routing_rules]]
-suffix = "."
-upstreams = ["upstream-1", "upstream-2"]
-
-[[routing_rules]]
-suffix = ".ru."
-upstreams = ["upstream-yandex"]
+    routing_rules = {
+        {
+            suffix = ".",
+            upstreams = { "upstream-1", "upstream-2" },
+        },
+        {
+            suffix = ".ru.",
+            upstreams = { "upstream-yandex" },
+        },
+    },
+}
 EOF
 
 success "Generated config at $CONFIG_FILE"
@@ -387,22 +401,9 @@ else
     exit 1
 fi
 
-# Install status script
-if [[ -f "$SCRIPT_DIR/scripts/status.sh" ]]; then
-    sed "s/DNS_SERVER=\"[0-9.]*\"/DNS_SERVER=\"$SERVER_IP\"/" \
-        "$SCRIPT_DIR/scripts/status.sh" > /tmp/status.sh
-    sed -i "s|METRICS_URL=\"http://[0-9.:]*|METRICS_URL=\"http://127.0.0.1:9100|" /tmp/status.sh
-    cp /tmp/status.sh "$SCRIPT_DIR/scripts/status.sh"
-    chmod +x "$SCRIPT_DIR/scripts/status.sh"
-    success "Installed status script"
-fi
-
-# Install monitor script
-if [[ -f "$SCRIPT_DIR/scripts/monitor.sh" ]]; then
-    sed -i "s/DNS_SERVER=\"[0-9.]*\"/DNS_SERVER=\"$SERVER_IP\"/" "$SCRIPT_DIR/scripts/monitor.sh"
-    sed -i "s|METRICS_URL=\"http://[0-9.:]*|METRICS_URL=\"http://127.0.0.1:9100|" "$SCRIPT_DIR/scripts/monitor.sh"
-    success "Installed monitor script"
-fi
+# Update other scripts
+sed -i "s/DNS_SERVER=\"[0-9.]*\"/DNS_SERVER=\"$SERVER_IP\"/" "$SCRIPT_DIR/scripts/status.sh" 2>/dev/null || true
+sed -i "s/DNS_SERVER=\"[0-9.]*\"/DNS_SERVER=\"$SERVER_IP\"/" "$SCRIPT_DIR/scripts/monitor.sh" 2>/dev/null || true
 
 # Create log file
 touch "$LOG_DIR/balancedns-healthcheck.log"
@@ -458,15 +459,8 @@ else
     if ! "$INSTALL_DIR/balancedns" --config "$CONFIG_FILE" --test 2>/dev/null; then
         error "Configuration file has errors"
         echo -e "  Edit the config: nano $CONFIG_FILE"
-        echo -e "  Test it: $INSTALL_DIR/balancedns --config $CONFIG_FILE --test"
+        echo -e "  Test it: $INSTALL_DIR/balancedns --config $CONFIG_FILE"
     fi
-fi
-
-# Check health check
-if systemctl is-active --quiet balancedns-healthcheck.timer; then
-    success "Health check timer is active"
-else
-    warn "Health check timer not active"
 fi
 
 ###############################################################################
@@ -479,10 +473,9 @@ echo -e "${GREEN}╚════════════════════
 echo ""
 echo -e "${BOLD}What was installed:${NC}"
 echo -e "  ${GREEN}✓${NC} BalanceDNS compiled and installed"
-echo -e "  ${GREEN}✓${NC} Configuration generated at $CONFIG_FILE"
+echo -e "  ${GREEN}✓${NC} Configuration generated at $CONFIG_FILE (Lua)"
 echo -e "  ${GREEN}✓${NC} Systemd service with watchdog"
 echo -e "  ${GREEN}✓${NC} Health check monitoring (every 30s)"
-echo -e "  ${GREEN}✓${NC} Auto-restart on failure"
 echo ""
 echo -e "${BOLD}Service Information:${NC}"
 echo -e "  ${CYAN}DNS Server:${NC}    $SERVER_IP:53 (UDP/TCP)"
@@ -492,18 +485,11 @@ echo -e "  ${CYAN}Metrics:${NC}       http://127.0.0.1:9100/metrics"
 echo ""
 echo -e "${BOLD}Useful Commands:${NC}"
 echo -e "  ${YELLOW}Status:${NC}         systemctl status balancedns"
-echo -e "  ${YELLOW}Quick status:${NC}   $SCRIPT_DIR/scripts/status.sh"
-echo -e "  ${YELLOW}Monitor:${NC}        $SCRIPT_DIR/scripts/monitor.sh"
 echo -e "  ${YELLOW}Logs:${NC}           journalctl -u balancedns -f"
-echo -e "  ${YELLOW}Health logs:${NC}    tail -f $LOG_DIR/balancedns-healthcheck.log"
 echo -e "  ${YELLOW}Restart:${NC}        systemctl restart balancedns"
 echo -e "  ${YELLOW}Edit config:${NC}    nano $CONFIG_FILE"
 echo ""
-echo -e "${BOLD}Testing Your DNS Server:${NC}"
-echo -e "  dig @$SERVER_IP google.com A"
-echo -e "  dig @$SERVER_IP ya.ru A"
-echo ""
 echo -e "${BLUE}══════════════════════════════════════════════════════════${NC}"
-echo -e "${BOLD}Your DNS server is now running with automatic monitoring!${NC}"
+echo -e "${BOLD}Your DNS server is now running with Lua configuration!${NC}"
 echo -e "${BLUE}══════════════════════════════════════════════════════════${NC}"
 echo ""

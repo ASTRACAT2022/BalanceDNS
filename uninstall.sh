@@ -73,6 +73,8 @@ echo -e "${GREEN}✓${NC} Monitoring scripts removed"
 if [[ "$KEEP_CONFIG" == false ]]; then
     echo ""
     echo -e "${YELLOW}Removing configuration...${NC}"
+    rm -f /etc/balancedns.lua
+    rm -f /etc/balancedns.lua.bak.*
     rm -f /etc/balancedns.toml
     rm -f /etc/balancedns.toml.bak.*
     echo -e "${GREEN}✓${NC} Configuration removed"

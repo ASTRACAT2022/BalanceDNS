@@ -1,5 +1,5 @@
 [Unit]
-Description=BalanceDNS DNS proxy
+Description=BalanceDNS DNS proxy (Lua Config)
 After=network.target
 Before=nss-lookup.target
 Wants=balancedns-healthcheck.timer
@@ -35,10 +35,10 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ProtectHostname=true
 UMask=0077
 ReadWritePaths=/var/lib/balancedns
-ReadOnlyPaths=/etc/balancedns.toml /etc/balancedns.lua
+ReadOnlyPaths=/etc/balancedns.lua
 StateDirectory=balancedns
 WorkingDirectory=/var/lib/balancedns
-ExecStart=/usr/sbin/balancedns --config /etc/balancedns.toml
+ExecStart=/usr/sbin/balancedns --config /etc/balancedns.lua
 
 # Resource limits
 LimitNOFILE=65536
