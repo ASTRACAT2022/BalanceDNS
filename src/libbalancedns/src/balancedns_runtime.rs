@@ -218,12 +218,12 @@ impl<'a> Drop for InflightQueryGuard<'a> {
     }
 }
 
-struct StaleRefreshGuard<'a> {
-    runtime: &'a BalanceDnsRuntime,
+struct StaleRefreshGuard {
+    runtime: Arc<BalanceDnsRuntime>,
     cache_key: dns::NormalizedQuestionKey,
 }
 
-impl<'a> Drop for StaleRefreshGuard<'a> {
+impl Drop for StaleRefreshGuard {
     fn drop(&mut self) {
         self.runtime
             .stale_refresh_inflight
@@ -278,8 +278,11 @@ impl BalanceDnsRuntime {
             upstream_udp_sockets.push(Mutex::new(bind_upstream_udp_socket()?));
         }
 
+        let cache = Cache::new(config.clone())?;
+        crate::lua_plugin::set_global_cache(cache.clone());
+
         Ok(Arc::new(BalanceDnsRuntime {
-            cache: Cache::new(config.clone())?,
+            cache,
             config: config.clone(),
             local_hosts,
             remote_hosts: RwLock::new(HashMap::new()),
@@ -981,22 +984,24 @@ impl BalanceDnsRuntime {
                                 return;
                             }
                         };
+                        let service = service_fn({
+                            let runtime = runtime.clone();
+                            move |request| {
+                                let runtime = runtime.clone();
+                                async move { runtime.handle_metrics_request(request).await }
+                            }
+                        });
                         loop {
                             match listener.accept().await {
                                 Ok((stream, _)) => {
-                                    let runtime = runtime.clone();
+                                    let service = service.clone();
                                     tokio::spawn(async move {
-                                        let mut stream = stream;
-                                        if let Err(err) = runtime.handle_metrics_session_async(&mut stream).await {
-                                            if err.kind() != io::ErrorKind::UnexpectedEof {
-                                                debug!("Metrics session failed: {}", err);
-                                                let _ = write_http_response_async(
-                                                    &mut stream,
-                                                    "400 Bad Request",
-                                                    "text/plain; charset=utf-8",
-                                                    err.to_string().as_bytes(),
-                                                ).await;
-                                            }
+                                        if let Err(err) = Http::new()
+                                            .with_executor(TokioHyperExecutor)
+                                            .serve_connection(stream, service)
+                                            .await
+                                        {
+                                            debug!("Metrics session closed: {}", err);
                                         }
                                     });
                                 }
@@ -1222,91 +1227,70 @@ impl BalanceDnsRuntime {
         }
 
         let runtime = self.clone();
-        let cache_key_clone = cache_key.clone();
-        match thread::Builder::new()
-            .name("stale_refresh".to_string())
-            .spawn(move || {
-                let _guard = StaleRefreshGuard {
-                    runtime: &runtime,
-                    cache_key: cache_key.clone(),
-                };
-                let refresh_result = runtime
+        self.async_runtime.spawn(async move {
+            let _guard = StaleRefreshGuard {
+                runtime: runtime.clone(),
+                cache_key: cache_key.clone(),
+            };
+            let runtime_for_blocking = runtime.clone();
+            let refresh_result = tokio::task::spawn_blocking(move || {
+                runtime_for_blocking
                     .resolve_via_upstreams(&normalized_question, &fqdn)
                     .and_then(|response| {
-                        let processed = runtime.apply_post_response_plugins(response);
+                        let processed = runtime_for_blocking.apply_post_response_plugins(response);
                         Ok(processed)
-                    });
+                    })
+            })
+            .await;
 
-                if let Ok(response) = refresh_result {
-                    let ttl = dns::min_ttl(
-                        &response,
-                        runtime.config.min_ttl,
-                        runtime.config.max_ttl,
-                        runtime.config.cache_ttl_seconds,
-                    )
-                    .unwrap_or(runtime.config.cache_ttl_seconds);
-                    let _ = runtime.cache.insert(cache_key.clone(), response, ttl);
-                }
-            }) {
-            Ok(_) => {}
-            Err(e) => {
-                error!("Failed to spawn stale refresh thread: {}", e);
-                // Rollback on failure
-                self.stale_refresh_inflight.lock().remove(&cache_key_clone);
-                self.stale_refresh_active.fetch_sub(1, Ordering::Relaxed);
+            if let Ok(Ok(response)) = refresh_result {
+                let ttl = dns::min_ttl(
+                    &response,
+                    runtime.config.min_ttl,
+                    runtime.config.max_ttl,
+                    runtime.config.cache_ttl_seconds,
+                )
+                .unwrap_or(runtime.config.cache_ttl_seconds);
+                let _ = runtime.cache.insert(cache_key, response, ttl);
             }
-        }
+        });
     }
 
-    async fn handle_metrics_session_async<S: AsyncRead + AsyncWrite + Unpin>(
-        &self,
-        stream: &mut S,
-    ) -> io::Result<()> {
-        let request_timeout = StdDuration::from_millis(HTTP_HEADER_TIMEOUT_MS);
-        let request = timeout(request_timeout, read_http_request_async(stream))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Metrics request timed out"))??;
-        if request.method != "GET" && request.method != "HEAD" {
-            write_http_response_async(
-                stream,
-                "405 Method Not Allowed",
-                "text/plain; charset=utf-8",
-                b"method not allowed",
-            )
-            .await?;
-            return Ok(());
+    async fn handle_metrics_request(
+        self: Arc<Self>,
+        request: Request<Body>,
+    ) -> Result<Response<Body>, hyper::Error> {
+        let path = request.uri().path();
+        if path != "/metrics" {
+            return Ok(http_text_response(StatusCode::NOT_FOUND, "not found"));
         }
-        if http_target_path(&request.target)? != "/metrics" {
-            write_http_response_async(
-                stream,
-                "404 Not Found",
-                "text/plain; charset=utf-8",
-                b"not found",
-            )
-            .await?;
-            return Ok(());
+        if request.method() != Method::GET && request.method() != Method::HEAD {
+            return Ok(http_text_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method not allowed",
+            ));
         }
+
         self.snapshot_metrics();
         let mut metrics = Vec::new();
         let encoder = TextEncoder::new();
         match encoder.encode(&prometheus::gather(), &mut metrics) {
             Ok(_) => {
-                if request.method == "HEAD" {
-                    write_http_response_async(stream, "200 OK", encoder.format_type(), b"").await
+                let body = if request.method() == Method::HEAD {
+                    Body::empty()
                 } else {
-                    write_http_response_async(stream, "200 OK", encoder.format_type(), &metrics)
-                        .await
-                }
+                    Body::from(metrics)
+                };
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header(HYPER_CONTENT_TYPE, encoder.format_type())
+                    .body(body)
+                    .unwrap_or_else(|_| Response::new(Body::from(Vec::new()))))
             }
-            Err(err) => {
-                write_http_response_async(
-                    stream,
-                    "500 Internal Server Error",
-                    "text/plain; charset=utf-8",
-                    err.to_string().as_bytes(),
-                )
-                .await
-            }
+            Err(err) => Ok(http_text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                err.to_string(),
+            )),
         }
     }
 

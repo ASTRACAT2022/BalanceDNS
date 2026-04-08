@@ -1,3 +1,4 @@
+use crate::cache::Cache;
 use crate::config::{LuaComponentConfig, LuaSandboxConfig};
 use crate::dns;
 use libloading::Library;
@@ -124,6 +125,8 @@ impl Drop for LuaStateHandle {
 struct LuaCallbackApi {
     push_lstring: LuaPushLStringFn,
     push_integer: LuaPushIntegerFn,
+    push_number: LuaPushNumberFn,
+    push_boolean: LuaPushBooleanFn,
     push_nil: LuaPushNilFn,
     to_lstring: LuaToLStringFn,
     to_integer: LuaToIntegerXFn,
@@ -136,6 +139,11 @@ struct LuaHookApi {
 
 static LUA_CALLBACK_API: OnceLock<LuaCallbackApi> = OnceLock::new();
 static LUA_HOOK_API: OnceLock<LuaHookApi> = OnceLock::new();
+static GLOBAL_CACHE: OnceLock<Cache> = OnceLock::new();
+
+pub fn set_global_cache(cache: Cache) {
+    let _ = GLOBAL_CACHE.set(cache);
+}
 
 impl LuaScriptEngine {
     pub fn from_path(path: &str) -> io::Result<Self> {
@@ -244,6 +252,10 @@ impl LuaScriptEngine {
             self.set_callback(state, "hex", lua_balancedns_hex)?;
             self.set_callback(state, "from_hex", lua_balancedns_from_hex)?;
             self.set_callback(state, "log", lua_balancedns_log)?;
+            self.set_callback(state, "set_rcode", lua_balancedns_set_rcode)?;
+            self.set_callback(state, "set_tid", lua_balancedns_set_tid)?;
+            self.set_callback(state, "cache_get", lua_balancedns_cache_get)?;
+            self.set_callback(state, "cache_set", lua_balancedns_cache_set)?;
             self.push_toml_value(state, &component.settings)?;
             let config_field = c_string("config")?;
             (self.api.set_field)(state, -2, config_field.as_ptr());
@@ -529,6 +541,8 @@ impl LuaApi {
             let _ = LUA_CALLBACK_API.set(LuaCallbackApi {
                 push_lstring: api.push_lstring,
                 push_integer: api.push_integer,
+                push_number: api.push_number,
+                push_boolean: api.push_boolean,
                 push_nil: api.push_nil,
                 to_lstring: api.to_lstring,
                 to_integer: api.to_integer,
@@ -638,6 +652,77 @@ unsafe extern "C" fn lua_balancedns_log(state: *mut LuaState) -> c_int {
     1
 }
 
+unsafe extern "C" fn lua_balancedns_set_rcode(state: *mut LuaState) -> c_int {
+    let packet = lua_string_arg(state, 1);
+    let rcode = lua_integer_arg(state, 2);
+    match (packet, rcode) {
+        (Some(mut packet), Some(rcode)) => {
+            if packet.len() >= dns::DNS_HEADER_SIZE {
+                dns::set_rcode(&mut packet, rcode as u8);
+                lua_push_bytes(state, &packet);
+            } else {
+                lua_push_nil(state);
+            }
+        }
+        _ => lua_push_nil(state),
+    }
+    1
+}
+
+unsafe extern "C" fn lua_balancedns_set_tid(state: *mut LuaState) -> c_int {
+    let packet = lua_string_arg(state, 1);
+    let tid = lua_integer_arg(state, 2);
+    match (packet, tid) {
+        (Some(mut packet), Some(tid)) => {
+            if packet.len() >= dns::DNS_HEADER_SIZE {
+                dns::set_tid(&mut packet, tid as u16);
+                lua_push_bytes(state, &packet);
+            } else {
+                lua_push_nil(state);
+            }
+        }
+        _ => lua_push_nil(state),
+    }
+    1
+}
+
+unsafe extern "C" fn lua_balancedns_cache_get(state: *mut LuaState) -> c_int {
+    let packet = lua_string_arg(state, 1);
+    if let (Some(packet), Some(cache)) = (packet, GLOBAL_CACHE.get()) {
+        if let Ok(normalized) = dns::normalize(&packet, true) {
+            if let Some(entry) = cache.get2(&normalized) {
+                if !entry.is_expired() {
+                    let mut cached_packet = entry.packet.clone();
+                    dns::set_tid(&mut cached_packet, normalized.tid);
+                    lua_push_bytes(state, &cached_packet);
+                    return 1;
+                }
+            }
+        }
+    }
+    lua_push_nil(state);
+    1
+}
+
+unsafe extern "C" fn lua_balancedns_cache_set(state: *mut LuaState) -> c_int {
+    let query_packet = lua_string_arg(state, 1);
+    let response_packet = lua_string_arg(state, 2);
+    let ttl = lua_integer_arg(state, 3)
+        .unwrap_or(0)
+        .clamp(0, u32::MAX as i64) as u32;
+    if let (Some(query_packet), Some(response_packet), Some(cache)) =
+        (query_packet, response_packet, GLOBAL_CACHE.get())
+    {
+        if let Ok(normalized) = dns::normalize(&query_packet, true) {
+            let success = cache.insert(normalized.key(), response_packet, ttl);
+            lua_push_boolean(state, success);
+            return 1;
+        }
+    }
+    lua_push_boolean(state, false);
+    1
+}
+
 unsafe fn lua_string_arg(state: *mut LuaState, index: c_int) -> Option<Vec<u8>> {
     let api = LUA_CALLBACK_API.get()?;
     let mut len = 0usize;
@@ -663,6 +748,23 @@ unsafe fn lua_push_integer(state: *mut LuaState, value: LuaInteger) {
 unsafe fn lua_push_nil(state: *mut LuaState) {
     if let Some(api) = LUA_CALLBACK_API.get() {
         (api.push_nil)(state);
+    }
+}
+
+unsafe fn lua_integer_arg(state: *mut LuaState, index: c_int) -> Option<LuaInteger> {
+    let api = LUA_CALLBACK_API.get()?;
+    let mut is_num = 0;
+    let val = (api.to_integer)(state, index, &mut is_num);
+    if is_num == 0 {
+        None
+    } else {
+        Some(val)
+    }
+}
+
+unsafe fn lua_push_boolean(state: *mut LuaState, value: bool) {
+    if let Some(api) = LUA_CALLBACK_API.get() {
+        (api.push_boolean)(state, if value { 1 } else { 0 });
     }
 }
 
