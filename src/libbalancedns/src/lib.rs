@@ -16,22 +16,23 @@ extern crate prometheus;
 mod balancedns_runtime;
 mod cache;
 mod conductor;
-mod recursor;
-mod server;
-mod sandbox;
 mod config;
 pub mod dns;
 mod lua_config;
 mod lua_plugin;
 mod odoh;
 mod plugins;
+mod recursor;
 mod remote_refresh;
+mod sandbox;
+mod server;
 mod varz;
+mod worker;
 
 use balancedns_runtime::BalanceDnsRuntime;
 pub use config::{
     Config, LuaComponentConfig, LuaSandboxConfig, RemoteBlocklistConfig, RemoteHostsConfig,
-    UpstreamConfig, UpstreamProtocol,
+    ResolverMode, UpstreamConfig, UpstreamProtocol,
 };
 use privdrop::PrivDrop;
 pub use remote_refresh::{run_remote_refresh_helper, RemoteRefreshKind};

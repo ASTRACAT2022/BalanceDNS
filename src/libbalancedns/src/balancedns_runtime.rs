@@ -1,12 +1,14 @@
 use crate::cache::Cache;
 use crate::conductor::Conductor;
-use crate::recursor::Recursor;
-use crate::config::{Config, RoutingRuleConfig, UpstreamConfig, UpstreamProtocol};
+use crate::config::{Config, ResolverMode, RoutingRuleConfig, UpstreamConfig, UpstreamProtocol};
 use crate::dns;
 use crate::odoh::OdohServer;
-use crate::plugins::{PacketAction, PluginManager};
+use crate::plugins::PluginManager;
+use crate::recursor::Recursor;
 use crate::remote_refresh::RemoteRefreshKind;
+use crate::server::Frame;
 use crate::varz::Varz;
+use crate::worker::Worker;
 use base64;
 use base64::Engine;
 use crossbeam_channel::{bounded, Sender, TrySendError};
@@ -22,7 +24,6 @@ use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use rustls::{Certificate, PrivateKey, ServerConfig};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::File;
@@ -83,6 +84,7 @@ pub struct BalanceDnsRuntime {
     pub(crate) cache: Cache,
     pub(crate) conductor: Conductor,
     pub(crate) recursor: Recursor,
+    pub(crate) worker: Worker,
     pub(crate) local_hosts: HashMap<String, IpAddr>,
     pub(crate) remote_hosts: RwLock<HashMap<String, IpAddr>>,
     pub(crate) remote_blocklist: RwLock<HashSet<String>>,
@@ -205,7 +207,7 @@ impl UpstreamSelectionState {
     }
 }
 
-struct InflightQueryGuard<'a> {
+pub(crate) struct InflightQueryGuard<'a> {
     varz: &'a Varz,
 }
 
@@ -286,11 +288,13 @@ impl BalanceDnsRuntime {
         crate::lua_plugin::set_global_cache(cache.clone());
         let conductor = Conductor::new(config.clone(), varz.clone());
         let recursor = Recursor::new();
+        let worker = Worker::new();
 
         Ok(Arc::new(BalanceDnsRuntime {
             cache,
             conductor,
             recursor,
+            worker,
             config: config.clone(),
             local_hosts,
             remote_hosts: RwLock::new(HashMap::new()),
@@ -422,7 +426,8 @@ impl BalanceDnsRuntime {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         runtime.varz.client_queries.inc();
                         runtime.varz.client_queries_udp.inc();
-                        match runtime.process_query(&packet) {
+                        let frame = Frame::udp(packet, addr);
+                        match runtime.process_frame(frame) {
                             Ok(response) => {
                                 if let Err(e) = socket.send_to(&response, addr) {
                                     runtime.varz.client_queries_errors.inc();
@@ -722,7 +727,10 @@ impl BalanceDnsRuntime {
             self.varz.client_queries_dot.inc();
 
             let runtime = self.clone();
-            let response = match task::spawn_blocking(move || runtime.process_query(&packet)).await
+            let response = match task::spawn_blocking(move || {
+                runtime.process_frame(Frame::dot(packet, Some(addr)))
+            })
+            .await
             {
                 Ok(Ok(response)) => response,
                 Ok(Err(err)) => {
@@ -858,21 +866,24 @@ impl BalanceDnsRuntime {
             self.varz.client_queries_doh.inc();
 
             let runtime = self.clone();
-            let response = match task::spawn_blocking(move || runtime.process_query(&body)).await {
-                Ok(Ok(response)) => response,
-                Ok(Err(err)) => {
-                    return Ok(http_text_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        err.to_string(),
-                    ))
-                }
-                Err(err) => {
-                    return Ok(http_text_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("blocking worker join error: {}", err),
-                    ))
-                }
-            };
+            let response =
+                match task::spawn_blocking(move || runtime.process_frame(Frame::doh(body, None)))
+                    .await
+                {
+                    Ok(Ok(response)) => response,
+                    Ok(Err(err)) => {
+                        return Ok(http_text_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            err.to_string(),
+                        ))
+                    }
+                    Err(err) => {
+                        return Ok(http_text_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("blocking worker join error: {}", err),
+                        ))
+                    }
+                };
 
             Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -930,7 +941,7 @@ impl BalanceDnsRuntime {
             };
             self.varz.client_queries.inc();
             self.varz.client_queries_doh.inc();
-            match self.process_query(&body) {
+            match self.process_frame(Frame::doh(body, None)) {
                 Ok(response) => {
                     write_http_response(stream, "200 OK", "application/dns-message", &response)
                 }
@@ -988,7 +999,10 @@ impl BalanceDnsRuntime {
                         let listener = match TokioTcpListener::from_std(listener) {
                             Ok(listener) => listener,
                             Err(err) => {
-                                error!("Unable to start metrics listener on {}: {}", listen_addr, err);
+                                error!(
+                                    "Unable to start metrics listener on {}: {}",
+                                    listen_addr, err
+                                );
                                 return;
                             }
                         };
@@ -1013,7 +1027,9 @@ impl BalanceDnsRuntime {
                                         }
                                     });
                                 }
-                                Err(err) => error!("Metrics accept error on {}: {}", listen_addr, err),
+                                Err(err) => {
+                                    error!("Metrics accept error on {}: {}", listen_addr, err)
+                                }
                             }
                         }
                     });
@@ -1085,7 +1101,7 @@ impl BalanceDnsRuntime {
             query_count += 1;
             self.varz.client_queries.inc();
             self.varz.client_queries_tcp.inc();
-            let response = self.process_query(&packet)?;
+            let response = self.process_frame(Frame::tcp(packet, None))?;
             write_tcp_response_frame(&mut stream, &response)?;
         }
     }
@@ -1114,96 +1130,35 @@ impl BalanceDnsRuntime {
             query_count += 1;
             self.varz.client_queries.inc();
             self.varz.client_queries_dot.inc();
-            let response = self.process_query(&packet)?;
+            let response = self.process_frame(Frame::dot(packet, None))?;
             write_tcp_response_frame(&mut stream, &response)?;
         }
     }
 
-    pub(crate) fn process_query(self: &Arc<Self>, packet: &[u8]) -> io::Result<Vec<u8>> {
-        let _inflight_query = InflightQueryGuard::new(&self.varz);
-        let packet = if self.plugins.is_empty() {
-            Cow::Borrowed(packet)
-        } else {
-            match self.plugins.apply_pre_query(packet) {
-                None => Cow::Borrowed(packet),
-                Some(PacketAction::Continue(updated)) => Cow::Owned(updated),
-                Some(PacketAction::Respond(response)) => {
-                    return Ok(self.apply_post_response_plugins(response))
-                }
-            }
-        };
-        let normalized_question = dns::normalize(packet.as_ref(), true)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let fqdn = dns::qname_to_fqdn(&normalized_question.qname)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let fqdn = fqdn.to_ascii_lowercase();
-
-        if self.config.deny_any && normalized_question.qtype == dns::DNS_TYPE_ANY {
-            return Ok(dns::build_refused_packet(&normalized_question)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?);
-        }
-        if self.config.deny_dnskey && normalized_question.qtype == dns::DNS_TYPE_DNSKEY {
-            return Ok(dns::build_refused_packet(&normalized_question)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?);
-        }
-        if let Some((ip_addr, ttl)) = self.lookup_host(&fqdn) {
-            let response = dns::build_address_packet(&normalized_question, ip_addr, ttl)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-            return Ok(self.apply_post_response_plugins(response));
-        }
-        if self.is_blocked(&fqdn) {
-            return Ok(dns::build_nxdomain_packet(&normalized_question)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?);
-        }
-
-        if self.config.cache_enabled {
-            let cache_entry = self.cache.get2(&normalized_question);
-            if let Some(cache_entry) = cache_entry {
-                if cache_entry.is_expired() {
-                    self.varz.client_queries_expired.inc();
-                    if self.config.stale_refresh_enabled
-                        && cache_entry.is_servable_stale(self.config.stale_ttl_seconds)
-                    {
-                        self.schedule_stale_refresh(
-                            normalized_question.clone(),
-                            normalized_question.key(),
-                            fqdn.clone(),
-                        );
-                        self.varz.client_queries_cached.inc();
-                        let mut cached_packet = cache_entry.packet.clone();
-                        let _ = dns::set_ttl(&mut cached_packet, 1);
-                        dns::set_tid(&mut cached_packet, normalized_question.tid);
-                        return Ok(self.apply_post_response_plugins(cached_packet));
-                    }
-                } else {
-                    self.varz.client_queries_cached.inc();
-                    let mut cached_packet = cache_entry.packet.clone();
-                    dns::set_tid(&mut cached_packet, normalized_question.tid);
-                    return Ok(self.apply_post_response_plugins(cached_packet));
-                }
-            }
-        }
-
-        let response = self.async_runtime.block_on(async {
-            self.recursor.resolve(&normalized_question, &self.conductor, Arc::clone(self)).await
-        })?;
-        let response = self.apply_post_response_plugins(response);
-        if self.config.cache_enabled {
-            let ttl = dns::min_ttl(
-                &response,
-                self.config.min_ttl,
-                self.config.max_ttl,
-                self.config.cache_ttl_seconds,
-            )
-            .unwrap_or(self.config.cache_ttl_seconds);
-            let _ = self
-                .cache
-                .insert(normalized_question.key(), response.clone(), ttl);
-        }
-        Ok(response)
+    pub(crate) fn process_frame(self: &Arc<Self>, frame: Frame) -> io::Result<Vec<u8>> {
+        self.worker.process_frame(self, frame)
     }
 
-    fn schedule_stale_refresh(
+    pub(crate) fn process_query(self: &Arc<Self>, packet: &[u8]) -> io::Result<Vec<u8>> {
+        self.worker.process_packet(self, packet)
+    }
+
+    pub(crate) fn inflight_query_guard(varz: &Varz) -> InflightQueryGuard<'_> {
+        InflightQueryGuard::new(varz)
+    }
+
+    pub(crate) fn resolve_via_recursor(
+        self: &Arc<Self>,
+        normalized_question: &dns::NormalizedQuestion,
+    ) -> io::Result<Vec<u8>> {
+        self.async_runtime.block_on(async {
+            self.recursor
+                .resolve(normalized_question, &self.conductor, Arc::clone(self))
+                .await
+        })
+    }
+
+    pub(crate) fn schedule_stale_refresh(
         self: &Arc<Self>,
         normalized_question: dns::NormalizedQuestion,
         cache_key: dns::NormalizedQuestionKey,
@@ -1304,7 +1259,7 @@ impl BalanceDnsRuntime {
         }
     }
 
-    fn resolve_via_upstreams(
+    pub(crate) fn resolve_via_upstreams(
         &self,
         normalized_question: &dns::NormalizedQuestion,
         fqdn: &str,
@@ -1424,7 +1379,12 @@ impl BalanceDnsRuntime {
         for i in 0..pool_size {
             let idx = (start_idx + i) % pool_size;
             if let Some(socket) = self.upstream_udp_sockets[idx].try_lock() {
-                return self.query_udp_upstream_with_socket(&socket, remote_addr, query_packet, timeout);
+                return self.query_udp_upstream_with_socket(
+                    &socket,
+                    remote_addr,
+                    query_packet,
+                    timeout,
+                );
             }
         }
 
@@ -1508,7 +1468,7 @@ impl BalanceDnsRuntime {
     }
 
     #[inline]
-    fn lookup_host(&self, fqdn: &str) -> Option<(IpAddr, u32)> {
+    pub(crate) fn lookup_host(&self, fqdn: &str) -> Option<(IpAddr, u32)> {
         if let Some(ip_addr) = self.local_hosts.get(fqdn).copied() {
             return Some((ip_addr, self.config.cache_ttl_seconds));
         }
@@ -1523,7 +1483,7 @@ impl BalanceDnsRuntime {
     }
 
     #[inline]
-    fn is_blocked(&self, fqdn: &str) -> bool {
+    pub(crate) fn is_blocked(&self, fqdn: &str) -> bool {
         self.remote_blocklist.read().contains(fqdn)
     }
 
@@ -1676,12 +1636,16 @@ impl BalanceDnsRuntime {
     }
 
     #[inline]
-    fn apply_post_response_plugins(&self, response: Vec<u8>) -> Vec<u8> {
+    pub(crate) fn apply_post_response_plugins(&self, response: Vec<u8>) -> Vec<u8> {
         if self.plugins.is_empty() {
             response
         } else {
             self.plugins.apply_post_response(&response)
         }
+    }
+
+    pub(crate) fn resolver_mode(&self) -> ResolverMode {
+        self.config.resolver_mode
     }
 }
 

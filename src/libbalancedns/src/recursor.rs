@@ -33,7 +33,14 @@ impl Recursor {
             // In a real recursor, this would follow NS records.
 
             let upstream_indices = runtime.ordered_upstream_indices(&current_target);
-            let response = conductor.resolve(normalized_question, &current_target, upstream_indices, runtime.clone()).await?;
+            let response = conductor
+                .resolve(
+                    normalized_question,
+                    &current_target,
+                    upstream_indices,
+                    runtime.clone(),
+                )
+                .await?;
 
             // Check if it's a referral or a final answer
             // (Placeholder for referral logic)
@@ -41,6 +48,9 @@ impl Recursor {
             return Ok(response);
         }
 
-        Err(io::Error::new(io::ErrorKind::Other, "Max iterations reached in recursor"))
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Max iterations reached in recursor",
+        ))
     }
 }

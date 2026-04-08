@@ -18,6 +18,12 @@ pub enum LoadBalancingMode {
     P2,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolverMode {
+    Forward,
+    Recursive,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UpstreamProtocol {
     Udp,
@@ -75,6 +81,7 @@ pub struct Config {
     pub upstreams: Vec<UpstreamConfig>,
     pub lbmode: LoadBalancingMode,
     pub balancing_algorithm: String,
+    pub resolver_mode: ResolverMode,
     pub upstream_max_failure_duration: Duration,
     pub cache_enabled: bool,
     pub cache_size: usize,
@@ -311,6 +318,7 @@ impl Config {
         let config_server = get_table(&toml_config, "server");
         let config_tls = get_table(&toml_config, "tls");
         let config_balancing = get_table(&toml_config, "balancing");
+        let config_resolver = get_table(&toml_config, "resolver");
         let config_security = get_table(&toml_config, "security");
         let config_cache = get_table(&toml_config, "cache");
         let config_metrics = get_table(&toml_config, "metrics");
@@ -331,6 +339,11 @@ impl Config {
         let balancing_algorithm =
             get_string(config_balancing, "algorithm").unwrap_or_else(|| "round_robin".to_owned());
         let lbmode = parse_balancedns_lbmode(&balancing_algorithm);
+        let resolver_mode = parse_resolver_mode(
+            get_string(config_resolver, "mode")
+                .unwrap_or_else(|| "forward".to_owned())
+                .as_str(),
+        )?;
 
         let deny_any = get_bool(config_security, "deny_any", false, "security.deny_any")?;
         let deny_dnskey = get_bool(
@@ -495,6 +508,7 @@ impl Config {
             upstreams,
             lbmode,
             balancing_algorithm,
+            resolver_mode,
             upstream_max_failure_duration: Duration::from_millis(request_timeout_ms),
             cache_enabled,
             cache_size,
@@ -646,6 +660,7 @@ impl Config {
             upstreams,
             lbmode,
             balancing_algorithm,
+            resolver_mode: ResolverMode::Forward,
             upstream_max_failure_duration: Duration::from_millis(request_timeout_ms),
             cache_enabled: true,
             cache_size,
@@ -707,6 +722,16 @@ fn parse_balancedns_lbmode(algorithm: &str) -> LoadBalancingMode {
             );
             LoadBalancingMode::Fallback
         }
+    }
+}
+
+fn parse_resolver_mode(value: &str) -> Result<ResolverMode, Error> {
+    match value {
+        "forward" => Ok(ResolverMode::Forward),
+        "recursive" => Ok(ResolverMode::Recursive),
+        _ => Err(invalid_data(
+            "resolver.mode must be either 'forward' or 'recursive'",
+        )),
     }
 }
 

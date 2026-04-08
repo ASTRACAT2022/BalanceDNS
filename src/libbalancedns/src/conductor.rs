@@ -43,7 +43,9 @@ impl Conductor {
                 drop(inflight);
 
                 // This task is the "leader" for this query
-                let response = self.resolve_inner(normalized_question, fqdn, upstream_indices, runtime.clone()).await;
+                let response = self
+                    .resolve_inner(normalized_question, fqdn, upstream_indices, runtime.clone())
+                    .await;
 
                 let mut inflight = self.inflight.lock();
                 inflight.remove(&key);
@@ -67,7 +69,10 @@ impl Conductor {
             }
             if rx.changed().await.is_err() {
                 // Leader failed or disappeared
-                return Err(io::Error::new(io::ErrorKind::Other, "Coalesced query failed"));
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "Coalesced query failed",
+                ));
             }
         }
     }
@@ -92,21 +97,27 @@ impl Conductor {
             let upstream = &self.config.upstreams[upstream_idx];
             let elapsed = started_at.elapsed();
             if elapsed >= total_timeout {
-                _last_err = Some(io::Error::new(io::ErrorKind::TimedOut, "Overall upstream resolution timed out"));
+                _last_err = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Overall upstream resolution timed out",
+                ));
                 break;
             }
             let remaining_timeout = total_timeout.saturating_sub(elapsed);
 
             self.varz.upstream_sent.inc();
-            match self.query_upstream(
-                upstream,
-                &query_packet,
-                &upstream_question,
-                &upstream_question_fqdn,
-                normalized_question.tid,
-                remaining_timeout,
-                runtime.clone(),
-            ).await {
+            match self
+                .query_upstream(
+                    upstream,
+                    &query_packet,
+                    &upstream_question,
+                    &upstream_question_fqdn,
+                    normalized_question.tid,
+                    remaining_timeout,
+                    runtime.clone(),
+                )
+                .await
+            {
                 Ok(response) => {
                     self.varz.upstream_received.inc();
                     return Ok(response);
@@ -141,14 +152,18 @@ impl Conductor {
                 let query_packet = query_packet.to_vec();
                 tokio::task::spawn_blocking(move || {
                     runtime.query_udp_upstream(&upstream, &query_packet, timeout)
-                }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e))??
+                })
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??
             }
             UpstreamProtocol::Doh => {
                 let upstream = upstream.clone();
                 let query_packet = query_packet.to_vec();
                 tokio::task::spawn_blocking(move || {
                     runtime.query_doh_upstream(&upstream, &query_packet, timeout)
-                }).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e))??
+                })
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))??
             }
         };
 
@@ -164,7 +179,10 @@ impl Conductor {
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Upstream [{}] returned a mismatched response", upstream.name),
+                format!(
+                    "Upstream [{}] returned a mismatched response",
+                    upstream.name
+                ),
             ));
         }
 

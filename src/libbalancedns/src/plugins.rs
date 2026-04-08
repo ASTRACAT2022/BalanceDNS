@@ -2,11 +2,11 @@ use crate::config::{LuaComponentConfig, LuaSandboxConfig};
 use crate::dns;
 use crate::lua_plugin::{HookOutcome, LuaScriptEngine};
 use crate::sandbox::Sandbox;
-use std::sync::Arc;
 use libloading::Library;
 use std::panic::AssertUnwindSafe;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 const COMPONENT_MAX_PACKET_BYTES: usize = dns::DNS_MAX_PACKET_SIZE;
 const COMPONENT_FAILURE_DISABLE_THRESHOLD: usize = 8;

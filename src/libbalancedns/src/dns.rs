@@ -1022,6 +1022,9 @@ mod tests {
 
         let new_qname = b"\x03foo";
         overwrite_qname(&mut packet, new_qname);
-        assert_eq!(&packet[DNS_OFFSET_QUESTION..DNS_OFFSET_QUESTION + 4], b"\x03foo");
+        assert_eq!(
+            &packet[DNS_OFFSET_QUESTION..DNS_OFFSET_QUESTION + 4],
+            b"\x03foo"
+        );
     }
 }
