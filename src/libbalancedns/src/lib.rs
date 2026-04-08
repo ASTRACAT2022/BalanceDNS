@@ -22,7 +22,6 @@ mod lua_config;
 mod lua_plugin;
 mod odoh;
 mod plugins;
-mod recursor;
 mod remote_refresh;
 mod sandbox;
 mod server;
@@ -32,7 +31,7 @@ mod worker;
 use balancedns_runtime::BalanceDnsRuntime;
 pub use config::{
     Config, LuaComponentConfig, LuaSandboxConfig, RemoteBlocklistConfig, RemoteHostsConfig,
-    ResolverMode, UpstreamConfig, UpstreamProtocol,
+    UpstreamConfig, UpstreamProtocol,
 };
 use privdrop::PrivDrop;
 pub use remote_refresh::{run_remote_refresh_helper, RemoteRefreshKind};

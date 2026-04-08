@@ -17,10 +17,6 @@ return {
         algorithm = "fastest",
     },
 
-    resolver = {
-        mode = "forward",
-    },
-
     security = {
         deny_any = true,
         deny_dnskey = true,

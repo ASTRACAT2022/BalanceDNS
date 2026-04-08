@@ -1,5 +1,4 @@
 use crate::balancedns_runtime::BalanceDnsRuntime;
-use crate::config::ResolverMode;
 use crate::dns;
 use crate::plugins::PacketAction;
 use crate::server::{Frame, Transport};
@@ -95,10 +94,7 @@ impl Worker {
             }
         }
 
-        let response = match runtime.resolver_mode() {
-            ResolverMode::Forward => runtime.resolve_via_upstreams(&normalized_question, &fqdn),
-            ResolverMode::Recursive => runtime.resolve_via_recursor(&normalized_question),
-        }?;
+        let response = runtime.resolve_via_upstreams(&normalized_question, &fqdn)?;
         let response = runtime.apply_post_response_plugins(response);
         if runtime.config.cache_enabled {
             let ttl = dns::min_ttl(

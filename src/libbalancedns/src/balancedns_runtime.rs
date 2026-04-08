@@ -1,10 +1,9 @@
 use crate::cache::Cache;
 use crate::conductor::Conductor;
-use crate::config::{Config, ResolverMode, RoutingRuleConfig, UpstreamConfig, UpstreamProtocol};
+use crate::config::{Config, RoutingRuleConfig, UpstreamConfig, UpstreamProtocol};
 use crate::dns;
 use crate::odoh::OdohServer;
 use crate::plugins::PluginManager;
-use crate::recursor::Recursor;
 use crate::remote_refresh::RemoteRefreshKind;
 use crate::server::Frame;
 use crate::varz::Varz;
@@ -83,7 +82,6 @@ pub struct BalanceDnsRuntime {
     pub(crate) config: Config,
     pub(crate) cache: Cache,
     pub(crate) conductor: Conductor,
-    pub(crate) recursor: Recursor,
     pub(crate) worker: Worker,
     pub(crate) local_hosts: HashMap<String, IpAddr>,
     pub(crate) remote_hosts: RwLock<HashMap<String, IpAddr>>,
@@ -287,13 +285,11 @@ impl BalanceDnsRuntime {
         let cache = Cache::new(config.clone())?;
         crate::lua_plugin::set_global_cache(cache.clone());
         let conductor = Conductor::new(config.clone(), varz.clone());
-        let recursor = Recursor::new();
         let worker = Worker::new();
 
         Ok(Arc::new(BalanceDnsRuntime {
             cache,
             conductor,
-            recursor,
             worker,
             config: config.clone(),
             local_hosts,
@@ -1147,17 +1143,6 @@ impl BalanceDnsRuntime {
         InflightQueryGuard::new(varz)
     }
 
-    pub(crate) fn resolve_via_recursor(
-        self: &Arc<Self>,
-        normalized_question: &dns::NormalizedQuestion,
-    ) -> io::Result<Vec<u8>> {
-        self.async_runtime.block_on(async {
-            self.recursor
-                .resolve(normalized_question, &self.conductor, Arc::clone(self))
-                .await
-        })
-    }
-
     pub(crate) fn schedule_stale_refresh(
         self: &Arc<Self>,
         normalized_question: dns::NormalizedQuestion,
@@ -1642,10 +1627,6 @@ impl BalanceDnsRuntime {
         } else {
             self.plugins.apply_post_response(&response)
         }
-    }
-
-    pub(crate) fn resolver_mode(&self) -> ResolverMode {
-        self.config.resolver_mode
     }
 }
 
