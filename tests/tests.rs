@@ -6,79 +6,90 @@ mod test {
     use std::io::Write;
     use tempfile::Builder;
 
+    fn from_lua(lua: &str) -> Config {
+        Config::from_lua_string(lua).expect("Lua config parse failed")
+    }
+
     #[test]
     fn parse_balancedns_config() {
         let cfg = r#"
-[server]
-udp_listen = "0.0.0.0:5353"
-tcp_listen = "0.0.0.0:5353"
-dot_listen = "0.0.0.0:8853"
-doh_listen = "0.0.0.0:8443"
-
-[tls]
-cert_pem = "tls/server.crt"
-key_pem = "tls/server.key"
-
-[balancing]
-algorithm = "round_robin"
-
-[security]
-deny_any = true
-deny_dnskey = true
-request_timeout_ms = 3000
-
-[cache]
-enabled = true
-max_size = 20000
-ttl_seconds = 600
-stale_refresh_enabled = true
-stale_ttl_seconds = 30
-
-[metrics]
-listen = "127.0.0.1:9100"
-
-[hosts_local]
-"example.com." = "1.2.3.4"
-
-[hosts_remote]
-url = " https://example.com/hosts "
-refresh_seconds = 300
-ttl_seconds = 60
-
-[blocklist_remote]
-url = " https://example.com/blocklist "
-refresh_seconds = 300
-
-[plugins]
-libraries = ["plugins/libsample.dylib"]
-
-[lua]
-scripts = [" lua/query_logger.lua "]
-
-[[upstreams]]
-name = "cloudflare-doh"
-proto = "doh"
-url = " https://1.1.1.1/dns-query "
-pool = "default"
-weight = 5
-
-[[upstreams]]
-name = "cloudflare-udp"
-proto = "udp"
-addr = "1.1.1.1:53"
-pool = "default"
-weight = 1
-
-[[routing_rules]]
-suffix = ".ru."
-upstreams = ["cloudflare-udp"]
-
-[global]
-threads_udp = 6
-threads_tcp = 4
+return {
+    server = {
+        udp_listen = "0.0.0.0:5353",
+        tcp_listen = "0.0.0.0:5353",
+        dot_listen = "0.0.0.0:8853",
+        doh_listen = "0.0.0.0:8443",
+    },
+    tls = {
+        cert_pem = "tls/server.crt",
+        key_pem = "tls/server.key",
+    },
+    balancing = {
+        algorithm = "round_robin",
+    },
+    security = {
+        deny_any = true,
+        deny_dnskey = true,
+        request_timeout_ms = 3000,
+    },
+    cache = {
+        enabled = true,
+        max_size = 20000,
+        ttl_seconds = 600,
+        stale_refresh_enabled = true,
+        stale_ttl_seconds = 30,
+    },
+    metrics = {
+        listen = "127.0.0.1:9100",
+    },
+    hosts_local = {
+        ["example.com."] = "1.2.3.4",
+    },
+    hosts_remote = {
+        url = " https://example.com/hosts ",
+        refresh_seconds = 300,
+        ttl_seconds = 60,
+    },
+    blocklist_remote = {
+        url = " https://example.com/blocklist ",
+        refresh_seconds = 300,
+    },
+    plugins = {
+        libraries = {"plugins/libsample.dylib"},
+    },
+    lua = {
+        scripts = {" lua/query_logger.lua "},
+    },
+    upstreams = {
+        {
+            name = "cloudflare-doh",
+            proto = "doh",
+            url = " https://1.1.1.1/dns-query ",
+            pool = "default",
+            weight = 5,
+        },
+        {
+            name = "cloudflare-udp",
+            proto = "udp",
+            addr = "1.1.1.1:53",
+            pool = "default",
+            weight = 1,
+        },
+    },
+    routing_rules = {
+        {
+            suffix = ".ru.",
+            upstreams = {"cloudflare-udp"},
+        },
+    },
+    global = {
+        threads_udp = 6,
+        threads_tcp = 4,
+    },
+}
 "#;
 
-        let config = Config::from_string(cfg).unwrap();
+        let config = from_lua(cfg);
         assert_eq!(config.udp_listen_addr.as_deref(), Some("0.0.0.0:5353"));
         assert_eq!(config.tcp_listen_addr.as_deref(), Some("0.0.0.0:5353"));
         assert_eq!(config.dot_listen_addr.as_deref(), Some("0.0.0.0:8853"));
@@ -126,27 +137,30 @@ threads_tcp = 4
     #[test]
     fn parse_legacy_config() {
         let cfg = r#"
-[upstream]
-type = "resolver"
-servers = ["127.0.0.1:53"]
-strategy = "fallback"
-max_failure_duration = 2500
-
-[network]
-listen = "127.0.0.1:5353"
-udp_ports = 1
-
-[cache]
-max_items = 100
-min_ttl = 60
-max_ttl = 300
-
-[global]
-threads_udp = 1
-threads_tcp = 1
+return {
+    upstream = {
+        type = "resolver",
+        servers = {"127.0.0.1:53"},
+        strategy = "fallback",
+        max_failure_duration = 2500,
+    },
+    network = {
+        listen = "127.0.0.1:5353",
+        udp_ports = 1,
+    },
+    cache = {
+        max_items = 100,
+        min_ttl = 60,
+        max_ttl = 300,
+    },
+    global = {
+        threads_udp = 1,
+        threads_tcp = 1,
+    },
+}
 "#;
 
-        let config = Config::from_string(cfg).unwrap();
+        let config = from_lua(cfg);
         assert_eq!(config.upstreams.len(), 1);
         assert_eq!(config.upstreams[0].proto, UpstreamProtocol::Udp);
         assert_eq!(config.upstreams[0].addr.as_deref(), Some("127.0.0.1:53"));
@@ -158,18 +172,23 @@ threads_tcp = 1
     #[test]
     fn balancedns_timeout_defaults_to_1500ms() {
         let cfg = r#"
-[server]
-udp_listen = "127.0.0.1:5353"
-
-[[upstreams]]
-name = "cloudflare-udp"
-proto = "udp"
-addr = "1.1.1.1:53"
-pool = "default"
-weight = 1
+return {
+    server = {
+        udp_listen = "127.0.0.1:5353",
+    },
+    upstreams = {
+        {
+            name = "cloudflare-udp",
+            proto = "udp",
+            addr = "1.1.1.1:53",
+            pool = "default",
+            weight = 1,
+        },
+    },
+}
 "#;
 
-        let config = Config::from_string(cfg).unwrap();
+        let config = from_lua(cfg);
         assert_eq!(config.request_timeout_ms, 1500);
         assert!(!config.stale_refresh_enabled);
         assert_eq!(config.stale_ttl_seconds, 30);
@@ -178,22 +197,29 @@ weight = 1
     #[test]
     fn balancedns_rejects_unknown_routing_upstream() {
         let cfg = r#"
-[server]
-udp_listen = "127.0.0.1:5353"
-
-[[upstreams]]
-name = "cloudflare-udp"
-proto = "udp"
-addr = "1.1.1.1:53"
-pool = "default"
-weight = 1
-
-[[routing_rules]]
-suffix = ".ru."
-upstreams = ["missing-upstream"]
+return {
+    server = {
+        udp_listen = "127.0.0.1:5353",
+    },
+    upstreams = {
+        {
+            name = "cloudflare-udp",
+            proto = "udp",
+            addr = "1.1.1.1:53",
+            pool = "default",
+            weight = 1,
+        },
+    },
+    routing_rules = {
+        {
+            suffix = ".ru.",
+            upstreams = {"missing-upstream"},
+        },
+    },
+}
 "#;
 
-        let err = Config::from_string(cfg).unwrap_err();
+        let err = Config::from_lua_string(cfg).unwrap_err();
         assert!(err
             .to_string()
             .contains("references unknown upstream [missing-upstream]"));
@@ -202,23 +228,28 @@ upstreams = ["missing-upstream"]
     #[test]
     fn balancedns_rejects_zero_refresh_interval() {
         let cfg = r#"
-[server]
-udp_listen = "127.0.0.1:5353"
-
-[hosts_remote]
-url = "https://example.com/hosts"
-refresh_seconds = 0
-ttl_seconds = 60
-
-[[upstreams]]
-name = "cloudflare-udp"
-proto = "udp"
-addr = "1.1.1.1:53"
-pool = "default"
-weight = 1
+return {
+    server = {
+        udp_listen = "127.0.0.1:5353",
+    },
+    hosts_remote = {
+        url = "https://example.com/hosts",
+        refresh_seconds = 0,
+        ttl_seconds = 60,
+    },
+    upstreams = {
+        {
+            name = "cloudflare-udp",
+            proto = "udp",
+            addr = "1.1.1.1:53",
+            pool = "default",
+            weight = 1,
+        },
+    },
+}
 "#;
 
-        let err = Config::from_string(cfg).unwrap_err();
+        let err = Config::from_lua_string(cfg).unwrap_err();
         assert!(err
             .to_string()
             .contains("hosts_remote.refresh_seconds must be greater than 0"));
@@ -227,44 +258,51 @@ weight = 1
     #[test]
     fn parse_structured_lua_config() {
         let cfg = r#"
-[server]
-udp_listen = "127.0.0.1:5353"
-
-[lua]
-scripts = ["lua/default.lua"]
-
-[lua.settings]
-mode = "observe"
-sample_rate = 5
-
-[lua.sandbox]
-max_packet_bytes = 2048
-disable_after_failures = 3
-init_instruction_limit = 123456
-hook_instruction_limit = 654321
-
-[[lua.components]]
-path = "lua/filter.lua"
-enabled = true
-
-[lua.components.settings]
-mode = "block"
-reply_code = 3
-tags = ["ads", "telemetry"]
-
-[[lua.components]]
-path = "lua/off.lua"
-enabled = false
-
-[[upstreams]]
-name = "cloudflare-udp"
-proto = "udp"
-addr = "1.1.1.1:53"
-pool = "default"
-weight = 1
+return {
+    server = {
+        udp_listen = "127.0.0.1:5353",
+    },
+    lua = {
+        scripts = {"lua/default.lua"},
+        settings = {
+            mode = "observe",
+            sample_rate = 5,
+        },
+        sandbox = {
+            max_packet_bytes = 2048,
+            disable_after_failures = 3,
+            init_instruction_limit = 123456,
+            hook_instruction_limit = 654321,
+        },
+        components = {
+            {
+                path = "lua/filter.lua",
+                enabled = true,
+                settings = {
+                    mode = "block",
+                    reply_code = 3,
+                    tags = {"ads", "telemetry"},
+                },
+            },
+            {
+                path = "lua/off.lua",
+                enabled = false,
+            },
+        },
+    },
+    upstreams = {
+        {
+            name = "cloudflare-udp",
+            proto = "udp",
+            addr = "1.1.1.1:53",
+            pool = "default",
+            weight = 1,
+        },
+    },
+}
 "#;
 
-        let config = Config::from_string(cfg).unwrap();
+        let config = from_lua(cfg);
         assert_eq!(
             config.lua_scripts,
             vec!["lua/default.lua", "lua/filter.lua"]
@@ -560,18 +598,23 @@ return {
     #[test]
     fn balancedns_requires_tls_files_for_dot_or_doh() {
         let cfg = r#"
-[server]
-dot_listen = "127.0.0.1:8853"
-
-[[upstreams]]
-name = "cloudflare-udp"
-proto = "udp"
-addr = "1.1.1.1:53"
-pool = "default"
-weight = 1
+return {
+    server = {
+        dot_listen = "127.0.0.1:8853",
+    },
+    upstreams = {
+        {
+            name = "cloudflare-udp",
+            proto = "udp",
+            addr = "1.1.1.1:53",
+            pool = "default",
+            weight = 1,
+        },
+    },
+}
 "#;
 
-        let err = Config::from_string(cfg).unwrap_err();
+        let err = Config::from_lua_string(cfg).unwrap_err();
         assert!(err.to_string().contains("tls.cert_pem is required"));
     }
 

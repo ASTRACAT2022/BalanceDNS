@@ -15,6 +15,10 @@ extern crate prometheus;
 
 mod balancedns_runtime;
 mod cache;
+mod conductor;
+mod recursor;
+mod server;
+mod sandbox;
 mod config;
 pub mod dns;
 mod lua_config;

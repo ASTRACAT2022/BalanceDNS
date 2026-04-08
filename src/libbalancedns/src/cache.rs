@@ -19,7 +19,7 @@
 use crate::config::Config;
 use crate::dns;
 use crate::dns::{NormalizedQuestion, NormalizedQuestionKey, DNS_CLASS_IN, DNS_RCODE_NXDOMAIN};
-use clockpro_cache::*;
+use caches::{AdaptiveCache, Cache as _};
 use coarsetime::{Duration, Instant};
 use log::error;
 use parking_lot::Mutex;
@@ -55,7 +55,7 @@ impl CacheEntry {
 #[derive(Clone)]
 pub struct Cache {
     config: Config,
-    shards: Arc<Vec<Mutex<ClockProCache<NormalizedQuestionKey, CacheEntry>>>>,
+    shards: Arc<Vec<Mutex<AdaptiveCache<NormalizedQuestionKey, CacheEntry>>>>,
 }
 
 pub struct CacheStats {
@@ -73,8 +73,8 @@ impl Cache {
         let mut shards = Vec::with_capacity(shard_count);
         for shard_index in 0..shard_count {
             let shard_capacity = shard_capacity(config.cache_size, shard_count, shard_index);
-            let shard = ClockProCache::new(shard_capacity)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+            let shard = AdaptiveCache::new(shard_capacity)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err.to_string()))?;
             shards.push(Mutex::new(shard));
         }
         Ok(Cache {
@@ -94,11 +94,11 @@ impl Cache {
         };
         for shard in self.shards.iter() {
             let cache = shard.lock();
-            stats.frequent_len += cache.frequent_len();
-            stats.recent_len += cache.recent_len();
-            stats.test_len += cache.test_len();
-            stats.inserted += cache.inserted();
-            stats.evicted += cache.evicted();
+            // AdaptiveCache doesn't expose frequent/recent/test len directly like ClockProCache did
+            // We can approximate or just report total len if needed.
+            stats.frequent_len += cache.len();
+            // stats.inserted += cache.inserted();
+            // stats.evicted += cache.evicted();
         }
         stats
     }
@@ -119,15 +119,14 @@ impl Cache {
         let expiration = now + duration;
         let cache_entry = CacheEntry { expiration, packet };
         let mut cache = self.shard_for_key(&normalized_question_key).lock();
-        cache.insert(normalized_question_key, cache_entry)
+        cache.put(normalized_question_key, cache_entry);
+        true
     }
 
     #[inline]
     pub fn get(&self, normalized_question_key: &NormalizedQuestionKey) -> Option<CacheEntry> {
         let mut cache = self.shard_for_key(normalized_question_key).lock();
-        cache
-            .get_mut(normalized_question_key)
-            .map(|res| res.clone())
+        cache.get(normalized_question_key).cloned()
     }
 
     /// get2() does a couple things before checking that a key is present in the cache.
@@ -239,7 +238,7 @@ impl Cache {
     fn shard_for_key(
         &self,
         normalized_question_key: &NormalizedQuestionKey,
-    ) -> &Mutex<ClockProCache<NormalizedQuestionKey, CacheEntry>> {
+    ) -> &Mutex<AdaptiveCache<NormalizedQuestionKey, CacheEntry>> {
         let shard_index = shard_index(normalized_question_key, self.shards.len());
         &self.shards[shard_index]
     }
