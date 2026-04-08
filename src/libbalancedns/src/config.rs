@@ -107,6 +107,8 @@ pub struct Config {
     pub dnstap_identity: Option<String>,
     pub dnstap_version: Option<String>,
     pub max_tcp_clients: usize,
+    pub max_dot_clients: usize,
+    pub max_doh_clients: usize,
     pub max_waiting_clients: usize,
     pub max_active_queries: usize,
     pub max_clients_waiting_for_query: usize,
@@ -173,6 +175,16 @@ impl Config {
         if config.max_tcp_clients == 0 {
             return Err(invalid_data(
                 "global.max_tcp_clients must be greater than 0",
+            ));
+        }
+        if config.max_dot_clients == 0 {
+            return Err(invalid_data(
+                "global.max_dot_clients must be greater than 0",
+            ));
+        }
+        if config.max_doh_clients == 0 {
+            return Err(invalid_data(
+                "global.max_doh_clients must be greater than 0",
             ));
         }
         if config.max_waiting_clients == 0 {
@@ -400,6 +412,18 @@ impl Config {
             250,
             "global.max_tcp_clients",
         )?;
+        let max_dot_clients = get_usize(
+            config_global,
+            "max_dot_clients",
+            max_tcp_clients,
+            "global.max_dot_clients",
+        )?;
+        let max_doh_clients = get_usize(
+            config_global,
+            "max_doh_clients",
+            max_tcp_clients,
+            "global.max_doh_clients",
+        )?;
         let max_waiting_clients = get_usize(
             config_global,
             "max_waiting_clients",
@@ -516,6 +540,8 @@ impl Config {
             dnstap_identity: None,
             dnstap_version: Some("BalanceDNS".to_owned()),
             max_tcp_clients,
+            max_dot_clients,
+            max_doh_clients,
             max_waiting_clients,
             max_active_queries,
             max_clients_waiting_for_query,
@@ -665,6 +691,8 @@ impl Config {
             dnstap_identity,
             dnstap_version,
             max_tcp_clients,
+            max_dot_clients: max_tcp_clients,
+            max_doh_clients: max_tcp_clients,
             max_waiting_clients,
             max_active_queries,
             max_clients_waiting_for_query,
