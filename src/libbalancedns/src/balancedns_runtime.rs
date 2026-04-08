@@ -46,6 +46,9 @@ const TCP_SESSION_PREFETCH_MAX: usize = 4;
 const TCP_SESSION_PREFETCH_READ_TIMEOUT_MS: u64 = 5;
 const TCP_SESSION_MAX_QUERIES: usize = 1000; // Max queries per TCP/DoT/DoH session
 const TCP_SESSION_IDLE_TIMEOUT_MS: u64 = 30000; // 30 seconds idle timeout
+const TLS_HANDSHAKE_TIMEOUT_MS: u64 = 5000; // 5 seconds for TLS handshake
+const HTTP_HEADER_TIMEOUT_MS: u64 = 5000; // 5 seconds for HTTP headers
+const HTTP_KEEP_ALIVE_TIMEOUT_MS: u64 = 60000; // 60 seconds keep-alive
 
 // Upstream query timeouts
 const UPSTREAM_QUERY_MIN_TIMEOUT_MS: u64 = 100;
@@ -89,8 +92,11 @@ pub struct BalanceDnsRuntime {
     stale_refresh_inflight: Mutex<HashSet<dns::NormalizedQuestionKey>>,
     stale_refresh_active: AtomicUsize,
     tcp_connection_count: AtomicUsize,
+    dot_connection_count: AtomicUsize,
+    doh_connection_count: AtomicUsize,
     upstream_udp_sockets: Vec<Mutex<UdpSocket>>,
     odoh_server: OdohServer,
+    async_runtime: tokio::runtime::Runtime,
 }
 
 struct RuntimeRoutingRule {
@@ -106,6 +112,14 @@ struct UpstreamSelectionState {
 
 struct TcpConnectionGuard {
     runtime: Arc<BalanceDnsRuntime>,
+    protocol: ConnectionProtocol,
+}
+
+#[derive(Clone, Copy)]
+enum ConnectionProtocol {
+    Tcp,
+    Dot,
+    Doh,
 }
 
 #[derive(Clone, Copy)]
@@ -122,16 +136,19 @@ where
 }
 
 impl TcpConnectionGuard {
-    fn new(runtime: Arc<BalanceDnsRuntime>) -> Self {
-        Self { runtime }
+    fn new(runtime: Arc<BalanceDnsRuntime>, protocol: ConnectionProtocol) -> Self {
+        Self { runtime, protocol }
     }
 }
 
 impl Drop for TcpConnectionGuard {
     fn drop(&mut self) {
-        self.runtime
-            .tcp_connection_count
-            .fetch_sub(1, Ordering::Relaxed);
+        let counter = match self.protocol {
+            ConnectionProtocol::Tcp => &self.runtime.tcp_connection_count,
+            ConnectionProtocol::Dot => &self.runtime.dot_connection_count,
+            ConnectionProtocol::Doh => &self.runtime.doh_connection_count,
+        };
+        counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -281,8 +298,21 @@ impl BalanceDnsRuntime {
             stale_refresh_inflight: Mutex::new(HashSet::new()),
             stale_refresh_active: AtomicUsize::new(0),
             tcp_connection_count: AtomicUsize::new(0),
+            dot_connection_count: AtomicUsize::new(0),
+            doh_connection_count: AtomicUsize::new(0),
             upstream_udp_sockets,
             odoh_server,
+            async_runtime: TokioRuntimeBuilder::new_multi_thread()
+                .enable_all()
+                .worker_threads(
+                    thread::available_parallelism()
+                        .map(|p| p.get())
+                        .unwrap_or(4)
+                        .max(2),
+                )
+                .thread_name("balancedns_async")
+                .build()
+                .map_err(io::Error::other)?,
         }))
     }
 
@@ -456,6 +486,8 @@ impl BalanceDnsRuntime {
                 .name(format!("balancedns_tcp_worker_{}", worker_id))
                 .spawn(move || {
                     while let Ok((stream, addr)) = rx.recv() {
+                        let _connection_guard =
+                            TcpConnectionGuard::new(runtime.clone(), ConnectionProtocol::Tcp);
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             if let Err(err) = runtime.handle_tcp_session(stream) {
                                 debug!("TCP session closed for {}: {}", addr, err);
@@ -464,7 +496,6 @@ impl BalanceDnsRuntime {
                         if let Err(panic_err) = result {
                             error!("TCP session worker panicked for {}: {:?}", addr, panic_err);
                         }
-                        runtime.tcp_connection_count.fetch_sub(1, Ordering::Relaxed);
                     }
                 })
                 .map_err(|err| io::Error::other(format!("Unable to spawn TCP worker: {}", err)))?;
@@ -513,28 +544,15 @@ impl BalanceDnsRuntime {
         let listener = TcpListener::bind(&listen_addr)?;
         listener.set_nonblocking(true)?;
         let tls_config = load_tls_server_config(&self.config, TlsApplicationProtocol::Dns)?;
-        let max_tcp = self.config.max_tcp_clients;
-        let worker_count = stream_worker_count(self.config.tcp_acceptor_threads);
         thread::Builder::new()
             .name("balancedns_dot".to_string())
             .spawn({
                 let runtime = self.clone();
                 move || {
-                    let async_runtime = match TokioRuntimeBuilder::new_multi_thread()
-                        .enable_all()
-                        .worker_threads(worker_count)
-                        .thread_name("balancedns_dot_async")
-                        .build()
-                    {
-                        Ok(async_runtime) => async_runtime,
-                        Err(err) => {
-                            error!("Unable to build DoT runtime on {}: {}", listen_addr, err);
-                            return;
-                        }
-                    };
                     let acceptor = TlsAcceptor::from(Arc::new(tls_config.clone()));
                     let listen_addr_for_runtime = listen_addr.clone();
-                    async_runtime.block_on(async move {
+                    let rt = &runtime.async_runtime;
+                    rt.block_on(async {
                         let listener = match TokioTcpListener::from_std(listener) {
                             Ok(listener) => listener,
                             Err(err) => {
@@ -549,17 +567,18 @@ impl BalanceDnsRuntime {
                         loop {
                             match listener.accept().await {
                                 Ok((stream, addr)) => {
+                                    let max_dot = runtime.config.max_dot_clients;
                                     let previous = runtime
-                                        .tcp_connection_count
+                                        .dot_connection_count
                                         .fetch_add(1, Ordering::Relaxed);
-                                    if previous >= max_tcp {
+                                    if previous >= max_dot {
                                         runtime
-                                            .tcp_connection_count
+                                            .dot_connection_count
                                             .fetch_sub(1, Ordering::Relaxed);
                                         runtime.varz.client_connections_rejected.inc();
                                         warn!(
                                             "DoT connection limit reached ({}/{}), rejecting {}",
-                                            previous, max_tcp, addr
+                                            previous, max_dot, addr
                                         );
                                         continue;
                                     }
@@ -587,28 +606,15 @@ impl BalanceDnsRuntime {
         let listener = TcpListener::bind(&listen_addr)?;
         listener.set_nonblocking(true)?;
         let tls_config = load_tls_server_config(&self.config, TlsApplicationProtocol::Http11)?;
-        let max_tcp = self.config.max_tcp_clients;
-        let worker_count = stream_worker_count(self.config.tcp_acceptor_threads);
         thread::Builder::new()
             .name("balancedns_doh".to_string())
             .spawn({
                 let runtime = self.clone();
                 move || {
-                    let async_runtime = match TokioRuntimeBuilder::new_multi_thread()
-                        .enable_all()
-                        .worker_threads(worker_count)
-                        .thread_name("balancedns_doh_async")
-                        .build()
-                    {
-                        Ok(async_runtime) => async_runtime,
-                        Err(err) => {
-                            error!("Unable to build DoH runtime on {}: {}", listen_addr, err);
-                            return;
-                        }
-                    };
                     let acceptor = TlsAcceptor::from(Arc::new(tls_config.clone()));
                     let listen_addr_for_runtime = listen_addr.clone();
-                    async_runtime.block_on(async move {
+                    let rt = &runtime.async_runtime;
+                    rt.block_on(async {
                         let listener = match TokioTcpListener::from_std(listener) {
                             Ok(listener) => listener,
                             Err(err) => {
@@ -626,17 +632,18 @@ impl BalanceDnsRuntime {
                         loop {
                             match listener.accept().await {
                                 Ok((stream, addr)) => {
+                                    let max_doh = runtime.config.max_doh_clients;
                                     let previous = runtime
-                                        .tcp_connection_count
+                                        .doh_connection_count
                                         .fetch_add(1, Ordering::Relaxed);
-                                    if previous >= max_tcp {
+                                    if previous >= max_doh {
                                         runtime
-                                            .tcp_connection_count
+                                            .doh_connection_count
                                             .fetch_sub(1, Ordering::Relaxed);
                                         runtime.varz.client_connections_rejected.inc();
                                         warn!(
                                             "DoH connection limit reached ({}/{}), rejecting {}",
-                                            previous, max_tcp, addr
+                                            previous, max_doh, addr
                                         );
                                         continue;
                                     }
@@ -663,7 +670,7 @@ impl BalanceDnsRuntime {
         stream: TokioTcpStream,
         addr: SocketAddr,
     ) {
-        let _connection_guard = TcpConnectionGuard::new(self.clone());
+        let _connection_guard = TcpConnectionGuard::new(self.clone(), ConnectionProtocol::Dot);
         let idle_timeout = StdDuration::from_millis(TCP_SESSION_IDLE_TIMEOUT_MS);
 
         if let Err(err) = stream.set_nodelay(true) {
@@ -672,7 +679,8 @@ impl BalanceDnsRuntime {
             return;
         }
 
-        let mut tls_stream = match timeout(idle_timeout, acceptor.accept(stream)).await {
+        let handshake_timeout = StdDuration::from_millis(TLS_HANDSHAKE_TIMEOUT_MS);
+        let mut tls_stream = match timeout(handshake_timeout, acceptor.accept(stream)).await {
             Ok(Ok(tls_stream)) => tls_stream,
             Ok(Err(err)) => {
                 debug!("DoT TLS handshake failed for {}: {}", addr, err);
@@ -743,8 +751,7 @@ impl BalanceDnsRuntime {
         stream: TokioTcpStream,
         addr: SocketAddr,
     ) {
-        let _connection_guard = TcpConnectionGuard::new(self.clone());
-        let idle_timeout = StdDuration::from_millis(TCP_SESSION_IDLE_TIMEOUT_MS);
+        let _connection_guard = TcpConnectionGuard::new(self.clone(), ConnectionProtocol::Doh);
 
         if let Err(err) = stream.set_nodelay(true) {
             debug!("Failed to configure DoH stream for {}: {}", addr, err);
@@ -752,7 +759,8 @@ impl BalanceDnsRuntime {
             return;
         }
 
-        let tls_stream = match timeout(idle_timeout, acceptor.accept(stream)).await {
+        let handshake_timeout = StdDuration::from_millis(TLS_HANDSHAKE_TIMEOUT_MS);
+        let tls_stream = match timeout(handshake_timeout, acceptor.accept(stream)).await {
             Ok(Ok(tls_stream)) => tls_stream,
             Ok(Err(err)) => {
                 debug!("DoH TLS handshake failed for {}: {}", addr, err);
@@ -954,6 +962,7 @@ impl BalanceDnsRuntime {
         listen_addr: String,
     ) -> io::Result<thread::JoinHandle<()>> {
         let listener = TcpListener::bind(&listen_addr)?;
+        listener.set_nonblocking(true)?;
         info!(
             "Metrics listener is ready on http://{}/metrics",
             listen_addr
@@ -962,23 +971,39 @@ impl BalanceDnsRuntime {
             .name("balancedns_metrics".to_string())
             .spawn({
                 let runtime = self.clone();
-                move || loop {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            if let Err(err) = runtime.handle_metrics_session(&mut stream) {
-                                if err.kind() != io::ErrorKind::UnexpectedEof {
-                                    debug!("Metrics session failed on {}: {}", listen_addr, err);
-                                    let _ = write_http_response(
-                                        &mut stream,
-                                        "400 Bad Request",
-                                        "text/plain; charset=utf-8",
-                                        err.to_string().as_bytes(),
-                                    );
+                move || {
+                    let rt = &runtime.async_runtime;
+                    rt.block_on(async {
+                        let listener = match TokioTcpListener::from_std(listener) {
+                            Ok(listener) => listener,
+                            Err(err) => {
+                                error!("Unable to start metrics listener on {}: {}", listen_addr, err);
+                                return;
+                            }
+                        };
+                        loop {
+                            match listener.accept().await {
+                                Ok((stream, _)) => {
+                                    let runtime = runtime.clone();
+                                    tokio::spawn(async move {
+                                        let mut stream = stream;
+                                        if let Err(err) = runtime.handle_metrics_session_async(&mut stream).await {
+                                            if err.kind() != io::ErrorKind::UnexpectedEof {
+                                                debug!("Metrics session failed: {}", err);
+                                                let _ = write_http_response_async(
+                                                    &mut stream,
+                                                    "400 Bad Request",
+                                                    "text/plain; charset=utf-8",
+                                                    err.to_string().as_bytes(),
+                                                ).await;
+                                            }
+                                        }
+                                    });
                                 }
+                                Err(err) => error!("Metrics accept error on {}: {}", listen_addr, err),
                             }
                         }
-                        Err(err) => error!("Metrics accept error on {}: {}", listen_addr, err),
-                    }
+                    });
                 }
             })
     }
@@ -1233,24 +1258,32 @@ impl BalanceDnsRuntime {
         }
     }
 
-    fn handle_metrics_session<S: Read + Write>(&self, stream: &mut S) -> io::Result<()> {
-        let request = read_http_request(stream)?;
+    async fn handle_metrics_session_async<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: &mut S,
+    ) -> io::Result<()> {
+        let request_timeout = StdDuration::from_millis(HTTP_HEADER_TIMEOUT_MS);
+        let request = timeout(request_timeout, read_http_request_async(stream))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Metrics request timed out"))??;
         if request.method != "GET" && request.method != "HEAD" {
-            write_http_response(
+            write_http_response_async(
                 stream,
                 "405 Method Not Allowed",
                 "text/plain; charset=utf-8",
                 b"method not allowed",
-            )?;
+            )
+            .await?;
             return Ok(());
         }
         if http_target_path(&request.target)? != "/metrics" {
-            write_http_response(
+            write_http_response_async(
                 stream,
                 "404 Not Found",
                 "text/plain; charset=utf-8",
                 b"not found",
-            )?;
+            )
+            .await?;
             return Ok(());
         }
         self.snapshot_metrics();
@@ -1259,17 +1292,21 @@ impl BalanceDnsRuntime {
         match encoder.encode(&prometheus::gather(), &mut metrics) {
             Ok(_) => {
                 if request.method == "HEAD" {
-                    write_http_response(stream, "200 OK", encoder.format_type(), b"")
+                    write_http_response_async(stream, "200 OK", encoder.format_type(), b"").await
                 } else {
-                    write_http_response(stream, "200 OK", encoder.format_type(), &metrics)
+                    write_http_response_async(stream, "200 OK", encoder.format_type(), &metrics)
+                        .await
                 }
             }
-            Err(err) => write_http_response(
-                stream,
-                "500 Internal Server Error",
-                "text/plain; charset=utf-8",
-                err.to_string().as_bytes(),
-            ),
+            Err(err) => {
+                write_http_response_async(
+                    stream,
+                    "500 Internal Server Error",
+                    "text/plain; charset=utf-8",
+                    err.to_string().as_bytes(),
+                )
+                .await
+            }
         }
     }
 
@@ -1386,11 +1423,30 @@ impl BalanceDnsRuntime {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Missing upstream addr"))?
             .parse()
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid upstream addr"))?;
-        let pool_idx = self.udp_socket_rr_counter.fetch_add(1, Ordering::Relaxed)
-            % self.upstream_udp_sockets.len();
-        let socket = self.upstream_udp_sockets[pool_idx].lock();
 
-        // Serialize request/response per pooled socket to avoid reply mixups under concurrent load.
+        let pool_size = self.upstream_udp_sockets.len();
+        let start_idx = self.udp_socket_rr_counter.fetch_add(1, Ordering::Relaxed) % pool_size;
+
+        for i in 0..pool_size {
+            let idx = (start_idx + i) % pool_size;
+            if let Some(socket) = self.upstream_udp_sockets[idx].try_lock() {
+                return self.query_udp_upstream_with_socket(&socket, remote_addr, query_packet, timeout);
+            }
+        }
+
+        // All pooled sockets are busy, use a temporary one to avoid blocking
+        debug!("UDP upstream socket pool exhausted, using a temporary socket");
+        let socket = bind_upstream_udp_socket()?;
+        self.query_udp_upstream_with_socket(&socket, remote_addr, query_packet, timeout)
+    }
+
+    fn query_udp_upstream_with_socket(
+        &self,
+        socket: &UdpSocket,
+        remote_addr: SocketAddr,
+        query_packet: &[u8],
+        timeout: StdDuration,
+    ) -> io::Result<Vec<u8>> {
         socket.set_read_timeout(Some(timeout))?;
         socket.set_write_timeout(Some(timeout))?;
         socket.send_to(query_packet, remote_addr)?;
@@ -1398,7 +1454,14 @@ impl BalanceDnsRuntime {
         let deadline = Instant::now() + timeout;
         let mut buf = [0u8; 65535];
         loop {
-            let remaining_timeout = deadline.saturating_duration_since(Instant::now());
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Timed out while waiting for UDP upstream response",
+                ));
+            }
+            let remaining_timeout = deadline.duration_since(now);
             socket.set_read_timeout(Some(remaining_timeout))?;
             match socket.recv_from(&mut buf) {
                 Ok((len, addr)) if addr == remote_addr => return Ok(buf[..len].to_vec()),
@@ -1407,12 +1470,6 @@ impl BalanceDnsRuntime {
                         "Ignoring UDP response from unexpected sender {} (expected {})",
                         addr, remote_addr
                     );
-                    if remaining_timeout.is_zero() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "Timed out while waiting for UDP upstream response",
-                        ));
-                    }
                 }
                 Err(err) => return Err(err),
             }
@@ -2214,6 +2271,112 @@ fn write_http_response<S: Write>(
     )?;
     stream.write_all(body)?;
     stream.flush()
+}
+
+async fn write_http_response_async<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> io::Result<()> {
+    let header = format!(
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        content_type,
+        body.len()
+    );
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.flush().await
+}
+
+async fn read_http_request_async<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<HttpRequest> {
+    let mut raw = Vec::with_capacity(4096);
+    let mut buf = [0u8; 4096];
+    let header_end_pos;
+    loop {
+        let count = stream.read(&mut buf).await?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Unexpected EOF while reading HTTP headers",
+            ));
+        }
+        raw.extend_from_slice(&buf[..count]);
+        if raw.len() > 65_536 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HTTP headers are too large",
+            ));
+        }
+        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            header_end_pos = Some(pos + 4);
+            break;
+        }
+    }
+    // Split header from any body bytes that were read along with the last chunk
+    let header_end = header_end_pos.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HTTP request headers malformed: no header terminator found",
+        )
+    })?;
+    let extra_body_bytes = raw.split_off(header_end);
+    let header_text = String::from_utf8(raw).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HTTP request headers are not valid UTF-8",
+        )
+    })?;
+    let mut lines = header_text.split("\r\n").filter(|line| !line.is_empty());
+    let request_line = lines
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing HTTP request line"))?;
+    let mut request_parts = request_line.split_whitespace();
+    let method = request_parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing HTTP method"))?
+        .to_owned();
+    let target = request_parts
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing HTTP target"))?
+        .to_owned();
+    let mut headers = HashMap::new();
+    for line in lines {
+        if let Some(idx) = line.find(':') {
+            headers.insert(
+                line[..idx].trim().to_ascii_lowercase(),
+                line[idx + 1..].trim().to_owned(),
+            );
+        }
+    }
+    let content_length = headers
+        .get("content-length")
+        .and_then(|x| x.parse::<usize>().ok())
+        .unwrap_or(0);
+    if content_length > DOH_MAX_BODY_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "Content-Length {} exceeds maximum allowed size {}",
+                content_length, DOH_MAX_BODY_SIZE
+            ),
+        ));
+    }
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        let already_read = extra_body_bytes.len().min(content_length);
+        body[..already_read].copy_from_slice(&extra_body_bytes[..already_read]);
+        if already_read < content_length {
+            stream.read_exact(&mut body[already_read..]).await?;
+        }
+    }
+    Ok(HttpRequest {
+        method,
+        target,
+        headers,
+        body,
+    })
 }
 
 #[cfg(test)]
