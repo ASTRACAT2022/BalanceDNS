@@ -356,14 +356,21 @@ impl fmt::Display for NormalizedQuestion {
         let mut offset: usize = 0;
         while offset < qname_len {
             let label_len = qname[offset] as usize;
-            assert_eq!(label_len, 0);
+            if label_len == 0 {
+                break;
+            }
             if label_len & 0xc0 == 0xc0 {
                 res.push(b'&');
                 offset += 2;
                 continue;
             }
             offset += 1;
-            res.extend_from_slice(&qname[offset..offset + label_len]);
+            let label_end = offset + label_len;
+            if label_end > qname_len {
+                res.extend_from_slice(b"<malformed>");
+                break;
+            }
+            res.extend_from_slice(&qname[offset..label_end]);
             res.push(b'.');
             offset += label_len;
         }
@@ -404,13 +411,24 @@ pub fn qname_lc(qname: &[u8]) -> Vec<u8> {
     while offset < qname_len {
         res[offset] = qname[offset];
         let label_len = qname[offset] as usize;
-        assert_ne!(label_len, 0);
+        if label_len == 0 {
+            break;
+        }
         if label_len & 0xc0 == 0xc0 {
+            if offset + 2 > qname_len {
+                break;
+            }
+            if offset + 1 < qname_len {
+                res[offset + 1] = qname[offset + 1];
+            }
             offset += 2;
             continue;
         }
         offset += 1;
         for i in 0..label_len {
+            if offset + i >= qname_len {
+                return res;
+            }
             res[offset + i] = match qname[offset + i] {
                 c @ 0x41..=0x5a => c | 0x20,
                 c => c,
@@ -944,4 +962,66 @@ pub fn build_address_packet(
     packet.push(rdata_len as u8);
     packet.extend_from_slice(&rdata);
     Ok(packet)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_qname_lc_malformed() {
+        // Label length exceeds packet
+        let qname = vec![10, b'a', b'b', b'c'];
+        let res = qname_lc(&qname);
+        assert_eq!(res.len(), qname.len());
+        assert_eq!(res[0], 10);
+        assert_eq!(res[1], b'a');
+
+        // Compressed label at end of short packet
+        let qname = vec![0xc0];
+        let res = qname_lc(&qname);
+        assert_eq!(res, vec![0xc0]);
+    }
+
+    #[test]
+    fn test_display_normalized_question_malformed() {
+        let q = NormalizedQuestion {
+            qname: vec![10, b'a', b'b', b'c'], // Malformed: label length 10 but only 3 bytes follow
+            tid: 0x1234,
+            flags: 0,
+            payload_size: 512,
+            qtype: DNS_TYPE_A,
+            qclass: DNS_CLASS_IN,
+            labels_count: 1,
+            dnssec: false,
+        };
+        let s = format!("{}", q);
+        assert!(s.contains("<malformed>"));
+    }
+
+    #[test]
+    fn test_qname_lc_valid() {
+        let qname = b"\x07example\x03com\x00";
+        let res = qname_lc(qname);
+        assert_eq!(res, b"\x07example\x03com\x00");
+
+        let qname_upper = b"\x07ExAmPlE\x03CoM\x00";
+        let res = qname_lc(qname_upper);
+        assert_eq!(res, b"\x07example\x03com\x00");
+    }
+
+    #[test]
+    fn test_overwrite_qname() {
+        let mut packet = vec![0u8; 64];
+        set_qdcount(&mut packet, 1);
+        packet[DNS_OFFSET_QUESTION] = 3;
+        packet[DNS_OFFSET_QUESTION + 1] = b'a';
+        packet[DNS_OFFSET_QUESTION + 2] = b'b';
+        packet[DNS_OFFSET_QUESTION + 3] = b'c';
+        packet[DNS_OFFSET_QUESTION + 4] = 0;
+
+        let new_qname = b"\x03foo";
+        overwrite_qname(&mut packet, new_qname);
+        assert_eq!(&packet[DNS_OFFSET_QUESTION..DNS_OFFSET_QUESTION + 4], b"\x03foo");
+    }
 }
