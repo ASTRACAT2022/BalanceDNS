@@ -50,7 +50,7 @@ return {
     },
 
     hosts_remote = {
-        url = "https://raw.githubusercontent.com/ASTRACAT2022/host-DNS/refs/heads/main/bypass",
+        url = "https://raw.githubusercontent.com/ASTRACAT2022/host-DNS/main/bypass",
         refresh_seconds = 3600,
         ttl_seconds = 3600,
     },

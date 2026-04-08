@@ -328,6 +328,7 @@ impl BalanceDnsRuntime {
     }
 
     pub fn run(self: &Arc<Self>) -> io::Result<()> {
+        self.log_initialization_summary();
         self.prime_remote_data_in_memory();
         self.spawn_refreshers();
         let mut handles = Vec::new();
@@ -361,34 +362,94 @@ impl BalanceDnsRuntime {
 
     fn spawn_refreshers(self: &Arc<Self>) {
         if self.config.hosts_remote.is_some() {
+            let config = self.config.hosts_remote.as_ref().unwrap();
+            info!(
+                "Remote hosts refresh enabled: url={}, refresh_seconds={}, ttl_seconds={}",
+                config.url, config.refresh_seconds, config.ttl_seconds
+            );
             let runtime = self.clone();
             match thread::Builder::new()
                 .name("remote_hosts_refresh".to_string())
                 .spawn(move || {
                     runtime.refresh_remote_snapshot_loop(RemoteRefreshKind::Hosts);
                 }) {
-                Ok(_) => {}
+                Ok(_) => info!("Remote hosts refresh thread started"),
                 Err(e) => error!("Failed to spawn remote hosts refresh thread: {}", e),
             }
+        } else {
+            info!("Remote hosts refresh disabled");
         }
         if self.config.blocklist_remote.is_some() {
+            let config = self.config.blocklist_remote.as_ref().unwrap();
+            info!(
+                "Remote blocklist refresh enabled: url={}, refresh_seconds={}",
+                config.url, config.refresh_seconds
+            );
             let runtime = self.clone();
             match thread::Builder::new()
                 .name("remote_blocklist_refresh".to_string())
                 .spawn(move || {
                     runtime.refresh_remote_snapshot_loop(RemoteRefreshKind::Blocklist);
                 }) {
-                Ok(_) => {}
+                Ok(_) => info!("Remote blocklist refresh thread started"),
                 Err(e) => error!("Failed to spawn blocklist refresh thread: {}", e),
             }
+        } else {
+            info!("Remote blocklist refresh disabled");
         }
     }
 
     fn prime_remote_data_in_memory(&self) {
         self.load_remote_hosts_snapshot();
         self.load_remote_blocklist_snapshot();
-        self.refresh_remote_snapshot_once(RemoteRefreshKind::Hosts);
-        self.refresh_remote_snapshot_once(RemoteRefreshKind::Blocklist);
+        if self.config.hosts_remote.is_some() {
+            self.refresh_remote_snapshot_once(RemoteRefreshKind::Hosts);
+        }
+        if self.config.blocklist_remote.is_some() {
+            self.refresh_remote_snapshot_once(RemoteRefreshKind::Blocklist);
+        }
+    }
+
+    fn log_initialization_summary(&self) {
+        let plugin_stats = self.plugins.stats();
+        info!(
+            "Initialization: listeners udp={} tcp={} dot={} doh={} metrics={}",
+            self.config.udp_listen_addr.is_some(),
+            self.config.tcp_listen_addr.is_some(),
+            self.config.dot_listen_addr.is_some(),
+            self.config.doh_listen_addr.is_some(),
+            self.config.webservice_enabled
+        );
+        info!(
+            "Initialization: cache enabled={} max_size={} ttl={} min_ttl={} max_ttl={} stale_refresh={}",
+            self.config.cache_enabled,
+            self.config.cache_size,
+            self.config.cache_ttl_seconds,
+            self.config.min_ttl,
+            self.config.max_ttl,
+            self.config.stale_refresh_enabled
+        );
+        info!(
+            "Initialization: upstreams={} routing_rules={} udp_socket_pool={}",
+            self.config.upstreams.len(),
+            self.routing_rules.len(),
+            self.upstream_udp_sockets.len()
+        );
+        info!(
+            "Initialization: policies local_hosts={} remote_hosts={} remote_blocklist={} deny_any={} deny_dnskey={}",
+            self.local_hosts.len(),
+            self.config.hosts_remote.is_some(),
+            self.config.blocklist_remote.is_some(),
+            self.config.deny_any,
+            self.config.deny_dnskey
+        );
+        info!(
+            "Initialization: plugins native={} lua={} wasm={} total={}",
+            plugin_stats.native,
+            plugin_stats.lua,
+            plugin_stats.wasm,
+            plugin_stats.native + plugin_stats.lua + plugin_stats.wasm
+        );
     }
 
     fn spawn_udp_listener(

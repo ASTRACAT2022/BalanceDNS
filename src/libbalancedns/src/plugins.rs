@@ -45,6 +45,13 @@ pub struct PluginManager {
     components: Vec<PluginComponent>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PluginStats {
+    pub native: usize,
+    pub lua: usize,
+    pub wasm: usize,
+}
+
 impl PluginManager {
     pub fn from_config(
         plugin_paths: &[String],
@@ -86,12 +93,33 @@ impl PluginManager {
             }
         }
 
-        PluginManager { components }
+        let manager = PluginManager { components };
+        let stats = manager.stats();
+        info!(
+            "Plugin pipeline initialized: native={}, lua={}, wasm={}, total={}",
+            stats.native,
+            stats.lua,
+            stats.wasm,
+            stats.native + stats.lua + stats.wasm
+        );
+        manager
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.components.is_empty()
+    }
+
+    pub fn stats(&self) -> PluginStats {
+        let mut stats = PluginStats::default();
+        for component in &self.components {
+            match component {
+                PluginComponent::Native(_) => stats.native += 1,
+                PluginComponent::Lua(_) => stats.lua += 1,
+                PluginComponent::Wasm(_, _) => stats.wasm += 1,
+            }
+        }
+        stats
     }
 
     pub fn apply_pre_query(&self, packet: &[u8]) -> Option<PacketAction> {
