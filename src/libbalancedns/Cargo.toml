@@ -6,6 +6,7 @@ publish = false
 edition = "2018"
 
 [dependencies]
+anyhow = "1"
 base64 = "*"
 caches = "0.3.0"
 clippy = {version = "*", optional = true}

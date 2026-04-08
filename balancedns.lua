@@ -86,6 +86,20 @@ return {
         },
     },
 
+    wasm = {
+        sandbox = {
+            max_packet_bytes = 4096,
+            disable_after_failures = 8,
+        },
+
+        components = {
+            --{
+            --    path = "/var/lib/balancedns/wasm/remote_hosts_plugin.wasm",
+            --    enabled = true,
+            --},
+        },
+    },
+
     upstreams = {
         {
             name = "upstream-1",

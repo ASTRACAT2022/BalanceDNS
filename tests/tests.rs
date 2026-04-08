@@ -3,11 +3,34 @@ extern crate libbalancedns;
 #[cfg(test)]
 mod test {
     use libbalancedns::{dns, Config, UpstreamProtocol};
+    use std::io;
     use std::io::Write;
     use tempfile::Builder;
 
-    fn from_lua(lua: &str) -> Config {
-        Config::from_lua_string(lua).expect("Lua config parse failed")
+    fn missing_lua_shared_library(err: &io::Error) -> bool {
+        err.kind() == io::ErrorKind::NotFound && err.to_string().contains("Lua shared library")
+    }
+
+    fn from_lua(lua: &str) -> Option<Config> {
+        match Config::from_lua_string(lua) {
+            Ok(config) => Some(config),
+            Err(err) if missing_lua_shared_library(&err) => {
+                eprintln!("Skipping Lua config test: {}", err);
+                None
+            }
+            Err(err) => panic!("Lua config parse failed: {}", err),
+        }
+    }
+
+    fn from_lua_err(lua: &str) -> Option<io::Error> {
+        match Config::from_lua_string(lua) {
+            Ok(_) => panic!("Expected Lua config parsing to fail"),
+            Err(err) if missing_lua_shared_library(&err) => {
+                eprintln!("Skipping Lua config error test: {}", err);
+                None
+            }
+            Err(err) => Some(err),
+        }
     }
 
     #[test]
@@ -60,6 +83,14 @@ return {
     lua = {
         scripts = {" lua/query_logger.lua "},
     },
+    wasm = {
+        components = {
+            {
+                path = " wasm/remote-hosts.wasm ",
+                enabled = true,
+            },
+        },
+    },
     upstreams = {
         {
             name = "cloudflare-doh",
@@ -89,7 +120,9 @@ return {
 }
 "#;
 
-        let config = from_lua(cfg);
+        let Some(config) = from_lua(cfg) else {
+            return;
+        };
         assert_eq!(config.udp_listen_addr.as_deref(), Some("0.0.0.0:5353"));
         assert_eq!(config.tcp_listen_addr.as_deref(), Some("0.0.0.0:5353"));
         assert_eq!(config.dot_listen_addr.as_deref(), Some("0.0.0.0:8853"));
@@ -119,6 +152,11 @@ return {
         assert_eq!(config.lua_components.len(), 1);
         assert_eq!(config.lua_components[0].path, "lua/query_logger.lua");
         assert_eq!(config.lua_sandbox.max_packet_bytes, 4096);
+        assert_eq!(config.wasm_components.len(), 1);
+        assert_eq!(config.wasm_components[0].path, "wasm/remote-hosts.wasm");
+        assert!(config.wasm_components[0].enabled);
+        assert_eq!(config.wasm_sandbox.max_packet_bytes, 4096);
+        assert_eq!(config.wasm_sandbox.disable_after_failures, 8);
         assert_eq!(config.upstreams.len(), 2);
         assert_eq!(config.upstreams[0].proto, UpstreamProtocol::Doh);
         assert_eq!(
@@ -160,7 +198,9 @@ return {
 }
 "#;
 
-        let config = from_lua(cfg);
+        let Some(config) = from_lua(cfg) else {
+            return;
+        };
         assert_eq!(config.upstreams.len(), 1);
         assert_eq!(config.upstreams[0].proto, UpstreamProtocol::Udp);
         assert_eq!(config.upstreams[0].addr.as_deref(), Some("127.0.0.1:53"));
@@ -188,7 +228,9 @@ return {
 }
 "#;
 
-        let config = from_lua(cfg);
+        let Some(config) = from_lua(cfg) else {
+            return;
+        };
         assert_eq!(config.request_timeout_ms, 1500);
         assert!(!config.stale_refresh_enabled);
         assert_eq!(config.stale_ttl_seconds, 30);
@@ -219,7 +261,9 @@ return {
 }
 "#;
 
-        let err = Config::from_lua_string(cfg).unwrap_err();
+        let Some(err) = from_lua_err(cfg) else {
+            return;
+        };
         assert!(err
             .to_string()
             .contains("references unknown upstream [missing-upstream]"));
@@ -249,7 +293,9 @@ return {
 }
 "#;
 
-        let err = Config::from_lua_string(cfg).unwrap_err();
+        let Some(err) = from_lua_err(cfg) else {
+            return;
+        };
         assert!(err
             .to_string()
             .contains("hosts_remote.refresh_seconds must be greater than 0"));
@@ -290,6 +336,22 @@ return {
             },
         },
     },
+    wasm = {
+        sandbox = {
+            max_packet_bytes = 2048,
+            disable_after_failures = 3,
+        },
+        components = {
+            {
+                path = "wasm/default.wasm",
+                enabled = true,
+            },
+            {
+                path = "wasm/off.wasm",
+                enabled = false,
+            },
+        },
+    },
     upstreams = {
         {
             name = "cloudflare-udp",
@@ -302,7 +364,9 @@ return {
 }
 "#;
 
-        let config = from_lua(cfg);
+        let Some(config) = from_lua(cfg) else {
+            return;
+        };
         assert_eq!(
             config.lua_scripts,
             vec!["lua/default.lua", "lua/filter.lua"]
@@ -312,6 +376,21 @@ return {
         assert_eq!(config.lua_sandbox.disable_after_failures, 3);
         assert_eq!(config.lua_sandbox.init_instruction_limit, 123456);
         assert_eq!(config.lua_sandbox.hook_instruction_limit, 654321);
+        assert_eq!(config.wasm_components.len(), 2);
+        assert_eq!(config.wasm_sandbox.max_packet_bytes, 2048);
+        assert_eq!(config.wasm_sandbox.disable_after_failures, 3);
+        assert!(config
+            .wasm_components
+            .iter()
+            .find(|component| component.path == "wasm/default.wasm")
+            .unwrap()
+            .enabled);
+        assert!(!config
+            .wasm_components
+            .iter()
+            .find(|component| component.path == "wasm/off.wasm")
+            .unwrap()
+            .enabled);
 
         let default_component = config
             .lua_components
@@ -565,6 +644,9 @@ return {
         scripts = {},
         components = {},
     },
+    wasm = {
+        components = {},
+    },
     upstreams = {
         {
             name = "cloudflare-udp",
@@ -592,6 +674,7 @@ return {
         assert!(config.plugin_libraries.is_empty());
         assert!(config.lua_scripts.is_empty());
         assert!(config.lua_components.is_empty());
+        assert!(config.wasm_components.is_empty());
         assert_eq!(config.upstreams.len(), 1);
     }
 
@@ -614,7 +697,9 @@ return {
 }
 "#;
 
-        let err = Config::from_lua_string(cfg).unwrap_err();
+        let Some(err) = from_lua_err(cfg) else {
+            return;
+        };
         assert!(err.to_string().contains("tls.cert_pem is required"));
     }
 

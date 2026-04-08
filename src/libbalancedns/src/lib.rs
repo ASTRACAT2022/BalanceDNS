@@ -31,7 +31,7 @@ mod worker;
 use balancedns_runtime::BalanceDnsRuntime;
 pub use config::{
     Config, LuaComponentConfig, LuaSandboxConfig, RemoteBlocklistConfig, RemoteHostsConfig,
-    UpstreamConfig, UpstreamProtocol,
+    UpstreamConfig, UpstreamProtocol, WasmComponentConfig, WasmSandboxConfig,
 };
 use privdrop::PrivDrop;
 pub use remote_refresh::{run_remote_refresh_helper, RemoteRefreshKind};

@@ -5,6 +5,7 @@ use crate::dns;
 use crate::odoh::OdohServer;
 use crate::plugins::PluginManager;
 use crate::remote_refresh::RemoteRefreshKind;
+use crate::sandbox::WasmHostContext;
 use crate::server::Frame;
 use crate::varz::Varz;
 use crate::worker::Worker;
@@ -84,7 +85,7 @@ pub struct BalanceDnsRuntime {
     pub(crate) conductor: Conductor,
     pub(crate) worker: Worker,
     pub(crate) local_hosts: HashMap<String, IpAddr>,
-    pub(crate) remote_hosts: RwLock<HashMap<String, IpAddr>>,
+    pub(crate) remote_hosts: Arc<RwLock<HashMap<String, IpAddr>>>,
     pub(crate) remote_blocklist: RwLock<HashSet<String>>,
     pub(crate) routing_rules: Vec<RuntimeRoutingRule>,
     pub(crate) upstream_selection: UpstreamSelectionState,
@@ -246,6 +247,7 @@ impl BalanceDnsRuntime {
             .iter()
             .filter_map(|(name, ip)| ip.parse().ok().map(|ip| (name.clone(), ip)))
             .collect::<HashMap<String, IpAddr>>();
+        let remote_hosts = Arc::new(RwLock::new(HashMap::new()));
         let routing_rules = compile_routing_rules(&config.routing_rules, &config.upstreams);
         let upstream_selection = UpstreamSelectionState::new(&config.upstreams);
         let http_client = Client::builder()
@@ -286,6 +288,16 @@ impl BalanceDnsRuntime {
         crate::lua_plugin::set_global_cache(cache.clone());
         let conductor = Conductor::new(config.clone(), varz.clone());
         let worker = Worker::new();
+        let remote_hosts_ttl = config
+            .hosts_remote
+            .as_ref()
+            .map_or(config.cache_ttl_seconds, |cfg| cfg.ttl_seconds);
+        let wasm_host = Arc::new(WasmHostContext::new(
+            local_hosts.clone(),
+            remote_hosts.clone(),
+            config.cache_ttl_seconds,
+            remote_hosts_ttl,
+        ));
 
         Ok(Arc::new(BalanceDnsRuntime {
             cache,
@@ -293,7 +305,7 @@ impl BalanceDnsRuntime {
             worker,
             config: config.clone(),
             local_hosts,
-            remote_hosts: RwLock::new(HashMap::new()),
+            remote_hosts,
             remote_blocklist: RwLock::new(HashSet::new()),
             routing_rules,
             upstream_selection,
@@ -301,6 +313,9 @@ impl BalanceDnsRuntime {
                 &config.plugin_libraries,
                 &config.lua_components,
                 &config.lua_sandbox,
+                &config.wasm_components,
+                &config.wasm_sandbox,
+                wasm_host,
             ),
             rr_counter: AtomicUsize::new(0),
             udp_socket_rr_counter: AtomicUsize::new(0),

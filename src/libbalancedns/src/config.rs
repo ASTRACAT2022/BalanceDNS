@@ -69,6 +69,18 @@ pub struct LuaComponentConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct WasmSandboxConfig {
+    pub max_packet_bytes: usize,
+    pub disable_after_failures: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct WasmComponentConfig {
+    pub path: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct Config {
     pub decrement_ttl: bool,
     pub upstream_servers: Vec<String>,
@@ -119,6 +131,8 @@ pub struct Config {
     pub lua_scripts: Vec<String>,
     pub lua_components: Vec<LuaComponentConfig>,
     pub lua_sandbox: LuaSandboxConfig,
+    pub wasm_components: Vec<WasmComponentConfig>,
+    pub wasm_sandbox: WasmSandboxConfig,
     pub routing_rules: Vec<RoutingRuleConfig>,
 }
 
@@ -212,6 +226,16 @@ impl Config {
         if config.lua_sandbox.hook_instruction_limit == 0 {
             return Err(invalid_data(
                 "lua.sandbox.hook_instruction_limit must be greater than 0",
+            ));
+        }
+        if config.wasm_sandbox.max_packet_bytes == 0 {
+            return Err(invalid_data(
+                "wasm.sandbox.max_packet_bytes must be greater than 0",
+            ));
+        }
+        if config.wasm_sandbox.disable_after_failures == 0 {
+            return Err(invalid_data(
+                "wasm.sandbox.disable_after_failures must be greater than 0",
             ));
         }
         if let Some(hosts_remote) = &config.hosts_remote {
@@ -318,6 +342,7 @@ impl Config {
         let config_blocklist_remote = get_table(&toml_config, "blocklist_remote");
         let config_plugins = get_table(&toml_config, "plugins");
         let config_lua = get_table(&toml_config, "lua");
+        let config_wasm = get_table(&toml_config, "wasm");
         let config_global = get_table(&toml_config, "global");
 
         let udp_listen_addr = get_string(config_server, "udp_listen");
@@ -388,6 +413,7 @@ impl Config {
         let blocklist_remote = parse_remote_blocklist_config(config_blocklist_remote)?;
         let plugin_libraries = get_string_array(config_plugins, "libraries", "plugins.libraries")?;
         let (lua_scripts, lua_components, lua_sandbox) = parse_lua_config(config_lua)?;
+        let (wasm_components, wasm_sandbox) = parse_wasm_config(config_wasm)?;
         let routing_rules = parse_routing_rules(&toml_config)?;
 
         let user = get_string(config_global, "user");
@@ -539,6 +565,8 @@ impl Config {
             lua_scripts,
             lua_components,
             lua_sandbox,
+            wasm_components,
+            wasm_sandbox,
             routing_rules,
         })
     }
@@ -690,6 +718,8 @@ impl Config {
             lua_scripts: Vec::new(),
             lua_components: Vec::new(),
             lua_sandbox: default_lua_sandbox_config(),
+            wasm_components: Vec::new(),
+            wasm_sandbox: default_wasm_sandbox_config(),
             routing_rules: Vec::new(),
         })
     }
@@ -903,7 +933,83 @@ fn default_lua_sandbox_config() -> LuaSandboxConfig {
     }
 }
 
+fn parse_wasm_config(
+    table: Option<&TomlTable>,
+) -> Result<(Vec<WasmComponentConfig>, WasmSandboxConfig), Error> {
+    let Some(table) = table else {
+        return Ok((Vec::new(), default_wasm_sandbox_config()));
+    };
+
+    let sandbox = match table.get("sandbox") {
+        Some(Value::Table(sandbox)) => parse_wasm_sandbox_config(Some(sandbox))?,
+        Some(_) => return Err(invalid_data("wasm.sandbox must be a table")),
+        None => default_wasm_sandbox_config(),
+    };
+
+    let mut components = Vec::new();
+    if let Some(component_values) = table.get("components") {
+        let component_values = component_values
+            .as_array()
+            .ok_or_else(|| invalid_data("wasm.components must be an array of tables"))?;
+        for component_value in component_values {
+            let component_table = component_value
+                .as_table()
+                .ok_or_else(|| invalid_data("Each wasm.components entry must be a table"))?;
+            let path = get_required_string(
+                component_table,
+                "path",
+                "wasm.components.path must be a string",
+            )?;
+            let enabled = get_bool(
+                Some(component_table),
+                "enabled",
+                true,
+                "wasm.components.enabled",
+            )?;
+            upsert_wasm_component(&mut components, WasmComponentConfig { path, enabled });
+        }
+    }
+
+    Ok((components, sandbox))
+}
+
+fn parse_wasm_sandbox_config(table: Option<&TomlTable>) -> Result<WasmSandboxConfig, Error> {
+    let defaults = default_wasm_sandbox_config();
+    Ok(WasmSandboxConfig {
+        max_packet_bytes: get_usize(
+            table,
+            "max_packet_bytes",
+            defaults.max_packet_bytes,
+            "wasm.sandbox.max_packet_bytes",
+        )?,
+        disable_after_failures: get_usize(
+            table,
+            "disable_after_failures",
+            defaults.disable_after_failures,
+            "wasm.sandbox.disable_after_failures",
+        )?,
+    })
+}
+
+fn default_wasm_sandbox_config() -> WasmSandboxConfig {
+    WasmSandboxConfig {
+        max_packet_bytes: 4096,
+        disable_after_failures: 8,
+    }
+}
+
 fn upsert_lua_component(components: &mut Vec<LuaComponentConfig>, component: LuaComponentConfig) {
+    if let Some(existing) = components
+        .iter_mut()
+        .find(|existing| existing.path == component.path)
+    {
+        *existing = component;
+    } else {
+        components.push(component);
+    }
+}
+
+fn upsert_wasm_component(components: &mut Vec<WasmComponentConfig>, component: WasmComponentConfig) {
     if let Some(existing) = components
         .iter_mut()
         .find(|existing| existing.path == component.path)
@@ -936,6 +1042,7 @@ fn normalize_lua_empty_arrays(value: &mut Value) {
     coerce_empty_table_to_array_at(value, &["plugins", "libraries"]);
     coerce_empty_table_to_array_at(value, &["lua", "scripts"]);
     coerce_empty_table_to_array_at(value, &["lua", "components"]);
+    coerce_empty_table_to_array_at(value, &["wasm", "components"]);
     coerce_empty_table_to_array_at(value, &["upstreams"]);
     coerce_empty_table_to_array_at(value, &["routing_rules"]);
 }

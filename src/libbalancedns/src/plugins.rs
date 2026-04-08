@@ -1,8 +1,11 @@
-use crate::config::{LuaComponentConfig, LuaSandboxConfig};
+use crate::config::{
+    LuaComponentConfig, LuaSandboxConfig, WasmComponentConfig, WasmSandboxConfig,
+};
 use crate::dns;
 use crate::lua_plugin::{HookOutcome, LuaScriptEngine};
-use crate::sandbox::Sandbox;
+use crate::sandbox::{Sandbox, WasmHostContext, WasmPacketStatus};
 use libloading::Library;
+use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -32,13 +35,23 @@ pub struct PluginLibrary {
     consecutive_failures: AtomicUsize,
 }
 
+pub struct WasmPlugin {
+    path: String,
+    sandbox: Arc<Sandbox>,
+    wasm_bytes: Vec<u8>,
+    disabled: AtomicBool,
+    consecutive_failures: AtomicUsize,
+    max_packet_bytes: usize,
+    failure_disable_threshold: usize,
+}
+
 unsafe impl Send for PluginLibrary {}
 unsafe impl Sync for PluginLibrary {}
 
 enum PluginComponent {
     Native(PluginLibrary),
     Lua(LuaScriptEngine),
-    Wasm(Arc<Sandbox>, Vec<u8>),
+    Wasm(WasmPlugin),
 }
 
 pub struct PluginManager {
@@ -57,6 +70,9 @@ impl PluginManager {
         plugin_paths: &[String],
         lua_components: &[LuaComponentConfig],
         lua_sandbox: &LuaSandboxConfig,
+        wasm_components: &[WasmComponentConfig],
+        wasm_sandbox: &WasmSandboxConfig,
+        wasm_host: Arc<WasmHostContext>,
     ) -> Self {
         let mut components = Vec::new();
 
@@ -93,6 +109,23 @@ impl PluginManager {
             }
         }
 
+        let wasm_runtime = Arc::new(Sandbox::new(wasm_host));
+        for component in wasm_components {
+            if !component.enabled {
+                info!("Skipping disabled Wasm component [{}]", component.path);
+                continue;
+            }
+            match WasmPlugin::from_config(component, wasm_sandbox, wasm_runtime.clone()) {
+                Ok(plugin) => {
+                    info!("Loaded Wasm component [{}]", component.path);
+                    components.push(PluginComponent::Wasm(plugin));
+                }
+                Err(err) => {
+                    error!("Unable to load Wasm component [{}]: {}", component.path, err);
+                }
+            }
+        }
+
         let manager = PluginManager { components };
         let stats = manager.stats();
         info!(
@@ -116,7 +149,7 @@ impl PluginManager {
             match component {
                 PluginComponent::Native(_) => stats.native += 1,
                 PluginComponent::Lua(_) => stats.lua += 1,
-                PluginComponent::Wasm(_, _) => stats.wasm += 1,
+                PluginComponent::Wasm(_) => stats.wasm += 1,
             }
         }
         stats
@@ -166,10 +199,9 @@ impl PluginComponent {
                 plugin.call_hook_safe(b"balancedns_plugin_pre_query", packet)
             }
             PluginComponent::Lua(script) => script.apply_pre_query(packet).map(map_lua_outcome),
-            PluginComponent::Wasm(sandbox, wasm_bytes) => sandbox
-                .run_plugin(wasm_bytes, packet)
-                .ok()
-                .map(PacketAction::Continue),
+            PluginComponent::Wasm(plugin) => {
+                plugin.call_hook_safe("balancedns_plugin_pre_query", packet)
+            }
         }
     }
 
@@ -179,10 +211,9 @@ impl PluginComponent {
                 plugin.call_hook_safe(b"balancedns_plugin_post_response", packet)
             }
             PluginComponent::Lua(script) => script.apply_post_response(packet).map(map_lua_outcome),
-            PluginComponent::Wasm(sandbox, wasm_bytes) => sandbox
-                .run_plugin(wasm_bytes, packet)
-                .ok()
-                .map(PacketAction::Continue),
+            PluginComponent::Wasm(plugin) => {
+                plugin.call_hook_safe("balancedns_plugin_post_response", packet)
+            }
         }
     }
 }
@@ -300,6 +331,83 @@ impl PluginLibrary {
             error!(
                 "Native component [{}] failed (#{}/{}): {}",
                 self.path, failures, COMPONENT_FAILURE_DISABLE_THRESHOLD, message
+            );
+        }
+    }
+}
+
+impl WasmPlugin {
+    fn from_config(
+        component: &WasmComponentConfig,
+        sandbox: &WasmSandboxConfig,
+        runtime: Arc<Sandbox>,
+    ) -> std::io::Result<Self> {
+        let wasm_bytes = fs::read(&component.path)?;
+        Ok(Self {
+            path: component.path.clone(),
+            sandbox: runtime,
+            wasm_bytes,
+            disabled: AtomicBool::new(false),
+            consecutive_failures: AtomicUsize::new(0),
+            max_packet_bytes: sandbox.max_packet_bytes.min(dns::DNS_MAX_PACKET_SIZE),
+            failure_disable_threshold: sandbox.disable_after_failures,
+        })
+    }
+
+    #[inline]
+    fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::Relaxed)
+    }
+
+    fn call_hook_safe(&self, export_name: &str, packet: &[u8]) -> Option<PacketAction> {
+        if self.is_disabled() {
+            return None;
+        }
+        if packet.len() > self.max_packet_bytes {
+            self.record_failure("input packet exceeds Wasm sandbox limit");
+            return None;
+        }
+
+        match self.sandbox.run_plugin(&self.wasm_bytes, export_name, packet) {
+            Ok(None) => {
+                self.record_success();
+                None
+            }
+            Ok(Some(outcome)) => {
+                if outcome.packet.len() > self.max_packet_bytes {
+                    self.record_failure("Wasm component output exceeds sandbox limit");
+                    return None;
+                }
+                self.record_success();
+                Some(match outcome.status {
+                    WasmPacketStatus::Continue => PacketAction::Continue(outcome.packet),
+                    WasmPacketStatus::Respond => PacketAction::Respond(outcome.packet),
+                })
+            }
+            Err(err) => {
+                self.record_failure(&err.to_string());
+                None
+            }
+        }
+    }
+
+    fn record_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    fn record_failure(&self, message: &str) {
+        let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures >= self.failure_disable_threshold {
+            if !self.disabled.swap(true, Ordering::Relaxed) {
+                error!(
+                    "Wasm component [{}] was disabled after {} consecutive failures: {}",
+                    self.path, failures, message
+                );
+            }
+        } else {
+            error!(
+                "Wasm component [{}] failed (#{}/{}): {}",
+                self.path, failures, self.failure_disable_threshold, message
             );
         }
     }
