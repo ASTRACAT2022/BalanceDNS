@@ -126,22 +126,9 @@ impl Config {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Config, Error> {
         let path = path.as_ref();
         let mut fd = File::open(path)?;
-        let mut toml = String::new();
-        fd.read_to_string(&mut toml)?;
-        match path.extension().and_then(|ext| ext.to_str()) {
-            Some("lua") => Self::from_lua_string(&toml),
-            _ => Self::from_string(&toml),
-        }
-    }
-
-    pub fn from_string(toml: &str) -> Result<Config, Error> {
-        let toml_config: Value = toml::from_str(toml).map_err(|err| {
-            invalid_data(format!(
-                "Syntax error - config file is not valid TOML: {}",
-                err
-            ))
-        })?;
-        Self::parse(toml_config)
+        let mut lua = String::new();
+        fd.read_to_string(&mut lua)?;
+        Self::from_lua_string(&lua)
     }
 
     pub fn from_lua_string(lua: &str) -> Result<Config, Error> {

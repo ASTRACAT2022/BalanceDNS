@@ -1,6 +1,8 @@
 use crate::config::{LuaComponentConfig, LuaSandboxConfig};
 use crate::dns;
 use crate::lua_plugin::{HookOutcome, LuaScriptEngine};
+use crate::sandbox::Sandbox;
+use std::sync::Arc;
 use libloading::Library;
 use std::panic::AssertUnwindSafe;
 use std::slice;
@@ -36,6 +38,7 @@ unsafe impl Sync for PluginLibrary {}
 enum PluginComponent {
     Native(PluginLibrary),
     Lua(LuaScriptEngine),
+    Wasm(Arc<Sandbox>, Vec<u8>),
 }
 
 pub struct PluginManager {
@@ -135,6 +138,10 @@ impl PluginComponent {
                 plugin.call_hook_safe(b"balancedns_plugin_pre_query", packet)
             }
             PluginComponent::Lua(script) => script.apply_pre_query(packet).map(map_lua_outcome),
+            PluginComponent::Wasm(sandbox, wasm_bytes) => sandbox
+                .run_plugin(wasm_bytes, packet)
+                .ok()
+                .map(PacketAction::Continue),
         }
     }
 
@@ -144,6 +151,10 @@ impl PluginComponent {
                 plugin.call_hook_safe(b"balancedns_plugin_post_response", packet)
             }
             PluginComponent::Lua(script) => script.apply_post_response(packet).map(map_lua_outcome),
+            PluginComponent::Wasm(sandbox, wasm_bytes) => sandbox
+                .run_plugin(wasm_bytes, packet)
+                .ok()
+                .map(PacketAction::Continue),
         }
     }
 }

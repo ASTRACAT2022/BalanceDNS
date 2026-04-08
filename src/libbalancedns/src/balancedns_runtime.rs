@@ -1,4 +1,6 @@
 use crate::cache::Cache;
+use crate::conductor::Conductor;
+use crate::recursor::Recursor;
 use crate::config::{Config, RoutingRuleConfig, UpstreamConfig, UpstreamProtocol};
 use crate::dns;
 use crate::odoh::OdohServer;
@@ -77,17 +79,19 @@ impl SessionStream for TcpStream {
 }
 
 pub struct BalanceDnsRuntime {
-    config: Config,
-    cache: Cache,
-    local_hosts: HashMap<String, IpAddr>,
-    remote_hosts: RwLock<HashMap<String, IpAddr>>,
-    remote_blocklist: RwLock<HashSet<String>>,
-    routing_rules: Vec<RuntimeRoutingRule>,
-    upstream_selection: UpstreamSelectionState,
-    plugins: PluginManager,
-    rr_counter: AtomicUsize,
-    udp_socket_rr_counter: AtomicUsize,
-    varz: Arc<Varz>,
+    pub(crate) config: Config,
+    pub(crate) cache: Cache,
+    pub(crate) conductor: Conductor,
+    pub(crate) recursor: Recursor,
+    pub(crate) local_hosts: HashMap<String, IpAddr>,
+    pub(crate) remote_hosts: RwLock<HashMap<String, IpAddr>>,
+    pub(crate) remote_blocklist: RwLock<HashSet<String>>,
+    pub(crate) routing_rules: Vec<RuntimeRoutingRule>,
+    pub(crate) upstream_selection: UpstreamSelectionState,
+    pub(crate) plugins: PluginManager,
+    pub(crate) rr_counter: AtomicUsize,
+    pub(crate) udp_socket_rr_counter: AtomicUsize,
+    pub(crate) varz: Arc<Varz>,
     http_client: Client,
     stale_refresh_inflight: Mutex<HashSet<dns::NormalizedQuestionKey>>,
     stale_refresh_active: AtomicUsize,
@@ -99,15 +103,15 @@ pub struct BalanceDnsRuntime {
     async_runtime: tokio::runtime::Runtime,
 }
 
-struct RuntimeRoutingRule {
-    suffix: String,
-    prioritized_indices: Vec<usize>,
+pub(crate) struct RuntimeRoutingRule {
+    pub(crate) suffix: String,
+    pub(crate) prioritized_indices: Vec<usize>,
 }
 
-struct UpstreamSelectionState {
-    cumulative_weights: Vec<usize>,
-    total_weight: usize,
-    fallback_indices: Vec<usize>,
+pub(crate) struct UpstreamSelectionState {
+    pub(crate) cumulative_weights: Vec<usize>,
+    pub(crate) total_weight: usize,
+    pub(crate) fallback_indices: Vec<usize>,
 }
 
 struct TcpConnectionGuard {
@@ -280,9 +284,13 @@ impl BalanceDnsRuntime {
 
         let cache = Cache::new(config.clone())?;
         crate::lua_plugin::set_global_cache(cache.clone());
+        let conductor = Conductor::new(config.clone(), varz.clone());
+        let recursor = Recursor::new();
 
         Ok(Arc::new(BalanceDnsRuntime {
             cache,
+            conductor,
+            recursor,
             config: config.clone(),
             local_hosts,
             remote_hosts: RwLock::new(HashMap::new()),
@@ -1111,7 +1119,7 @@ impl BalanceDnsRuntime {
         }
     }
 
-    fn process_query(self: &Arc<Self>, packet: &[u8]) -> io::Result<Vec<u8>> {
+    pub(crate) fn process_query(self: &Arc<Self>, packet: &[u8]) -> io::Result<Vec<u8>> {
         let _inflight_query = InflightQueryGuard::new(&self.varz);
         let packet = if self.plugins.is_empty() {
             Cow::Borrowed(packet)
@@ -1176,7 +1184,9 @@ impl BalanceDnsRuntime {
             }
         }
 
-        let response = self.resolve_via_upstreams(&normalized_question, &fqdn)?;
+        let response = self.async_runtime.block_on(async {
+            self.recursor.resolve(&normalized_question, &self.conductor, Arc::clone(self)).await
+        })?;
         let response = self.apply_post_response_plugins(response);
         if self.config.cache_enabled {
             let ttl = dns::min_ttl(
@@ -1395,7 +1405,7 @@ impl BalanceDnsRuntime {
         Ok(response)
     }
 
-    fn query_udp_upstream(
+    pub(crate) fn query_udp_upstream(
         &self,
         upstream: &UpstreamConfig,
         query_packet: &[u8],
@@ -1460,7 +1470,7 @@ impl BalanceDnsRuntime {
         }
     }
 
-    fn query_doh_upstream(
+    pub(crate) fn query_doh_upstream(
         &self,
         upstream: &UpstreamConfig,
         query_packet: &[u8],
@@ -1487,7 +1497,7 @@ impl BalanceDnsRuntime {
     }
 
     #[inline]
-    fn ordered_upstream_indices(&self, fqdn: &str) -> Vec<usize> {
+    pub(crate) fn ordered_upstream_indices(&self, fqdn: &str) -> Vec<usize> {
         route_upstream_indices_for_fqdn_compiled(
             fqdn,
             &self.routing_rules,
