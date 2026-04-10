@@ -3,6 +3,8 @@ Description=BalanceDNS DNS proxy (Lua Config)
 After=network.target
 Before=nss-lookup.target
 Wants=balancedns-healthcheck.timer
+StartLimitIntervalSec=300
+StartLimitBurst=100
 
 [Install]
 WantedBy=multi-user.target

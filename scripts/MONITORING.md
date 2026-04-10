@@ -4,8 +4,8 @@
 
 This monitoring system provides automatic health checking and restart capabilities for BalanceDNS:
 
-1. **Systemd Watchdog** - OS-level supervision with automatic restart if the process hangs
-2. **Health Check Timer** - Periodic DNS responsiveness checks every 30 seconds
+1. **Systemd Restart Policy** - OS-level supervision with automatic restart on process exit/failure
+2. **Health Check Timer** - Periodic UDP/DoH/DoT checks every 15 seconds
 3. **Auto-Restart** - Automatic service restart if health checks fail
 4. **Monitoring Dashboard** - Real-time metrics and status display
 5. **Panic Recovery** - Application-level panic guards prevent crashes from killing the server
@@ -26,13 +26,13 @@ This monitoring system provides automatic health checking and restart capabiliti
 └──────────────────────────┼──────────────────────────────────┘
                            │
               ┌────────────┴────────────┐
-              │   systemd Watchdog      │
-              │   (WatchdogSec=60)      │
+              │  systemd Restart Policy │
+              │   (Restart=always)      │
               └────────────┬────────────┘
                            │
               ┌────────────┴────────────┐
               │  Health Check Timer     │
-              │  (every 30 seconds)     │
+              │  (every 15 seconds)     │
               └────────────┬────────────┘
                            │
               ┌────────────┴────────────┐
@@ -46,29 +46,29 @@ This monitoring system provides automatic health checking and restart capabiliti
 ### 1. Systemd Service (balancedns.service)
 
 **Key Features:**
-- `Type=notify` - Service signals readiness to systemd
-- `WatchdogSec=60` - Systemd expects a ping every 60 seconds
+- `Type=simple` - Standard long-running process mode
+- `Restart=always` - Automatic restart if process exits/fails
 - `Restart=always` - Automatic restart on any failure
 - `RestartSec=2` - Wait 2 seconds before restarting
 - Resource limits (memory, file descriptors, tasks)
 
 **What it monitors:**
 - Process crashes
-- Process hangs (no watchdog ping for 60s)
+- Unexpected process exits/failures
 - OOM killer
 - Signal-based termination
 
 ### 2. Health Check Timer (balancedns-healthcheck.timer)
 
 **Key Features:**
-- Runs every 30 seconds
-- Tests DNS resolution on 127.0.0.1:53
+- Runs every 15 seconds
+- Tests UDP, DoH and DoT endpoints
 - Retries 2 times before declaring failure
-- Automatic service restart if unresponsive
-- 10-second cooldown between restarts to prevent restart loops
+- Automatic service restart after consecutive failed runs
+- Cooldown between restarts to prevent restart loops
 
 **What it monitors:**
-- DNS query responsiveness
+- UDP/DoH/DoT query responsiveness
 - Service state (is it running?)
 - Application-level responsiveness
 
@@ -173,28 +173,16 @@ sudo ./scripts/uninstall-monitor.sh
 
 ### Health Check Settings
 
-Edit `/usr/local/bin/balancedns-healthcheck.sh`:
+Edit `/etc/default/balancedns-healthcheck`:
 
 ```bash
-DNS_SERVER="127.0.0.1"           # DNS server to test
-DNS_PORT="53"                     # DNS port
-HEALTHCHECK_TIMEOUT=3             # Query timeout in seconds
-MAX_RETRIES=2                     # Retry attempts before restart
-RESTART_COOLDOWN=10               # Minimum seconds between restarts
-```
-
-### Systemd Watchdog Timeout
-
-Edit `/etc/systemd/system/balancedns.service`:
-
-```ini
-WatchdogSec=60  # Change to adjust watchdog timeout
-```
-
-Then run:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart balancedns
+BALANCEDNS_CHECK_PROTOCOLS=udp,doh,dot
+BALANCEDNS_DNS_SERVER=127.0.0.1
+BALANCEDNS_DNS_PORT=53
+BALANCEDNS_DOH_URL=https://127.0.0.1/dns-query
+BALANCEDNS_DOT_PORT=853
+BALANCEDNS_FAILURE_THRESHOLD=3
+BALANCEDNS_RESTART_COOLDOWN=30
 ```
 
 ### Health Check Frequency
@@ -202,7 +190,7 @@ sudo systemctl restart balancedns
 Edit `/etc/systemd/system/balancedns-healthcheck.timer`:
 
 ```ini
-OnUnitActiveSec=30  # Change to adjust check frequency
+OnUnitActiveSec=15  # Change to adjust check frequency
 ```
 
 Then run:
@@ -255,14 +243,11 @@ If restart loops occur, increase `RESTART_COOLDOWN` in the health check script.
 
 ### Service Hangs
 
-The systemd watchdog should detect and restart hung services:
+The healthcheck timer detects hangs where process is alive but requests are not served.
+Check recent runs:
 
 ```bash
-# Check watchdog status
-systemctl show balancedns --property=WatchdogUSec
-
-# Manually trigger watchdog
-systemctl kill -s SIGABRT balancedns
+journalctl -u balancedns-healthcheck.service --since "15 minutes ago"
 ```
 
 ## Monitoring Metrics

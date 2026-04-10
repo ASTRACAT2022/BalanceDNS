@@ -5,6 +5,7 @@ Wants=balancedns-healthcheck.timer
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/balancedns-healthcheck.sh
+EnvironmentFile=-/etc/default/balancedns-healthcheck
+ExecStart=/usr/local/bin/balancedns-healthcheck.sh --quiet
 Nice=10
 IOSchedulingClass=idle

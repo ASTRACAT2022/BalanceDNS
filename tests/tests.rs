@@ -379,18 +379,22 @@ return {
         assert_eq!(config.wasm_components.len(), 2);
         assert_eq!(config.wasm_sandbox.max_packet_bytes, 2048);
         assert_eq!(config.wasm_sandbox.disable_after_failures, 3);
-        assert!(config
-            .wasm_components
-            .iter()
-            .find(|component| component.path == "wasm/default.wasm")
-            .unwrap()
-            .enabled);
-        assert!(!config
-            .wasm_components
-            .iter()
-            .find(|component| component.path == "wasm/off.wasm")
-            .unwrap()
-            .enabled);
+        assert!(
+            config
+                .wasm_components
+                .iter()
+                .find(|component| component.path == "wasm/default.wasm")
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            !config
+                .wasm_components
+                .iter()
+                .find(|component| component.path == "wasm/off.wasm")
+                .unwrap()
+                .enabled
+        );
 
         let default_component = config
             .lua_components

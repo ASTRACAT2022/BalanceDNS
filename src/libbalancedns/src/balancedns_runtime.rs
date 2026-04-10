@@ -799,18 +799,24 @@ impl BalanceDnsRuntime {
             self.varz.client_queries_dot.inc();
 
             let runtime = self.clone();
-            let response = match task::spawn_blocking(move || {
-                runtime.process_frame(Frame::dot(packet, Some(addr)))
-            })
+            let processing_timeout = self.query_processing_timeout();
+            let response = match timeout(
+                processing_timeout,
+                task::spawn_blocking(move || runtime.process_frame(Frame::dot(packet, Some(addr)))),
+            )
             .await
             {
-                Ok(Ok(response)) => response,
-                Ok(Err(err)) => {
+                Ok(Ok(Ok(response))) => response,
+                Ok(Ok(Err(err))) => {
                     debug!("DoT query failed for {}: {}", addr, err);
                     return;
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     error!("DoT blocking worker join error for {}: {}", addr, err);
+                    return;
+                }
+                Err(_) => {
+                    debug!("DoT query processing timed out for {}", addr);
                     return;
                 }
             };
@@ -871,13 +877,21 @@ impl BalanceDnsRuntime {
             }
         });
 
-        if let Err(err) = Http::new()
-            .with_executor(TokioHyperExecutor)
-            .http1_keep_alive(true)
-            .serve_connection(tls_stream, service)
-            .await
+        let mut http = Http::new().with_executor(TokioHyperExecutor);
+        http.http1_keep_alive(false);
+        match timeout(
+            StdDuration::from_millis(HTTP_KEEP_ALIVE_TIMEOUT_MS),
+            http.serve_connection(tls_stream, service),
+        )
+        .await
         {
-            debug!("DoH session closed for {}: {}", addr, err);
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                debug!("DoH session closed for {}: {}", addr, err);
+            }
+            Err(_) => {
+                debug!("DoH session timed out for {}", addr);
+            }
         }
     }
 
@@ -914,7 +928,17 @@ impl BalanceDnsRuntime {
                             "unsupported content-type",
                         ));
                     }
-                    let bytes = to_bytes(request.into_body()).await?;
+                    let body_timeout = StdDuration::from_millis(HTTP_HEADER_TIMEOUT_MS);
+                    let bytes = match timeout(body_timeout, to_bytes(request.into_body())).await {
+                        Ok(Ok(bytes)) => bytes,
+                        Ok(Err(err)) => return Err(err),
+                        Err(_) => {
+                            return Ok(http_text_response(
+                                StatusCode::REQUEST_TIMEOUT,
+                                "request body read timed out",
+                            ))
+                        }
+                    };
                     if bytes.len() > DOH_MAX_BODY_SIZE {
                         return Ok(http_text_response(
                             StatusCode::PAYLOAD_TOO_LARGE,
@@ -938,24 +962,33 @@ impl BalanceDnsRuntime {
             self.varz.client_queries_doh.inc();
 
             let runtime = self.clone();
-            let response =
-                match task::spawn_blocking(move || runtime.process_frame(Frame::doh(body, None)))
-                    .await
-                {
-                    Ok(Ok(response)) => response,
-                    Ok(Err(err)) => {
-                        return Ok(http_text_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            err.to_string(),
-                        ))
-                    }
-                    Err(err) => {
-                        return Ok(http_text_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("blocking worker join error: {}", err),
-                        ))
-                    }
-                };
+            let processing_timeout = self.query_processing_timeout();
+            let response = match timeout(
+                processing_timeout,
+                task::spawn_blocking(move || runtime.process_frame(Frame::doh(body, None))),
+            )
+            .await
+            {
+                Ok(Ok(Ok(response))) => response,
+                Ok(Ok(Err(err))) => {
+                    return Ok(http_text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        err.to_string(),
+                    ))
+                }
+                Ok(Err(err)) => {
+                    return Ok(http_text_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("blocking worker join error: {}", err),
+                    ))
+                }
+                Err(_) => {
+                    return Ok(http_text_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "query processing timed out",
+                    ))
+                }
+            };
 
             Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -1213,6 +1246,11 @@ impl BalanceDnsRuntime {
 
     pub(crate) fn process_query(self: &Arc<Self>, packet: &[u8]) -> io::Result<Vec<u8>> {
         self.worker.process_packet(self, packet)
+    }
+
+    #[inline]
+    fn query_processing_timeout(&self) -> StdDuration {
+        StdDuration::from_millis(self.config.request_timeout_ms.saturating_mul(2).clamp(500, 10_000))
     }
 
     pub(crate) fn inflight_query_guard(varz: &Varz) -> InflightQueryGuard<'_> {

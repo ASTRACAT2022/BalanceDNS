@@ -2,9 +2,15 @@
 # BalanceDNS Quick Status Check
 # Usage: ./status.sh
 
-DNS_SERVER="144.31.151.64"
-DNS_PORT="53"
-METRICS_URL="http://127.0.0.1:9100/metrics"
+if [[ -f /etc/default/balancedns-healthcheck ]]; then
+    # shellcheck disable=SC1091
+    source /etc/default/balancedns-healthcheck
+fi
+
+SERVICE_NAME="${BALANCEDNS_SERVICE_NAME:-balancedns}"
+DNS_SERVER="${BALANCEDNS_DNS_SERVER:-127.0.0.1}"
+DNS_PORT="${BALANCEDNS_DNS_PORT:-53}"
+METRICS_URL="${BALANCEDNS_METRICS_URL:-http://127.0.0.1:9100/metrics}"
 
 # Colors
 RED='\033[0;31m'
@@ -20,16 +26,16 @@ echo ""
 
 # Service status
 echo -e "${BOLD}Service Status:${NC}"
-if systemctl is-active --quiet balancedns 2>/dev/null; then
-    echo -e "  ● balancedns.service: ${GREEN}active (running)${NC}"
+if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    echo -e "  ● ${SERVICE_NAME}.service: ${GREEN}active (running)${NC}"
     
     # Get uptime
-    start_time=$(systemctl show balancedns --property=ActiveEnterTimestamp 2>/dev/null | cut -d= -f2-)
+    start_time=$(systemctl show "$SERVICE_NAME" --property=ActiveEnterTimestamp 2>/dev/null | cut -d= -f2-)
     if [[ -n "$start_time" ]]; then
         echo -e "    Started: $start_time"
     fi
 else
-    echo -e "  ● balancedns.service: ${RED}inactive/failed${NC}"
+    echo -e "  ● ${SERVICE_NAME}.service: ${RED}inactive/failed${NC}"
 fi
 echo ""
 
@@ -49,7 +55,7 @@ echo ""
 
 # Recent logs
 echo -e "${BOLD}Recent Log Entries (last 10):${NC}"
-journalctl -u balancedns --no-pager -n 10 2>/dev/null | tail -n 10 | while read line; do
+journalctl -u "$SERVICE_NAME" --no-pager -n 10 2>/dev/null | tail -n 10 | while read line; do
     echo -e "  $line"
 done
 echo ""
@@ -60,13 +66,15 @@ if command -v curl &> /dev/null; then
     if [[ -n "$metrics" ]]; then
         echo -e "${BOLD}Quick Metrics:${NC}"
         
-        total_queries=$(echo "$metrics" | grep "balancedns_client_queries_total" | awk '{print $2}')
+        total_queries=$(echo "$metrics" | grep -E '^balancedns_client_queries(\{.*\})?[[:space:]]' | awk '{print $2}')
         total_errors=$(echo "$metrics" | grep "balancedns_client_queries_errors_total" | awk '{print $2}')
-        tcp_conn=$(echo "$metrics" | grep "balancedns_tcp_connections" | awk '{print $2}')
+        inflight=$(echo "$metrics" | grep -E '^balancedns_inflight_queries(\{.*\})?[[:space:]]' | awk '{print $2}')
+        uptime=$(echo "$metrics" | grep -E '^balancedns_uptime(\{.*\})?[[:space:]]' | awk '{print $2}')
         
         echo -e "  Total Queries:  ${total_queries:-0}"
         echo -e "  Total Errors:   ${total_errors:-0}"
-        echo -e "  TCP Connections: ${tcp_conn:-0}"
+        echo -e "  Inflight Queries: ${inflight:-0}"
+        echo -e "  Uptime: ${uptime:-0}s"
         echo ""
     fi
 fi

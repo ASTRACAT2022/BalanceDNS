@@ -6,9 +6,9 @@ The monitoring system is now installed and running on your server.
 
 ## 📊 What's Installed
 
-1. **Health Check Timer** - Checks DNS every 30 seconds
+1. **Health Check Timer** - Checks UDP/DoH/DoT every 15 seconds
 2. **Auto-Restart** - Restarts if server becomes unresponsive  
-3. **Systemd Watchdog** - Kills & restarts if process hangs (60s timeout)
+3. **Consecutive Failure Guard** - Restarts only after repeated failures
 4. **Status Scripts** - Easy monitoring and status checking
 
 ## 🎯 Quick Commands
@@ -31,15 +31,15 @@ journalctl -u balancedns -f
 
 - **DNS Server**: 0.0.0.0:53
 - **Metrics**: http://127.0.0.1:9100/metrics
-- **Health Check**: Every 30 seconds
+- **Health Check**: Every 15 seconds
 
 ## 🛡️ Protection Levels
 
 | Issue | Detection | Action |
 |-------|-----------|--------|
 | Process crash | Immediate | Auto-restart (2s delay) |
-| Process hang | 60 seconds | SIGABRT + restart |
-| DNS unresponsive | 30 seconds | Health check restart |
+| Process alive but not serving DoH/DoT | 15-45 seconds | Health check restart |
+| Single transient network glitch | Immediate | No restart (failure threshold) |
 | Memory leak | Monitored | 2GB limit enforced |
 | Too many connections | Monitored | 256 task limit |
 
@@ -54,16 +54,17 @@ journalctl -u balancedns -f
 ### Adjust health check frequency
 Edit `/etc/systemd/system/balancedns-healthcheck.timer`:
 ```ini
-OnUnitActiveSec=30  # Change to desired frequency
+OnUnitActiveSec=15  # Change to desired frequency
 ```
 Then: `sudo systemctl daemon-reload && sudo systemctl restart balancedns-healthcheck.timer`
 
-### Adjust watchdog timeout
-Edit `/etc/systemd/system/balancedns.service`:
-```ini
-WatchdogSec=60  # Change timeout
+### Adjust healthcheck strategy
+Edit `/etc/default/balancedns-healthcheck`:
+```bash
+BALANCEDNS_CHECK_PROTOCOLS=udp,doh,dot
+BALANCEDNS_FAILURE_THRESHOLD=3
 ```
-Then: `sudo systemctl daemon-reload && sudo systemctl restart balancedns`
+Then: `sudo systemctl restart balancedns-healthcheck.timer`
 
 ## ✅ Current Status
 
@@ -87,5 +88,5 @@ systemctl show balancedns --property=NRestarts
 
 **DNS not responding?**
 ```bash
-dig @144.31.151.64 localhost A
+dig @127.0.0.1 localhost A
 ```

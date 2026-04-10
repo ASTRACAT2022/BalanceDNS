@@ -19,7 +19,7 @@ echo ""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Step 1: Install health check script
-echo -e "  [1/5] Installing health check script..."
+echo -e "  [1/6] Installing health check script..."
 if [[ -f "$SCRIPT_DIR/healthcheck.sh" ]]; then
     cp "$SCRIPT_DIR/healthcheck.sh" /usr/local/bin/balancedns-healthcheck.sh
     chmod +x /usr/local/bin/balancedns-healthcheck.sh
@@ -29,8 +29,22 @@ else
     exit 1
 fi
 
-# Step 2: Install systemd timer and service
-echo -e "  [2/5] Installing systemd health check timer..."
+# Step 2: Install environment template if missing
+echo -e "  [2/6] Installing health check environment template..."
+if [[ -f "$SCRIPT_DIR/balancedns-healthcheck.env.example" ]]; then
+    if [[ ! -f /etc/default/balancedns-healthcheck ]]; then
+        cp "$SCRIPT_DIR/balancedns-healthcheck.env.example" /etc/default/balancedns-healthcheck
+        chmod 644 /etc/default/balancedns-healthcheck
+        echo -e "        ${GREEN}✓${NC} Installed /etc/default/balancedns-healthcheck"
+    else
+        echo -e "        ${YELLOW}!${NC} /etc/default/balancedns-healthcheck already exists - keeping current file"
+    fi
+else
+    echo -e "        ${YELLOW}!${NC} env example not found - skipping"
+fi
+
+# Step 3: Install systemd timer and service
+echo -e "  [3/6] Installing systemd health check timer..."
 if [[ -f "$SCRIPT_DIR/../balancedns-healthcheck.service" ]]; then
     cp "$SCRIPT_DIR/../balancedns-healthcheck.service" /etc/systemd/system/
     echo -e "        ${GREEN}✓${NC} Installed balancedns-healthcheck.service"
@@ -47,8 +61,8 @@ else
     exit 1
 fi
 
-# Step 3: Update main service file
-echo -e "  [3/5] Updating main balancedns.service..."
+# Step 4: Update main service file
+echo -e "  [4/6] Updating main balancedns.service..."
 if [[ -f "$SCRIPT_DIR/../balancedns.service" ]]; then
     cp "$SCRIPT_DIR/../balancedns.service" /etc/systemd/system/balancedns.service
     echo -e "        ${GREEN}✓${NC} Updated balancedns.service"
@@ -56,15 +70,15 @@ else
     echo -e "        ${YELLOW}!${NC} balancedns.service not found - skipping"
 fi
 
-# Step 4: Create log directory
-echo -e "  [4/5] Creating log directory..."
+# Step 5: Create log directory
+echo -e "  [5/6] Creating log directory..."
 mkdir -p /var/log
 touch /var/log/balancedns-healthcheck.log
 chmod 644 /var/log/balancedns-healthcheck.log
 echo -e "        ${GREEN}✓${NC} Log file created at /var/log/balancedns-healthcheck.log"
 
-# Step 5: Enable and start services
-echo -e "  [5/5] Enabling and starting services..."
+# Step 6: Enable and start services
+echo -e "  [6/6] Enabling and starting services..."
 systemctl daemon-reload
 systemctl enable balancedns-healthcheck.timer
 systemctl start balancedns-healthcheck.timer
@@ -77,7 +91,8 @@ echo -e "${GREEN}═════════════════════
 echo ""
 echo -e "Installed components:"
 echo -e "  ${BLUE}•${NC} Health check script: /usr/local/bin/balancedns-healthcheck.sh"
-echo -e "  ${BLUE}•${NC} Health check timer: balancedns-healthcheck.timer (runs every 30s)"
+echo -e "  ${BLUE}•${NC} Health check config: /etc/default/balancedns-healthcheck"
+echo -e "  ${BLUE}•${NC} Health check timer: balancedns-healthcheck.timer (runs every 15s)"
 echo -e "  ${BLUE}•${NC} Health check log:  /var/log/balancedns-healthcheck.log"
 echo ""
 echo -e "Useful commands:"
