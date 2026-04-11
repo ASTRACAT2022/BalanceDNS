@@ -1,0 +1,18 @@
+services:
+  balancedns:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: balancedns:local
+    container_name: balancedns
+    restart: unless-stopped
+    cap_add:
+      - NET_BIND_SERVICE
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "9090:9090"
+    volumes:
+      - ./configs/docker.yaml:/app/configs/docker.yaml:ro
+      - ./scripts:/app/scripts:ro
+    command: ["-config", "/app/configs/docker.yaml"]

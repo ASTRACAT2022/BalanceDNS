@@ -1,48 +1,186 @@
-# BalanceDNS
+# BalanceDNS (MVP+)
 
-This is an overview of the **BalanceDNS** DNS resolver architecture written in **Rust**. It replaces earlier designs that could no longer keep up with growing load because of blocking I/O, cache duplication, and weak plugin isolation.
+BalanceDNS is a lightweight DNS resolver/forwarder in Go with policy-based routing, sandboxed plugins (Lua and Go-exec), high-speed sharded LRU cache, and Prometheus metrics.
 
-Its foundation is the asynchronous **tokio** runtime. That lets the system process millions of concurrent tasks on a shared thread pool with *work stealing*, without allowing expensive requests to stall the whole queue.
+## Features
 
-## Architecture Overview
+- UDP + TCP DNS listeners (`miekg/dns`)
+- Processing chain: `Blacklist -> Cache -> Lua/Plugin Policy -> Upstream`
+- Multi-upstream routing by zone with automatic fallback between matching upstreams
+- Upstream protocols:
+  - `udp`
+  - `tcp`
+  - `dot` (DNS-over-TLS)
+  - `doh` (DNS-over-HTTPS)
+- Thread-safe sharded LRU cache (64 shards on large capacity) with min/max TTL bounds
+- Sandbox plugin engine:
+  - Lua runtime in clean state without `os`, `io`, package loading
+  - Go plugins executed as isolated subprocesses with strict timeout and empty environment
+- Listener/network stack tuning (`reuse_port`, `reuse_addr`, UDP size, read/write timeouts)
+- Built-in supervisor/control plane:
+  - per-component restart with backoff
+  - crash loop protection (`max_consecutive_failure`)
+  - health/readiness/status endpoints
+- Prometheus metrics
+- Graceful shutdown (`SIGINT`, `SIGTERM`)
 
-The platform is divided into several independent but tightly connected modules:
+## Metrics
 
-### 1. Server Module
-Handles incoming traffic over UDP, TCP, and HTTP. Internally, all incoming data is normalized into a single abstract format: **"frames"**. That abstraction makes flow control easier, improves fairness across clients, and helps protect BalanceDNS from overload through pacing.
+- `balancedns_queries_total`
+- `balancedns_cache_hits_total`
+- `balancedns_upstream_latency_seconds`
+- `balancedns_plugin_execution_errors`
+- `balancedns_component_up`
+- `balancedns_component_restarts_total`
 
-### 2. Worker Module
-Every received frame becomes an asynchronous job for the worker pool. A worker is the main request coordinator: it applies policies first, checks the cache for a ready answer, and if there is no hit, hands the request off to the forwarding path.
+## Run
 
-### 3. Cache Module
-BalanceDNS redesigned caching from the ground up:
-- **ARC (Adaptive Replacement Cache)** replaces a classic key-value cache, giving better eviction behavior for unpopular data and better resistance to zone-scanning patterns.
-- **Consistent hashing** replaces multicast-style cache fanout. Each server knows its nearby peers and forwards a miss to the right node instead of pushing fresh records to every server in the datacenter.
+```bash
+go run ./cmd/balancedns -config configs/balancedns.yaml
+go run ./cmd/balancedns -config configs/balancedns.lua
+```
 
-### 4. Conductor Module
-Manages all outbound traffic to upstream servers:
-- **Deduplication**: if a thousand identical requests arrive at once, such as after a hot cache entry expires, the Conductor sends only one upstream request and queues the rest behind it. That sharply reduces network spam.
-- **Smart routing**: the module continuously collects metrics such as RTT, latency, and packet loss, then decides which authoritative server should answer fastest, which transport to use, and whether the request should be routed through a protected internal path.
+Detailed Russian manual:
+- `docs/MANUAL_RU.md`
+- `docs/POLICIES_RU.md` (практика по политикам ответов)
 
-### 5. Sandbox Module
-To extend BalanceDNS with logging, DDoS protections, and modern protocols such as oDoH, the platform uses **WebAssembly (Wasm)** plugins:
-- **Isolation**: Wasm modules run in protected memory, so a plugin crash does not bring down the resolver.
-- **Zero-copy shared memory**: a shared memory region avoids repeated data copies between the host and the Wasm sandbox.
-- **Hostcalls**: plugins can delegate expensive work back to the host. For example, cryptographic math inside Wasm can be slow, so heavy crypto operations are handed to the Rust core through hostcalls, improving performance by up to 4x.
+## Config
 
-## Forward Mode
+See `configs/balancedns.yaml` and `configs/balancedns.lua`.
 
-The request path is:
+YAML, JSON and Lua are supported.
 
-1. Accept the client request over UDP, TCP, DoT, or DoH.
-2. Normalize it into a `Frame`.
-3. Run policy checks in `Worker`.
-4. Serve from cache when possible.
-5. On a miss, send the request through `Conductor` to the selected upstream.
-6. Run post-response plugins and write the result back into cache.
+Lua config must return table:
 
-Current policy layers include local hosts overrides, remote hosts, blocklists, request-type denies, routing rules, and Lua/native/Wasm plugins.
+```lua
+return {
+  listen = { dns = env("BALANCEDNS_DNS_ADDR", ":5353") },
+  upstreams = {
+    { name = "global-doh", protocol = "doh", doh_url = "https://dns.google/dns-query", zones = {"."} }
+  }
+}
+```
 
-## Summary
+### Upstream examples
 
-**BalanceDNS** is a resilient, fully asynchronous, and modular platform. It addresses cache bloat, removes blocking I/O bottlenecks, and gives developers a safe way to ship new features through WebAssembly.
+```yaml
+upstreams:
+  - name: "global-doh"
+    protocol: "doh"
+    doh_url: "https://dns.google/dns-query"
+    zones: ["."]
+    timeout_ms: 1500
+
+  - name: "global-dot"
+    protocol: "dot"
+    addr: "1.1.1.1:853"
+    tls_server_name: "cloudflare-dns.com"
+    zones: ["."]
+    timeout_ms: 1500
+```
+
+### Control plane
+
+```yaml
+control:
+  restart_backoff_ms: 200
+  restart_max_backoff_ms: 5000
+  max_consecutive_failure: 0
+  min_stable_run_ms: 10000
+```
+
+- `0` in `max_consecutive_failure` means unlimited restart attempts.
+- Health endpoints are served on metrics listener:
+  - `/healthz`
+  - `/readyz`
+  - `/statusz`
+
+## Plugin contract
+
+### Lua plugin
+
+```lua
+function handle(question)
+  -- question.domain, question.type, question.qtype
+  return {
+    action = "FORWARD" | "BLOCK" | "REWRITE" | "LOCAL_DATA",
+    rewrite_domain = "example.org.",
+    rewrite_type = "A",
+    local_data = {
+      ttl = 60,
+      ip = "127.0.0.1",
+      ips = {"127.0.0.1", "::1"}
+    }
+  }
+end
+```
+
+### Go-exec plugin
+
+Plugin process receives JSON on `stdin` and returns JSON to `stdout`:
+
+Input:
+
+```json
+{"question":{"domain":"example.org.","type":"A","qtype":1}}
+```
+
+Output:
+
+```json
+{"action":"FORWARD"}
+```
+
+or
+
+```json
+{"action":"LOCAL_DATA","local_data":{"ips":["127.0.0.2"],"ttl":60}}
+```
+
+### Plugin entries
+
+```yaml
+plugins:
+  enabled: true
+  timeout_ms: 20
+  entries:
+    - name: "lua-policy"
+      runtime: "lua"
+      path: "scripts/policy.lua"
+    - name: "go-policy"
+      runtime: "go_exec"
+      path: "/opt/balancedns/plugins/go-policy"
+      timeout_ms: 10
+```
+
+Example Go plugin source: `scripts/go_policy_example.go` (build it into executable and use `runtime: "go_exec"`).
+
+## Tests and checks
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+go build ./cmd/balancedns
+```
+
+## Systemd install
+
+Linux/systemd installer:
+
+```bash
+./scripts/install-systemd.sh
+```
+
+The script builds binary, installs config and creates `balancedns.service` with hardening options.
+
+## Docker
+
+```bash
+docker compose up -d --build
+```
+
+Files:
+- `Dockerfile`
+- `docker-compose.yml`
+- `configs/docker.yaml`
