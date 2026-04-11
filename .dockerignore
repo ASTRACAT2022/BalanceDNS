@@ -1,0 +1,10 @@
+.git
+.gitignore
+.DS_Store
+bin
+build
+dist
+*.log
+*.tmp
+*.swp
+coverage.out

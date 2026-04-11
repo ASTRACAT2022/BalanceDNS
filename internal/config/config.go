@@ -1,0 +1,296 @@
+package config
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+type Config struct {
+	Listen    ListenConfig    `json:"listen" yaml:"listen"`
+	Logging   LoggingConfig   `json:"logging" yaml:"logging"`
+	Upstreams []Upstream      `json:"upstreams" yaml:"upstreams"`
+	Routing   RoutingConfig   `json:"routing" yaml:"routing"`
+	Cache     CacheConfig     `json:"cache" yaml:"cache"`
+	Plugins   PluginConfig    `json:"plugins" yaml:"plugins"`
+	Blacklist BlacklistConfig `json:"blacklist" yaml:"blacklist"`
+	Control   ControlConfig   `json:"control" yaml:"control"`
+}
+
+type ListenConfig struct {
+	DNS            string `json:"dns" yaml:"dns"`
+	Metrics        string `json:"metrics" yaml:"metrics"`
+	ReadTimeoutMS  int    `json:"read_timeout_ms" yaml:"read_timeout_ms"`
+	WriteTimeoutMS int    `json:"write_timeout_ms" yaml:"write_timeout_ms"`
+	ReusePort      bool   `json:"reuse_port" yaml:"reuse_port"`
+	ReuseAddr      bool   `json:"reuse_addr" yaml:"reuse_addr"`
+	UDPSize        int    `json:"udp_size" yaml:"udp_size"`
+}
+
+type LoggingConfig struct {
+	Level      string `json:"level" yaml:"level"`
+	LogQueries bool   `json:"log_queries" yaml:"log_queries"`
+}
+
+type Upstream struct {
+	Name                  string   `json:"name" yaml:"name"`
+	Protocol              string   `json:"protocol" yaml:"protocol"`
+	Addr                  string   `json:"addr" yaml:"addr"`
+	DoHURL                string   `json:"doh_url" yaml:"doh_url"`
+	TLSServerName         string   `json:"tls_server_name" yaml:"tls_server_name"`
+	TLSInsecureSkipVerify bool     `json:"tls_insecure_skip_verify" yaml:"tls_insecure_skip_verify"`
+	Zones                 []string `json:"zones" yaml:"zones"`
+	TimeoutMS             int      `json:"timeout_ms" yaml:"timeout_ms"`
+}
+
+type RoutingConfig struct {
+	Chain []string `json:"chain" yaml:"chain"`
+}
+
+type CacheConfig struct {
+	Enabled       bool   `json:"enabled" yaml:"enabled"`
+	Capacity      int    `json:"capacity" yaml:"capacity"`
+	MinTTLSeconds uint32 `json:"min_ttl_seconds" yaml:"min_ttl_seconds"`
+	MaxTTLSeconds uint32 `json:"max_ttl_seconds" yaml:"max_ttl_seconds"`
+}
+
+type PluginConfig struct {
+	Enabled   bool          `json:"enabled" yaml:"enabled"`
+	TimeoutMS int           `json:"timeout_ms" yaml:"timeout_ms"`
+	Scripts   []string      `json:"scripts" yaml:"scripts"`
+	Entries   []PluginEntry `json:"entries" yaml:"entries"`
+}
+
+type PluginEntry struct {
+	Name      string   `json:"name" yaml:"name"`
+	Runtime   string   `json:"runtime" yaml:"runtime"`
+	Path      string   `json:"path" yaml:"path"`
+	Args      []string `json:"args" yaml:"args"`
+	TimeoutMS int      `json:"timeout_ms" yaml:"timeout_ms"`
+}
+
+type BlacklistConfig struct {
+	Domains []string `json:"domains" yaml:"domains"`
+}
+
+type ControlConfig struct {
+	RestartBackoffMS      int `json:"restart_backoff_ms" yaml:"restart_backoff_ms"`
+	RestartMaxBackoffMS   int `json:"restart_max_backoff_ms" yaml:"restart_max_backoff_ms"`
+	MaxConsecutiveFailure int `json:"max_consecutive_failure" yaml:"max_consecutive_failure"`
+	MinStableRunMS        int `json:"min_stable_run_ms" yaml:"min_stable_run_ms"`
+}
+
+func Load(path string) (*Config, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".lua":
+		cfg, err := loadLua(path)
+		if err != nil {
+			return nil, err
+		}
+		applyDefaults(cfg)
+		if err := validate(cfg); err != nil {
+			return nil, err
+		}
+		return cfg, nil
+	case ".yaml", ".yml":
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read config: %w", err)
+		}
+		cfg := &Config{}
+		if err := yaml.Unmarshal(data, cfg); err != nil {
+			return nil, fmt.Errorf("parse yaml: %w", err)
+		}
+		applyDefaults(cfg)
+		if err := validate(cfg); err != nil {
+			return nil, err
+		}
+		return cfg, nil
+	case ".json":
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read config: %w", err)
+		}
+		cfg := &Config{}
+		if err := json.Unmarshal(data, cfg); err != nil {
+			return nil, fmt.Errorf("parse json: %w", err)
+		}
+		applyDefaults(cfg)
+		if err := validate(cfg); err != nil {
+			return nil, err
+		}
+		return cfg, nil
+	default:
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read config: %w", err)
+		}
+		cfg := &Config{}
+		if err := yaml.Unmarshal(data, cfg); err != nil {
+			if err2 := json.Unmarshal(data, cfg); err2 != nil {
+				return nil, errors.New("config must be YAML, JSON, or Lua")
+			}
+		}
+		applyDefaults(cfg)
+		if err := validate(cfg); err != nil {
+			return nil, err
+		}
+		return cfg, nil
+	}
+}
+
+func applyDefaults(cfg *Config) {
+	if cfg.Listen.DNS == "" {
+		cfg.Listen.DNS = ":53"
+	}
+	if cfg.Listen.Metrics == "" {
+		cfg.Listen.Metrics = ":9090"
+	}
+	if cfg.Listen.ReadTimeoutMS <= 0 {
+		cfg.Listen.ReadTimeoutMS = 2000
+	}
+	if cfg.Listen.WriteTimeoutMS <= 0 {
+		cfg.Listen.WriteTimeoutMS = 2000
+	}
+	if cfg.Listen.UDPSize <= 0 {
+		cfg.Listen.UDPSize = 1232
+	}
+	if cfg.Logging.Level == "" {
+		cfg.Logging.Level = "info"
+	}
+	if len(cfg.Routing.Chain) == 0 {
+		cfg.Routing.Chain = []string{"blacklist", "cache", "lua_policy", "upstream"}
+	}
+	if cfg.Cache.Capacity == 0 {
+		cfg.Cache.Capacity = 10000
+	}
+	if cfg.Cache.MinTTLSeconds == 0 {
+		cfg.Cache.MinTTLSeconds = 5
+	}
+	if cfg.Cache.MaxTTLSeconds == 0 {
+		cfg.Cache.MaxTTLSeconds = 3600
+	}
+	if cfg.Plugins.TimeoutMS == 0 {
+		cfg.Plugins.TimeoutMS = 20
+	}
+	if cfg.Control.RestartBackoffMS <= 0 {
+		cfg.Control.RestartBackoffMS = 200
+	}
+	if cfg.Control.RestartMaxBackoffMS <= 0 {
+		cfg.Control.RestartMaxBackoffMS = 5000
+	}
+	if cfg.Control.MinStableRunMS <= 0 {
+		cfg.Control.MinStableRunMS = 10000
+	}
+
+	if len(cfg.Plugins.Entries) == 0 && len(cfg.Plugins.Scripts) > 0 {
+		cfg.Plugins.Entries = make([]PluginEntry, 0, len(cfg.Plugins.Scripts))
+		for _, s := range cfg.Plugins.Scripts {
+			cfg.Plugins.Entries = append(cfg.Plugins.Entries, PluginEntry{
+				Name:    filepath.Base(s),
+				Runtime: "lua",
+				Path:    s,
+			})
+		}
+	}
+
+	for i := range cfg.Upstreams {
+		if cfg.Upstreams[i].Protocol == "" {
+			cfg.Upstreams[i].Protocol = "udp"
+		}
+		cfg.Upstreams[i].Protocol = strings.ToLower(strings.TrimSpace(cfg.Upstreams[i].Protocol))
+		if cfg.Upstreams[i].TimeoutMS <= 0 {
+			cfg.Upstreams[i].TimeoutMS = int((2 * time.Second).Milliseconds())
+		}
+	}
+
+	for i := range cfg.Plugins.Entries {
+		if cfg.Plugins.Entries[i].Runtime == "" {
+			cfg.Plugins.Entries[i].Runtime = "lua"
+		}
+		cfg.Plugins.Entries[i].Runtime = strings.ToLower(strings.TrimSpace(cfg.Plugins.Entries[i].Runtime))
+		if cfg.Plugins.Entries[i].Name == "" {
+			cfg.Plugins.Entries[i].Name = filepath.Base(cfg.Plugins.Entries[i].Path)
+		}
+	}
+}
+
+func validate(cfg *Config) error {
+	if len(cfg.Upstreams) == 0 {
+		return errors.New("at least one upstream is required")
+	}
+	for _, up := range cfg.Upstreams {
+		if up.Name == "" {
+			return errors.New("upstream name is required")
+		}
+		switch up.Protocol {
+		case "udp", "tcp", "dot":
+			if up.Addr == "" {
+				return fmt.Errorf("upstream %q address is required", up.Name)
+			}
+			if _, _, err := net.SplitHostPort(up.Addr); err != nil {
+				return fmt.Errorf("upstream %q addr must be host:port", up.Name)
+			}
+		case "doh":
+			if up.DoHURL == "" {
+				return fmt.Errorf("upstream %q doh_url is required for protocol doh", up.Name)
+			}
+			u, err := url.Parse(up.DoHURL)
+			if err != nil || u.Scheme != "https" {
+				return fmt.Errorf("upstream %q doh_url must be valid https url", up.Name)
+			}
+		default:
+			return fmt.Errorf("upstream %q has unsupported protocol %q", up.Name, up.Protocol)
+		}
+	}
+	if cfg.Cache.Capacity <= 0 {
+		return errors.New("cache.capacity must be > 0")
+	}
+	if cfg.Listen.ReadTimeoutMS <= 0 || cfg.Listen.WriteTimeoutMS <= 0 {
+		return errors.New("listen.read_timeout_ms and listen.write_timeout_ms must be > 0")
+	}
+	if cfg.Listen.UDPSize < 512 || cfg.Listen.UDPSize > 65535 {
+		return errors.New("listen.udp_size must be in range [512, 65535]")
+	}
+	if cfg.Control.RestartBackoffMS <= 0 || cfg.Control.RestartMaxBackoffMS <= 0 {
+		return errors.New("control.restart_backoff_ms and control.restart_max_backoff_ms must be > 0")
+	}
+	if cfg.Control.RestartBackoffMS > cfg.Control.RestartMaxBackoffMS {
+		return errors.New("control.restart_backoff_ms must be <= control.restart_max_backoff_ms")
+	}
+	if cfg.Control.MaxConsecutiveFailure < 0 {
+		return errors.New("control.max_consecutive_failure must be >= 0")
+	}
+	if cfg.Control.MinStableRunMS <= 0 {
+		return errors.New("control.min_stable_run_ms must be > 0")
+	}
+	if cfg.Cache.MinTTLSeconds > cfg.Cache.MaxTTLSeconds {
+		return errors.New("cache.min_ttl_seconds must be <= cache.max_ttl_seconds")
+	}
+	if cfg.Plugins.TimeoutMS <= 0 {
+		return errors.New("plugins.timeout_ms must be > 0")
+	}
+	for i, p := range cfg.Plugins.Entries {
+		if p.Path == "" {
+			return fmt.Errorf("plugins.entries[%d].path is required", i)
+		}
+		switch p.Runtime {
+		case "lua", "go_exec":
+		default:
+			return fmt.Errorf("plugins.entries[%d] has unsupported runtime %q", i, p.Runtime)
+		}
+		if p.TimeoutMS < 0 {
+			return fmt.Errorf("plugins.entries[%d].timeout_ms must be >= 0", i)
+		}
+	}
+	return nil
+}
