@@ -4,7 +4,7 @@ BalanceDNS is a lightweight DNS resolver/forwarder in Go with policy-based routi
 
 ## Features
 
-- UDP + TCP DNS listeners (`miekg/dns`)
+- DNS listeners: UDP/TCP + DoT + DoH (`miekg/dns` + net/http)
 - Processing chain: `Blacklist -> Cache -> Lua/Plugin Policy -> Upstream`
 - Multi-upstream routing by zone with automatic fallback between matching upstreams
 - Upstream protocols:
@@ -36,7 +36,7 @@ BalanceDNS is a lightweight DNS resolver/forwarder in Go with policy-based routi
 ## Run
 
 ```bash
-go run ./cmd/balancedns -config configs/balancedns.lua
+go run ./cmd/balancedns -config configs/prod.lua
 ```
 
 Detailed Russian manual:
@@ -45,7 +45,7 @@ Detailed Russian manual:
 
 ## Config
 
-See `configs/balancedns.lua`.
+See `configs/prod.lua`.
 
 Only Lua config is supported.
 
@@ -148,7 +148,7 @@ plugins = {
   enabled = true,
   timeout_ms = 20,
   entries = {
-    { name = "lua-policy", runtime = "lua", path = "scripts/policy.lua" },
+    { name = "lua-policy", runtime = "lua", path = "./scripts/policy.lua" },
     { name = "go-policy", runtime = "go_exec", path = "/opt/balancedns/plugins/go-policy", timeout_ms = 10 }
   }
 }
@@ -184,4 +184,4 @@ docker compose up -d --build
 Files:
 - `Dockerfile`
 - `docker-compose.yml`
-- `configs/docker.lua`
+- `configs/prod.lua`

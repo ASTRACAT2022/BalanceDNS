@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	configPath := flag.String("config", "configs/balancedns.lua", "Path to Lua config")
+	configPath := flag.String("config", "configs/prod.lua", "Path to Lua config")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)

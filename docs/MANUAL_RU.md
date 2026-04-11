@@ -1,270 +1,229 @@
-# BalanceDNS: руководство (RU)
+# BalanceDNS: гибкий manual (RU)
 
 ## 1. Что это
 
-`BalanceDNS` — DNS-резолвер/форвардер с:
-- цепочкой обработки запроса,
-- кэшем (TTL + LRU),
-- плагинами политики (Lua и go_exec),
-- маршрутизацией по зонам,
+`BalanceDNS` — DNS-резолвер/форвардер на Go с:
+- listener'ами `DNS (UDP/TCP)`, `DoT`, `DoH`;
+- маршрутизацией по зонам (`.ru` отдельно, остальное отдельно);
+- быстрым кэшем (sharded LRU + TTL);
+- policy-движком (Lua/go_exec, sandbox);
+- supervisor-контролем компонентов;
 - метриками Prometheus.
 
-## 2. Быстрый старт
+## 2. Один конфиг для всего
 
-### Локально
+В проекте используется **один основной конфиг**:
+- `configs/prod.lua`
 
-```bash
-go run ./cmd/balancedns -config configs/balancedns.lua
-```
-
-### Проверка
+Запуск по умолчанию:
 
 ```bash
-# DNS (пример для порта 5353 из balancedns.lua)
-dig @127.0.0.1 -p 5353 example.org A
-
-# Метрики
-curl -s http://127.0.0.1:9090/metrics | rg balancedns_
+go run ./cmd/balancedns -config configs/prod.lua
 ```
 
-## 3. Конфиг: форматы и дефолты
+Docker по умолчанию тоже использует `configs/prod.lua`.
 
-Поддерживается только:
-- Lua (`return { ... }`)
+## 3. Быстрый старт (Docker)
 
-Основные дефолты:
-- `listen.dns = ":53"`
-- `listen.metrics = ":9090"`
-- `listen.read_timeout_ms = 2000`
-- `listen.write_timeout_ms = 2000`
-- `listen.udp_size = 1232`
-- `routing.chain = ["blacklist", "cache", "lua_policy", "upstream"]`
-- `cache.capacity = 10000`
-- `cache.min_ttl_seconds = 5`
-- `cache.max_ttl_seconds = 3600`
-- `plugins.timeout_ms = 20`
-- `upstream.timeout_ms = 2000` (если не задан)
-
-## 4. Lua-конфиг
-
-Файл должен вернуть таблицу:
-
-```lua
-return {
-  listen = { dns = env("BALANCEDNS_DNS_ADDR", ":5353") },
-  upstreams = {
-    { name = "google", protocol = "doh", doh_url = "https://dns.google/dns-query", zones = {"."} }
-  }
-}
+```bash
+cd ~/BalanceDNS
+docker compose down --remove-orphans
+docker compose up -d --build
+docker compose logs -f -t
 ```
 
-В Lua-конфиге доступна функция:
-- `env("KEY", "default")` — читает переменную окружения.
+Проверка:
 
-Готовый пример:
-- `configs/balancedns.lua`
+```bash
+curl -s http://127.0.0.1:9091/healthz
+curl -s http://127.0.0.1:9091/statusz
+dig @127.0.0.1 -p 53 example.org A
+```
 
-## 5. Цепочка обработки (routing.chain)
+## 4. Главная идея гибкости: env + Lua
 
-Поддерживаемые этапы:
-- `blacklist`
-- `cache`
-- `lua_policy` (также алиасы: `plugin`, `plugins`, `lua`)
-- `upstream`
+`configs/prod.lua` поддерживает переменные окружения:
 
-Рекомендуемый порядок для production:
-1. `blacklist`
-2. `cache`
-3. `lua_policy`
-4. `upstream`
-
-## 6. Политики (плагины)
-
-Подробный practical guide:
-- `docs/POLICIES_RU.md`
-
-### 6.1 Lua plugin
-
-Контракт: файл должен экспортировать `handle(question)`.
-
-`question` содержит:
-- `question.domain` (FQDN)
-- `question.type` (например `"A"`)
-- `question.qtype` (число)
-
-Возврат:
-- `FORWARD`
-- `BLOCK`
-- `REWRITE`
-- `LOCAL_DATA`
+- `BALANCEDNS_BIND_IP` — IP для DNS/DoT/DoH
+- `BALANCEDNS_METRICS_IP` — IP для метрик
+- `BALANCEDNS_TLS_CERT` — путь к cert
+- `BALANCEDNS_TLS_KEY` — путь к key
+- `BALANCEDNS_LOG_LEVEL` — `debug|info|error`
 
 Пример:
 
-```lua
-function handle(question)
-  local d = string.lower(question.domain or "")
-
-  if d == "blocked.example." then
-    return { action = "BLOCK" }
-  end
-
-  if d == "rewrite.example." then
-    return {
-      action = "REWRITE",
-      rewrite_domain = "example.org.",
-      rewrite_type = "A"
-    }
-  end
-
-  if d == "local.example." then
-    return {
-      action = "LOCAL_DATA",
-      local_data = {
-        ttl = 60,
-        ips = {"127.0.0.2", "::1"}
-      }
-    }
-  end
-
-  return { action = "FORWARD" }
-end
-```
-
-### 6.2 go_exec plugin
-
-`go_exec` запускается как отдельный процесс (sandbox-подход):
-- timeout на исполнение,
-- stdin/stdout JSON,
-- пустое окружение процесса.
-
-Вход (stdin):
-
-```json
-{"question":{"domain":"example.org.","type":"A","qtype":1}}
-```
-
-Выход (stdout):
-
-```json
-{"action":"FORWARD"}
-```
-
-Пример исходника go-plugin:
-- `scripts/go_policy_example.go`
-
-## 7. Upstream и маршрутизация
-
-Протоколы upstream:
-- `udp`
-- `tcp`
-- `dot`
-- `doh`
-
-Маршрутизация по зонам:
-- используется longest-suffix match,
-- при ошибке автоматически пробуется следующий подходящий upstream.
-
-## 8. Кэш
-
-Реализация:
-- шардированный LRU (до 64 шардов),
-- потокобезопасный,
-- ключ: `FQDN + QType`,
-- TTL берется из ответа upstream и ограничивается `min_ttl_seconds/max_ttl_seconds`.
-
-## 9. Метрики
-
-- `balancedns_queries_total`
-- `balancedns_cache_hits_total`
-- `balancedns_upstream_latency_seconds`
-- `balancedns_plugin_execution_errors`
-- `balancedns_component_up`
-- `balancedns_component_restarts_total`
-
-## 10. Контроль процессов (supervisor)
-
-BalanceDNS запускает компоненты как независимые модули:
-- `dns-udp`
-- `dns-tcp`
-- `metrics-http`
-
-Для каждого модуля есть:
-- автоматический перезапуск при падении,
-- exponential backoff,
-- защита от crash-loop через `max_consecutive_failure`.
-
-Настройки:
-
-```lua
-control = {
-  restart_backoff_ms = 200,
-  restart_max_backoff_ms = 5000,
-  max_consecutive_failure = 0,
-  min_stable_run_ms = 10000
-}
-```
-
-- `max_consecutive_failure: 0` означает бесконечные попытки перезапуска.
-- Если указать `>0`, при превышении лимита сервис завершится с ошибкой.
-
-HTTP endpoints (на `listen.metrics`):
-- `/healthz`
-- `/readyz`
-- `/statusz`
-
-## 11. Docker
-
-### 11.1 Через docker compose
-
 ```bash
+BALANCEDNS_BIND_IP=144.31.151.64 \
+BALANCEDNS_METRICS_IP=127.0.0.1 \
+BALANCEDNS_TLS_CERT=/etc/balancedns/certs/fullchain.cer \
+BALANCEDNS_TLS_KEY=/etc/balancedns/certs/key.key \
+BALANCEDNS_LOG_LEVEL=info \
 docker compose up -d --build
 ```
 
-Порты:
-- `53/udp`
-- `53/tcp`
-- `9090/tcp` (metrics)
+## 5. Что уже настроено в prod.lua
 
-Файлы:
-- `Dockerfile`
-- `docker-compose.yml`
-- `configs/docker.lua`
+- `53` DNS
+- `853` DoT
+- `443` DoH (`/dns-query`)
+- `.ru` -> `77.88.8.8`
+- остальное -> `95.85.95.85` + fallback `2.56.220.2`
+- локальные ответы из `hosts.txt`
+- низкий шум логов (`log_queries = false`)
 
-### 11.2 Через docker run
+## 6. Формат hosts.txt
 
-```bash
-docker build -t balancedns:local .
+Файл: `hosts.txt` в корне проекта.
 
-docker run -d --name balancedns \
-  --cap-add=NET_BIND_SERVICE \
-  -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
-  -v $(pwd)/configs/docker.lua:/app/configs/docker.lua:ro \
-  -v $(pwd)/scripts:/app/scripts:ro \
-  balancedns:local -config /app/configs/docker.lua
+Формат строки:
+
+```text
+<ip> <fqdn> [alias1 alias2 ...]
 ```
 
-## 12. Тесты и диагностика
+Пример:
+
+```text
+10.10.10.10 api.internal.example
+10.10.10.20 db.internal.example
+fd00::10 v6.internal.example
+```
+
+Проверка:
+
+```bash
+dig @<BIND_IP> -p 53 api.internal.example A
+dig @<BIND_IP> -p 53 v6.internal.example AAAA
+```
+
+## 7. Типовые сценарии развертывания
+
+### 7.1 Один отдельный IP под DNS
+
+Лучший вариант для production:
+- на этом IP слушать `53/853/443`;
+- метрики вынести на `127.0.0.1`.
+
+### 7.2 Когда 443 уже занят
+
+Варианты:
+1. Выделить отдельный IP под BalanceDNS (рекомендуется).
+2. Временно сменить DoH порт на `8443` в `prod.lua`.
+3. Поставить reverse-proxy, который будет проксировать `/dns-query` в BalanceDNS.
+
+### 7.3 Когда один инстанс не хватает
+
+Поднимай второй инстанс (второй compose-проект/хост) с другим `BALANCEDNS_BIND_IP`.
+
+## 8. Стабильность и скорость: что крутить
+
+### 8.1 Стабильность
+
+- `control.max_consecutive_failure = 0` (бесконечные попытки перезапуска)
+- `control.min_stable_run_ms = 10000`
+- `read_timeout_ms`/`write_timeout_ms` не ставить слишком низко
+
+### 8.2 Производительность
+
+- `cache.capacity` больше для горячего трафика
+- `cache.max_ttl_seconds` под ваши требования свежести
+- `reuse_port = true`, `reuse_addr = true`
+- держать апстримы географически близко
+
+### 8.3 Логи
+
+Минимум шума:
+
+```lua
+logging = {
+  level = "info",
+  log_queries = false,
+}
+```
+
+## 9. Политики (Lua/go_exec)
+
+Этап policy: `lua_policy` в `routing.chain`.
+
+- Подробно: `docs/POLICIES_RU.md`
+- Для чистого резолвера можно держать:
+
+```lua
+plugins = {
+  enabled = false,
+  timeout_ms = 20,
+}
+```
+
+## 10. Метрики и health
+
+Endpoint'ы (на `listen.metrics`):
+- `/healthz`
+- `/readyz`
+- `/statusz`
+- `/metrics`
+
+Проверка:
+
+```bash
+curl -s http://127.0.0.1:9091/healthz
+curl -s http://127.0.0.1:9091/metrics | rg balancedns_
+```
+
+## 11. Systemd (без Docker)
+
+```bash
+sudo CONFIG_SRC=configs/prod.lua ./scripts/install-systemd.sh
+sudo systemctl status balancedns --no-pager
+```
+
+Если сертификаты в `/root/...`, перенеси их в `/etc/balancedns/certs` и выдай права чтения для группы сервиса.
+
+## 12. Частые проблемы и решения
+
+### 12.1 `bind: address already in use`
+
+Порт занят другим сервисом.
+
+Проверка:
+
+```bash
+ss -lntup | rg ':53|:443|:853|:9091'
+```
+
+### 12.2 `bind: permission denied` на 53/443/853
+
+Для Docker:
+- запускать контейнер root (`user: "0:0"`),
+- добавить `NET_BIND_SERVICE`.
+
+Для systemd:
+- убедиться, что есть `AmbientCapabilities=CAP_NET_BIND_SERVICE`.
+
+### 12.3 `decode lua config ... cannot unmarshal object into []string`
+
+Пустые массивы в Lua-таблицах иногда интерпретируются как object.
+
+Правильно:
+- `blacklist = {}` вместо `blacklist = { domains = {} }`
+- `plugins = { enabled = false, timeout_ms = 20 }` без `entries = {}`
+
+## 13. Операционный чек-лист
+
+Перед релизом:
 
 ```bash
 go test ./...
 go test -race ./...
-go vet ./...
 go build ./cmd/balancedns
 ```
 
-Проверка DNS:
+После релиза:
 
 ```bash
-dig @127.0.0.1 -p 53 example.org A
+curl -s http://127.0.0.1:9091/healthz
+dig @<BIND_IP> -p 53 ya.ru A
+dig @<BIND_IP> -p 53 google.com A
 ```
 
-Проверка метрик:
-
-```bash
-curl -s http://127.0.0.1:9090/metrics | rg balancedns_
-```
-
-## 13. Ограничения текущей версии
-
-- Локальные listener'ы для клиентов: UDP/TCP DNS.
-- DoH/DoT в текущей версии используются как протоколы **upstream**, а не как локальный входной listener.
+Если health `ok`, DNS отвечает, а логи без restart-loop — прод готов.

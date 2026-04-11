@@ -17,6 +17,6 @@ COPY configs ./configs
 COPY scripts ./scripts
 
 USER balancedns
-EXPOSE 53/udp 53/tcp 9090
+EXPOSE 53/udp 53/tcp 853/tcp 443/tcp 9091/tcp
 ENTRYPOINT ["/usr/local/bin/balancedns"]
-CMD ["-config", "/app/configs/docker.lua"]
+CMD ["-config", "/app/configs/prod.lua"]

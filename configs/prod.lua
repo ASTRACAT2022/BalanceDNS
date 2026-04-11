@@ -1,12 +1,19 @@
+local bind_ip = env("BALANCEDNS_BIND_IP", "144.31.151.64")
+local metrics_ip = env("BALANCEDNS_METRICS_IP", "0.0.0.0")
+
+local function addr(ip, port)
+  return string.format("%s:%d", ip, port)
+end
+
 return {
   listen = {
-    dns = "0.0.0.0:53",
-    dot = "0.0.0.0:853",
-    doh = "0.0.0.0:443",
+    dns = addr(bind_ip, 53),
+    dot = addr(bind_ip, 853),
+    doh = addr(bind_ip, 443),
     doh_path = "/dns-query",
-    tls_cert_file = "/etc/dnsdist/certs/fullchain.cer",
-    tls_key_file = "/etc/dnsdist/certs/key.key",
-    metrics = "0.0.0.0:9090",
+    tls_cert_file = env("BALANCEDNS_TLS_CERT", "/etc/balancedns/certs/fullchain.cer"),
+    tls_key_file = env("BALANCEDNS_TLS_KEY", "/etc/balancedns/certs/key.key"),
+    metrics = addr(metrics_ip, 9091),
     read_timeout_ms = 2500,
     write_timeout_ms = 2500,
     reuse_port = true,
@@ -16,7 +23,7 @@ return {
 
   logging = {
     level = env("BALANCEDNS_LOG_LEVEL", "info"),
-    log_queries = true,
+    log_queries = false,
   },
 
   acl = { "0.0.0.0/0", "::/0" },
@@ -64,12 +71,9 @@ return {
   plugins = {
     enabled = false,
     timeout_ms = 20,
-    entries = {},
   },
 
-  blacklist = {
-    domains = {},
-  },
+  blacklist = {},
 
   control = {
     restart_backoff_ms = 200,

@@ -147,18 +147,18 @@ stdout:
 Локально:
 
 ```bash
-go run ./cmd/balancedns -config configs/balancedns.lua
+go run ./cmd/balancedns -config configs/prod.lua
 
 # проверка BLOCK
-dig @127.0.0.1 -p 5353 ads.example A
+dig @127.0.0.1 -p 53 ads.example A
 
 # проверка LOCAL_DATA
-dig @127.0.0.1 -p 5353 internal.example A
+dig @127.0.0.1 -p 53 internal.example A
 ```
 
 Диагностика состояния сервиса:
 
 ```bash
-curl -s http://127.0.0.1:9090/healthz
-curl -s http://127.0.0.1:9090/statusz
+curl -s http://127.0.0.1:9091/healthz
+curl -s http://127.0.0.1:9091/statusz
 ```
