@@ -1,0 +1,6 @@
+# Custom local answers for BalanceDNS.
+# Format: <IP> <domain> [alias...]
+127.0.0.1 localhost
+10.10.10.10 api.internal.example
+10.10.10.20 db.internal.example
+fd00::10 v6.internal.example

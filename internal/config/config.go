@@ -13,9 +13,11 @@ import (
 type Config struct {
 	Listen    ListenConfig    `json:"listen" yaml:"listen"`
 	Logging   LoggingConfig   `json:"logging" yaml:"logging"`
+	ACL       []string        `json:"acl" yaml:"acl"`
 	Upstreams []Upstream      `json:"upstreams" yaml:"upstreams"`
 	Routing   RoutingConfig   `json:"routing" yaml:"routing"`
 	Cache     CacheConfig     `json:"cache" yaml:"cache"`
+	Hosts     HostsConfig     `json:"hosts" yaml:"hosts"`
 	Plugins   PluginConfig    `json:"plugins" yaml:"plugins"`
 	Blacklist BlacklistConfig `json:"blacklist" yaml:"blacklist"`
 	Control   ControlConfig   `json:"control" yaml:"control"`
@@ -23,6 +25,11 @@ type Config struct {
 
 type ListenConfig struct {
 	DNS            string `json:"dns" yaml:"dns"`
+	DoT            string `json:"dot" yaml:"dot"`
+	DoH            string `json:"doh" yaml:"doh"`
+	DoHPath        string `json:"doh_path" yaml:"doh_path"`
+	TLSCertFile    string `json:"tls_cert_file" yaml:"tls_cert_file"`
+	TLSKeyFile     string `json:"tls_key_file" yaml:"tls_key_file"`
 	Metrics        string `json:"metrics" yaml:"metrics"`
 	ReadTimeoutMS  int    `json:"read_timeout_ms" yaml:"read_timeout_ms"`
 	WriteTimeoutMS int    `json:"write_timeout_ms" yaml:"write_timeout_ms"`
@@ -56,6 +63,11 @@ type CacheConfig struct {
 	Capacity      int    `json:"capacity" yaml:"capacity"`
 	MinTTLSeconds uint32 `json:"min_ttl_seconds" yaml:"min_ttl_seconds"`
 	MaxTTLSeconds uint32 `json:"max_ttl_seconds" yaml:"max_ttl_seconds"`
+}
+
+type HostsConfig struct {
+	File string `json:"file" yaml:"file"`
+	TTL  uint32 `json:"ttl" yaml:"ttl"`
 }
 
 type PluginConfig struct {
@@ -108,6 +120,9 @@ func applyDefaults(cfg *Config) {
 	if cfg.Listen.Metrics == "" {
 		cfg.Listen.Metrics = ":9090"
 	}
+	if cfg.Listen.DoH != "" && cfg.Listen.DoHPath == "" {
+		cfg.Listen.DoHPath = "/dns-query"
+	}
 	if cfg.Listen.ReadTimeoutMS <= 0 {
 		cfg.Listen.ReadTimeoutMS = 2000
 	}
@@ -121,7 +136,7 @@ func applyDefaults(cfg *Config) {
 		cfg.Logging.Level = "info"
 	}
 	if len(cfg.Routing.Chain) == 0 {
-		cfg.Routing.Chain = []string{"blacklist", "cache", "lua_policy", "upstream"}
+		cfg.Routing.Chain = []string{"blacklist", "hosts", "cache", "lua_policy", "upstream"}
 	}
 	if cfg.Cache.Capacity == 0 {
 		cfg.Cache.Capacity = 10000
@@ -134,6 +149,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Plugins.TimeoutMS == 0 {
 		cfg.Plugins.TimeoutMS = 20
+	}
+	if cfg.Hosts.File != "" && cfg.Hosts.TTL == 0 {
+		cfg.Hosts.TTL = 60
 	}
 	if cfg.Control.RestartBackoffMS <= 0 {
 		cfg.Control.RestartBackoffMS = 200
@@ -205,6 +223,40 @@ func validate(cfg *Config) error {
 			return fmt.Errorf("upstream %q has unsupported protocol %q", up.Name, up.Protocol)
 		}
 	}
+	if err := validateListenAddr("listen.dns", cfg.Listen.DNS); err != nil {
+		return err
+	}
+	if err := validateListenAddr("listen.metrics", cfg.Listen.Metrics); err != nil {
+		return err
+	}
+	if cfg.Listen.DoT != "" {
+		if err := validateListenAddr("listen.dot", cfg.Listen.DoT); err != nil {
+			return err
+		}
+	}
+	if cfg.Listen.DoH != "" {
+		if err := validateListenAddr("listen.doh", cfg.Listen.DoH); err != nil {
+			return err
+		}
+		if cfg.Listen.DoHPath == "" {
+			return errors.New("listen.doh_path is required when listen.doh is set")
+		}
+		if !strings.HasPrefix(cfg.Listen.DoHPath, "/") {
+			return errors.New("listen.doh_path must start with '/'")
+		}
+	}
+	if cfg.Listen.DoT != "" || cfg.Listen.DoH != "" {
+		if strings.TrimSpace(cfg.Listen.TLSCertFile) == "" || strings.TrimSpace(cfg.Listen.TLSKeyFile) == "" {
+			return errors.New("listen.tls_cert_file and listen.tls_key_file are required for DoT/DoH listeners")
+		}
+	}
+
+	for i, cidr := range cfg.ACL {
+		if _, err := parseCIDROrIP(cidr); err != nil {
+			return fmt.Errorf("acl[%d]: %w", i, err)
+		}
+	}
+
 	if cfg.Cache.Capacity <= 0 {
 		return errors.New("cache.capacity must be > 0")
 	}
@@ -232,6 +284,9 @@ func validate(cfg *Config) error {
 	if cfg.Plugins.TimeoutMS <= 0 {
 		return errors.New("plugins.timeout_ms must be > 0")
 	}
+	if cfg.Hosts.File != "" && cfg.Hosts.TTL == 0 {
+		return errors.New("hosts.ttl must be > 0")
+	}
 	for i, p := range cfg.Plugins.Entries {
 		if p.Path == "" {
 			return fmt.Errorf("plugins.entries[%d].path is required", i)
@@ -246,4 +301,41 @@ func validate(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+func validateListenAddr(field, addr string) error {
+	if strings.TrimSpace(addr) == "" {
+		return fmt.Errorf("%s is required", field)
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("%s must be host:port: %w", field, err)
+	}
+	if host != "" && net.ParseIP(host) == nil {
+		return fmt.Errorf("%s host must be an IP address or empty (got %q)", field, host)
+	}
+	if strings.TrimSpace(port) == "" {
+		return fmt.Errorf("%s port is required", field)
+	}
+	return nil
+}
+
+func parseCIDROrIP(value string) (*net.IPNet, error) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return nil, errors.New("empty ACL value")
+	}
+	if _, ipnet, err := net.ParseCIDR(v); err == nil {
+		return ipnet, nil
+	}
+	ip := net.ParseIP(v)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid CIDR/IP %q", value)
+	}
+	if ip.To4() != nil {
+		_, ipnet, _ := net.ParseCIDR(ip.String() + "/32")
+		return ipnet, nil
+	}
+	_, ipnet, _ := net.ParseCIDR(ip.String() + "/128")
+	return ipnet, nil
 }

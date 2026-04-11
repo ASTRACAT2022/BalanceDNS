@@ -2,15 +2,20 @@ package app
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
 
 	"balancedns/internal/cache"
 	"balancedns/internal/config"
+	"balancedns/internal/hosts"
 	"balancedns/internal/logx"
 	"balancedns/internal/metrics"
 	"balancedns/internal/plugin"
@@ -27,6 +32,8 @@ type Server struct {
 	cache    *cache.Cache
 	plugins  *plugin.Engine
 	resolver *router.Resolver
+	hosts    *hosts.Table
+	acl      []*net.IPNet
 
 	chain     []string
 	blacklist []blacklistRule
@@ -61,6 +68,19 @@ func New(cfg *config.Config) (*Server, error) {
 		}
 	}
 
+	var hostTable *hosts.Table
+	if cfg.Hosts.File != "" {
+		hostTable, err = hosts.Load(cfg.Hosts.File, cfg.Hosts.TTL)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	acl, err := parseACL(cfg.ACL)
+	if err != nil {
+		return nil, err
+	}
+
 	s := &Server{
 		cfg:       cfg,
 		logger:    logger,
@@ -68,6 +88,8 @@ func New(cfg *config.Config) (*Server, error) {
 		cache:     c,
 		plugins:   engine,
 		resolver:  resolver,
+		hosts:     hostTable,
+		acl:       acl,
 		chain:     normalizeChain(cfg.Routing.Chain),
 		blacklist: parseBlacklist(cfg.Blacklist.Domains),
 	}
@@ -83,18 +105,33 @@ func (s *Server) Run(ctx context.Context) error {
 		{
 			Name:     "dns-udp",
 			Required: true,
-			Start:    s.runDNSComponent("udp", dnsMux),
+			Start:    s.runDNSComponent("udp", s.cfg.Listen.DNS, dnsMux),
 		},
 		{
 			Name:     "dns-tcp",
 			Required: true,
-			Start:    s.runDNSComponent("tcp", dnsMux),
+			Start:    s.runDNSComponent("tcp", s.cfg.Listen.DNS, dnsMux),
 		},
 		{
 			Name:     "metrics-http",
 			Required: true,
 			Start:    s.runMetricsComponent(),
 		},
+	}
+
+	if s.cfg.Listen.DoT != "" {
+		components = append(components, control.ComponentConfig{
+			Name:     "dns-dot",
+			Required: true,
+			Start:    s.runDoTComponent(dnsMux),
+		})
+	}
+	if s.cfg.Listen.DoH != "" {
+		components = append(components, control.ComponentConfig{
+			Name:     "dns-doh",
+			Required: true,
+			Start:    s.runDoHComponent(),
+		})
 	}
 
 	s.supervisor = control.New(s.logger, s.metrics, components, control.Options{
@@ -113,10 +150,10 @@ func (s *Server) Run(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) runDNSComponent(network string, handler dns.Handler) func(context.Context) error {
+func (s *Server) runDNSComponent(network, addr string, handler dns.Handler) func(context.Context) error {
 	return func(ctx context.Context) error {
 		srv := &dns.Server{
-			Addr:         s.cfg.Listen.DNS,
+			Addr:         addr,
 			Net:          network,
 			Handler:      handler,
 			ReusePort:    s.cfg.Listen.ReusePort,
@@ -131,12 +168,76 @@ func (s *Server) runDNSComponent(network string, handler dns.Handler) func(conte
 			_ = srv.Shutdown()
 		}()
 
-		s.logger.Infof("%s component started on %s", network, s.cfg.Listen.DNS)
+		s.logger.Infof("%s component started on %s", network, addr)
 		err := srv.ListenAndServe()
 		if ctx.Err() != nil {
 			return nil
 		}
 		return fmt.Errorf("%s listener failed: %w", network, err)
+	}
+}
+
+func (s *Server) runDoTComponent(handler dns.Handler) func(context.Context) error {
+	return func(ctx context.Context) error {
+		cert, err := tls.LoadX509KeyPair(s.cfg.Listen.TLSCertFile, s.cfg.Listen.TLSKeyFile)
+		if err != nil {
+			return fmt.Errorf("load dot certificate: %w", err)
+		}
+
+		srv := &dns.Server{
+			Addr:         s.cfg.Listen.DoT,
+			Net:          "tcp-tls",
+			Handler:      handler,
+			ReadTimeout:  time.Duration(s.cfg.Listen.ReadTimeoutMS) * time.Millisecond,
+			WriteTimeout: time.Duration(s.cfg.Listen.WriteTimeoutMS) * time.Millisecond,
+			TLSConfig: &tls.Config{
+				MinVersion:   tls.VersionTLS12,
+				Certificates: []tls.Certificate{cert},
+			},
+		}
+
+		go func() {
+			<-ctx.Done()
+			_ = srv.Shutdown()
+		}()
+
+		s.logger.Infof("dot component started on %s", s.cfg.Listen.DoT)
+		err = srv.ListenAndServe()
+		if ctx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("dot listener failed: %w", err)
+	}
+}
+
+func (s *Server) runDoHComponent() func(context.Context) error {
+	return func(ctx context.Context) error {
+		mux := http.NewServeMux()
+		mux.HandleFunc(s.cfg.Listen.DoHPath, s.handleDoH)
+
+		server := &http.Server{
+			Addr:         s.cfg.Listen.DoH,
+			Handler:      mux,
+			ReadTimeout:  time.Duration(s.cfg.Listen.ReadTimeoutMS) * time.Millisecond,
+			WriteTimeout: time.Duration(s.cfg.Listen.WriteTimeoutMS) * time.Millisecond,
+			TLSConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+			},
+		}
+
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = server.Shutdown(shutdownCtx)
+		}()
+
+		s.logger.Infof("doh component started on %s%s", s.cfg.Listen.DoH, s.cfg.Listen.DoHPath)
+		err := server.ListenAndServeTLS(s.cfg.Listen.TLSCertFile, s.cfg.Listen.TLSKeyFile)
+		if ctx.Err() != nil || errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("doh listener failed: %w", err)
 	}
 }
 
@@ -209,22 +310,107 @@ func (s *Server) writeSupervisorStatus(w http.ResponseWriter, healthy bool) {
 }
 
 func (s *Server) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
-	s.metrics.IncQueries()
-	if len(req.Question) == 0 {
-		s.writeRcode(w, req, dns.RcodeFormatError)
+	resp := s.resolveDNS(req, w.RemoteAddr())
+	if err := w.WriteMsg(resp); err != nil {
+		s.logger.Errorf("write dns response: %v", err)
+	}
+}
+
+func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", "GET, POST")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
+	remoteIP := remoteIPFromString(r.RemoteAddr)
+	if !s.allowedRemoteIP(remoteIP) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	wire, err := readDoHWireMessage(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	req := new(dns.Msg)
+	if err := req.Unpack(wire); err != nil {
+		http.Error(w, "invalid dns message", http.StatusBadRequest)
+		return
+	}
+
+	resp := s.resolveDNS(req, &net.TCPAddr{IP: remoteIP})
+	payload, err := resp.Pack()
+	if err != nil {
+		http.Error(w, "encode dns response", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/dns-message")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(payload)
+}
+
+func readDoHWireMessage(r *http.Request) ([]byte, error) {
+	switch r.Method {
+	case http.MethodGet:
+		encoded := strings.TrimSpace(r.URL.Query().Get("dns"))
+		if encoded == "" {
+			return nil, errors.New("missing dns query parameter")
+		}
+		data, err := base64.RawURLEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, errors.New("invalid dns query parameter")
+		}
+		return data, nil
+	case http.MethodPost:
+		defer r.Body.Close()
+		data, err := io.ReadAll(io.LimitReader(r.Body, 65535))
+		if err != nil {
+			return nil, errors.New("failed to read request body")
+		}
+		if len(data) == 0 {
+			return nil, errors.New("empty request body")
+		}
+		return data, nil
+	default:
+		return nil, errors.New("unsupported method")
+	}
+}
+
+func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr) *dns.Msg {
+	s.metrics.IncQueries()
+	if len(req.Question) == 0 {
+		return s.rcodeResponse(req, dns.RcodeFormatError)
+	}
+
+	if !s.allowedRemoteIP(remoteIPFromNetAddr(remoteAddr)) {
+		return s.rcodeResponse(req, dns.RcodeRefused)
+	}
+
 	current := normalizeQuestion(req.Question[0])
-	s.logger.Queryf("query id=%d remote=%s domain=%s type=%s", req.Id, w.RemoteAddr(), current.Name, dns.TypeToString[current.Qtype])
+	remote := "<unknown>"
+	if remoteAddr != nil {
+		remote = remoteAddr.String()
+	}
+	s.logger.Queryf("query id=%d remote=%s domain=%s type=%s", req.Id, remote, current.Name, dns.TypeToString[current.Qtype])
 
 	for _, stage := range s.chain {
 		switch stage {
 		case "blacklist":
 			if s.isBlocked(current.Name) {
 				s.logger.Debugf("blocked domain %s", current.Name)
-				s.writeRcode(w, req, dns.RcodeRefused)
-				return
+				return s.rcodeResponse(req, dns.RcodeRefused)
+			}
+
+		case "hosts":
+			if s.hosts == nil {
+				continue
+			}
+			if ans, ok := s.hosts.Lookup(current.Name, current.Qtype); ok {
+				return s.localDataResponse(req, current, plugin.LocalData{IPs: ans.IPs, TTL: ans.TTL})
 			}
 
 		case "cache":
@@ -235,10 +421,7 @@ func (s *Server) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 				s.metrics.IncCacheHits()
 				cached.Id = req.Id
 				cached.Question = []dns.Question{current}
-				if err := w.WriteMsg(cached); err != nil {
-					s.logger.Errorf("write cached response: %v", err)
-				}
-				return
+				return cached
 			}
 
 		case "lua_policy", "plugin", "plugins", "lua":
@@ -253,14 +436,9 @@ func (s *Server) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 			}
 			switch decision.Action {
 			case plugin.ActionBlock:
-				s.writeRcode(w, req, dns.RcodeRefused)
-				return
+				return s.rcodeResponse(req, dns.RcodeRefused)
 			case plugin.ActionLocalData:
-				resp := s.localDataResponse(req, decision.Question, decision.Local)
-				if err := w.WriteMsg(resp); err != nil {
-					s.logger.Errorf("write local data response: %v", err)
-				}
-				return
+				return s.localDataResponse(req, decision.Question, decision.Local)
 			case plugin.ActionRewrite, plugin.ActionForward:
 				current = normalizeQuestion(decision.Question)
 			}
@@ -269,23 +447,19 @@ func (s *Server) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 			resp, up, err := s.resolver.Forward(context.Background(), req, current)
 			if err != nil {
 				s.logger.Errorf("upstream forward failed for %s: %v", current.Name, err)
-				s.writeRcode(w, req, dns.RcodeServerFailure)
-				return
+				return s.rcodeResponse(req, dns.RcodeServerFailure)
 			}
 			if s.cache != nil && resp.Rcode == dns.RcodeSuccess {
 				s.cache.Set(current, resp)
 			}
-			if err := w.WriteMsg(resp); err != nil {
-				s.logger.Errorf("write upstream response: %v", err)
-			}
 			s.logger.Debugf("upstream=%s served domain=%s type=%s", up.Name, current.Name, dns.TypeToString[current.Qtype])
-			return
+			return resp
 		default:
 			s.logger.Debugf("unknown chain stage: %s", stage)
 		}
 	}
 
-	s.writeRcode(w, req, dns.RcodeServerFailure)
+	return s.rcodeResponse(req, dns.RcodeServerFailure)
 }
 
 func (s *Server) localDataResponse(req *dns.Msg, q dns.Question, local plugin.LocalData) *dns.Msg {
@@ -333,12 +507,10 @@ func (s *Server) isBlocked(name string) bool {
 	return false
 }
 
-func (s *Server) writeRcode(w dns.ResponseWriter, req *dns.Msg, rcode int) {
+func (s *Server) rcodeResponse(req *dns.Msg, rcode int) *dns.Msg {
 	msg := new(dns.Msg)
 	msg.SetRcode(req, rcode)
-	if err := w.WriteMsg(msg); err != nil {
-		s.logger.Errorf("write rcode response: %v", err)
-	}
+	return msg
 }
 
 func parseBlacklist(domains []string) []blacklistRule {
@@ -370,7 +542,7 @@ func normalizeChain(chain []string) []string {
 		}
 	}
 	if len(out) == 0 {
-		return []string{"blacklist", "cache", "lua_policy", "upstream"}
+		return []string{"blacklist", "hosts", "cache", "lua_policy", "upstream"}
 	}
 	return out
 }
@@ -385,4 +557,79 @@ func normalizeQuestion(q dns.Question) dns.Question {
 
 func normalizeDomain(name string) string {
 	return strings.ToLower(dns.Fqdn(strings.TrimSpace(name)))
+}
+
+func parseACL(values []string) ([]*net.IPNet, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	out := make([]*net.IPNet, 0, len(values))
+	for i, value := range values {
+		netmask, err := parseCIDROrIP(value)
+		if err != nil {
+			return nil, fmt.Errorf("acl[%d]: %w", i, err)
+		}
+		out = append(out, netmask)
+	}
+	return out, nil
+}
+
+func parseCIDROrIP(value string) (*net.IPNet, error) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return nil, errors.New("empty ACL value")
+	}
+	if _, ipnet, err := net.ParseCIDR(v); err == nil {
+		return ipnet, nil
+	}
+	ip := net.ParseIP(v)
+	if ip == nil {
+		return nil, fmt.Errorf("invalid CIDR/IP %q", value)
+	}
+	if ip.To4() != nil {
+		_, ipnet, _ := net.ParseCIDR(ip.String() + "/32")
+		return ipnet, nil
+	}
+	_, ipnet, _ := net.ParseCIDR(ip.String() + "/128")
+	return ipnet, nil
+}
+
+func (s *Server) allowedRemoteIP(ip net.IP) bool {
+	if len(s.acl) == 0 {
+		return true
+	}
+	if ip == nil {
+		return false
+	}
+	for _, netmask := range s.acl {
+		if netmask.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func remoteIPFromNetAddr(addr net.Addr) net.IP {
+	if addr == nil {
+		return nil
+	}
+	switch v := addr.(type) {
+	case *net.TCPAddr:
+		return v.IP
+	case *net.UDPAddr:
+		return v.IP
+	default:
+		return remoteIPFromString(addr.String())
+	}
+}
+
+func remoteIPFromString(raw string) net.IP {
+	host := strings.TrimSpace(raw)
+	if host == "" {
+		return nil
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return net.ParseIP(host)
 }

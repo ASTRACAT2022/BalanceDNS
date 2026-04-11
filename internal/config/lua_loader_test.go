@@ -27,6 +27,7 @@ return {
     udp_size = 1232,
   },
   logging = { level = "debug", log_queries = true },
+  acl = { "0.0.0.0/0", "::/0" },
   upstreams = {
     {
       name = "google-doh",
@@ -42,6 +43,10 @@ return {
     capacity = 10240,
     min_ttl_seconds = 5,
     max_ttl_seconds = 600,
+  },
+  hosts = {
+    file = "./hosts.txt",
+    ttl = 120,
   },
   plugins = {
     enabled = true,
@@ -74,5 +79,11 @@ return {
 	}
 	if !filepath.IsAbs(cfg.Plugins.Entries[0].Path) {
 		t.Fatalf("expected absolute plugin path from lua config, got %s", cfg.Plugins.Entries[0].Path)
+	}
+	if cfg.Hosts.TTL != 120 {
+		t.Fatalf("unexpected hosts ttl: %d", cfg.Hosts.TTL)
+	}
+	if !filepath.IsAbs(cfg.Hosts.File) {
+		t.Fatalf("expected absolute hosts path from lua config, got %s", cfg.Hosts.File)
 	}
 }

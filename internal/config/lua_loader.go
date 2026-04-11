@@ -81,6 +81,9 @@ func loadLua(path string) (*Config, error) {
 			}
 		}
 	}
+	if cfg.Hosts.File != "" && !filepath.IsAbs(cfg.Hosts.File) {
+		cfg.Hosts.File = filepath.Join(filepath.Dir(path), cfg.Hosts.File)
+	}
 
 	return cfg, nil
 }
