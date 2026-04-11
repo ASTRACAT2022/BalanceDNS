@@ -36,7 +36,6 @@ BalanceDNS is a lightweight DNS resolver/forwarder in Go with policy-based routi
 ## Run
 
 ```bash
-go run ./cmd/balancedns -config configs/balancedns.yaml
 go run ./cmd/balancedns -config configs/balancedns.lua
 ```
 
@@ -46,9 +45,9 @@ Detailed Russian manual:
 
 ## Config
 
-See `configs/balancedns.yaml` and `configs/balancedns.lua`.
+See `configs/balancedns.lua`.
 
-YAML, JSON and Lua are supported.
+Only Lua config is supported.
 
 Lua config must return table:
 
@@ -61,32 +60,37 @@ return {
 }
 ```
 
-### Upstream examples
+### Upstream example
 
-```yaml
-upstreams:
-  - name: "global-doh"
-    protocol: "doh"
-    doh_url: "https://dns.google/dns-query"
-    zones: ["."]
-    timeout_ms: 1500
-
-  - name: "global-dot"
-    protocol: "dot"
-    addr: "1.1.1.1:853"
-    tls_server_name: "cloudflare-dns.com"
-    zones: ["."]
-    timeout_ms: 1500
+```lua
+upstreams = {
+  {
+    name = "global-doh",
+    protocol = "doh",
+    doh_url = "https://dns.google/dns-query",
+    zones = {"."},
+    timeout_ms = 1500
+  },
+  {
+    name = "global-dot",
+    protocol = "dot",
+    addr = "1.1.1.1:853",
+    tls_server_name = "cloudflare-dns.com",
+    zones = {"."},
+    timeout_ms = 1500
+  }
+}
 ```
 
 ### Control plane
 
-```yaml
-control:
-  restart_backoff_ms: 200
-  restart_max_backoff_ms: 5000
-  max_consecutive_failure: 0
-  min_stable_run_ms: 10000
+```lua
+control = {
+  restart_backoff_ms = 200,
+  restart_max_backoff_ms = 5000,
+  max_consecutive_failure = 0,
+  min_stable_run_ms = 10000
+}
 ```
 
 - `0` in `max_consecutive_failure` means unlimited restart attempts.
@@ -139,18 +143,15 @@ or
 
 ### Plugin entries
 
-```yaml
-plugins:
-  enabled: true
-  timeout_ms: 20
-  entries:
-    - name: "lua-policy"
-      runtime: "lua"
-      path: "scripts/policy.lua"
-    - name: "go-policy"
-      runtime: "go_exec"
-      path: "/opt/balancedns/plugins/go-policy"
-      timeout_ms: 10
+```lua
+plugins = {
+  enabled = true,
+  timeout_ms = 20,
+  entries = {
+    { name = "lua-policy", runtime = "lua", path = "scripts/policy.lua" },
+    { name = "go-policy", runtime = "go_exec", path = "/opt/balancedns/plugins/go-policy", timeout_ms = 10 }
+  }
+}
 ```
 
 Example Go plugin source: `scripts/go_policy_example.go` (build it into executable and use `runtime: "go_exec"`).
@@ -183,4 +184,4 @@ docker compose up -d --build
 Files:
 - `Dockerfile`
 - `docker-compose.yml`
-- `configs/docker.yaml`
+- `configs/docker.lua`

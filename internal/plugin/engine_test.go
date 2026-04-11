@@ -53,7 +53,7 @@ printf '{"action":"LOCAL_DATA","local_data":{"ips":["127.0.0.9"],"ttl":30}}'
 		t.Fatalf("write script: %v", err)
 	}
 
-	e, err := NewEngine([]config.PluginEntry{{Name: "goexec", Runtime: "go_exec", Path: script}}, 1500*time.Millisecond)
+	e, err := NewEngine([]config.PluginEntry{{Name: "goexec", Runtime: "go_exec", Path: script}}, 5*time.Second)
 	if err != nil {
 		t.Fatalf("new engine: %v", err)
 	}

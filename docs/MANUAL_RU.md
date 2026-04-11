@@ -14,19 +14,13 @@
 ### Локально
 
 ```bash
-go run ./cmd/balancedns -config configs/balancedns.yaml
-```
-
-или Lua-конфиг:
-
-```bash
 go run ./cmd/balancedns -config configs/balancedns.lua
 ```
 
 ### Проверка
 
 ```bash
-# DNS (пример для порта 5353 из balancedns.yaml)
+# DNS (пример для порта 5353 из balancedns.lua)
 dig @127.0.0.1 -p 5353 example.org A
 
 # Метрики
@@ -35,9 +29,7 @@ curl -s http://127.0.0.1:9090/metrics | rg balancedns_
 
 ## 3. Конфиг: форматы и дефолты
 
-Поддерживаются:
-- YAML
-- JSON
+Поддерживается только:
 - Lua (`return { ... }`)
 
 Основные дефолты:
@@ -203,12 +195,13 @@ BalanceDNS запускает компоненты как независимые
 
 Настройки:
 
-```yaml
-control:
-  restart_backoff_ms: 200
-  restart_max_backoff_ms: 5000
-  max_consecutive_failure: 0
-  min_stable_run_ms: 10000
+```lua
+control = {
+  restart_backoff_ms = 200,
+  restart_max_backoff_ms = 5000,
+  max_consecutive_failure = 0,
+  min_stable_run_ms = 10000
+}
 ```
 
 - `max_consecutive_failure: 0` означает бесконечные попытки перезапуска.
@@ -235,7 +228,7 @@ docker compose up -d --build
 Файлы:
 - `Dockerfile`
 - `docker-compose.yml`
-- `configs/docker.yaml`
+- `configs/docker.lua`
 
 ### 11.2 Через docker run
 
@@ -245,9 +238,9 @@ docker build -t balancedns:local .
 docker run -d --name balancedns \
   --cap-add=NET_BIND_SERVICE \
   -p 53:53/udp -p 53:53/tcp -p 9090:9090 \
-  -v $(pwd)/configs/docker.yaml:/app/configs/docker.yaml:ro \
+  -v $(pwd)/configs/docker.lua:/app/configs/docker.lua:ro \
   -v $(pwd)/scripts:/app/scripts:ro \
-  balancedns:local -config /app/configs/docker.yaml
+  balancedns:local -config /app/configs/docker.lua
 ```
 
 ## 12. Тесты и диагностика

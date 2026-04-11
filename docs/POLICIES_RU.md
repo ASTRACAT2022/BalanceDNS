@@ -4,21 +4,22 @@
 
 Политики выполняются на этапе `lua_policy` в `routing.chain`:
 
-```yaml
-routing:
-  chain: ["blacklist", "cache", "lua_policy", "upstream"]
+```lua
+routing = {
+  chain = {"blacklist", "cache", "lua_policy", "upstream"}
+}
 ```
 
 Конфиг плагинов:
 
-```yaml
-plugins:
-  enabled: true
-  timeout_ms: 20
-  entries:
-    - name: "lua-policy"
-      runtime: "lua"
-      path: "scripts/policy.lua"
+```lua
+plugins = {
+  enabled = true,
+  timeout_ms = 20,
+  entries = {
+    { name = "lua-policy", runtime = "lua", path = "scripts/policy.lua" }
+  }
+}
 ```
 
 Плагины идут по порядку в `entries`.
@@ -88,15 +89,14 @@ end
 
 ### 4.1 Конфиг
 
-```yaml
-plugins:
-  enabled: true
-  timeout_ms: 20
-  entries:
-    - name: "go-policy"
-      runtime: "go_exec"
-      path: "/opt/balancedns/plugins/go-policy"
-      timeout_ms: 10
+```lua
+plugins = {
+  enabled = true,
+  timeout_ms = 20,
+  entries = {
+    { name = "go-policy", runtime = "go_exec", path = "/opt/balancedns/plugins/go-policy", timeout_ms = 10 }
+  }
+}
 ```
 
 ### 4.2 I/O формат
@@ -147,7 +147,7 @@ stdout:
 Локально:
 
 ```bash
-go run ./cmd/balancedns -config configs/balancedns.yaml
+go run ./cmd/balancedns -config configs/balancedns.lua
 
 # проверка BLOCK
 dig @127.0.0.1 -p 5353 ads.example A

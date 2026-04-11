@@ -1,17 +1,13 @@
 package config
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/url"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
@@ -90,62 +86,19 @@ type ControlConfig struct {
 
 func Load(path string) (*Config, error) {
 	ext := strings.ToLower(filepath.Ext(path))
-	switch ext {
-	case ".lua":
-		cfg, err := loadLua(path)
-		if err != nil {
-			return nil, err
-		}
-		applyDefaults(cfg)
-		if err := validate(cfg); err != nil {
-			return nil, err
-		}
-		return cfg, nil
-	case ".yaml", ".yml":
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("read config: %w", err)
-		}
-		cfg := &Config{}
-		if err := yaml.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parse yaml: %w", err)
-		}
-		applyDefaults(cfg)
-		if err := validate(cfg); err != nil {
-			return nil, err
-		}
-		return cfg, nil
-	case ".json":
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("read config: %w", err)
-		}
-		cfg := &Config{}
-		if err := json.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("parse json: %w", err)
-		}
-		applyDefaults(cfg)
-		if err := validate(cfg); err != nil {
-			return nil, err
-		}
-		return cfg, nil
-	default:
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("read config: %w", err)
-		}
-		cfg := &Config{}
-		if err := yaml.Unmarshal(data, cfg); err != nil {
-			if err2 := json.Unmarshal(data, cfg); err2 != nil {
-				return nil, errors.New("config must be YAML, JSON, or Lua")
-			}
-		}
-		applyDefaults(cfg)
-		if err := validate(cfg); err != nil {
-			return nil, err
-		}
-		return cfg, nil
+	if ext != ".lua" {
+		return nil, errors.New("only Lua config is supported (.lua)")
 	}
+
+	cfg, err := loadLua(path)
+	if err != nil {
+		return nil, err
+	}
+	applyDefaults(cfg)
+	if err := validate(cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 func applyDefaults(cfg *Config) {
