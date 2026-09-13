@@ -53,3 +53,55 @@ func TestCacheEvictsLRU(t *testing.T) {
 		t.Fatalf("expected second item to remain")
 	}
 }
+
+func TestCacheCopiesAndDecrementsTTL(t *testing.T) {
+	c := New(10, 0, 60)
+	q := dns.Question{Name: "copy.example.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	msg := makeMsg(q.Name)
+	msg.Answer[0].Header().Ttl = 2
+	c.Set(q, msg)
+
+	// A caller changing its response after Set must not corrupt the cache.
+	msg.Answer[0].Header().Ttl = 99
+	time.Sleep(1100 * time.Millisecond)
+	cached, ok := c.Get(q)
+	if !ok {
+		t.Fatal("expected cache hit")
+	}
+	if got := cached.Answer[0].Header().Ttl; got > 1 {
+		t.Fatalf("cached TTL = %d, want at most 1 second remaining", got)
+	}
+	if got := cached.Answer[0].Header().Ttl; got == 99 {
+		t.Fatal("cache retained a mutable caller-owned response")
+	}
+}
+
+func TestCacheDistinguishesQuestionClass(t *testing.T) {
+	c := New(10, 1, 60)
+	in := dns.Question{Name: "class.example.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+	chaos := in
+	chaos.Qclass = dns.ClassCHAOS
+	c.Set(in, makeMsg(in.Name))
+	if _, ok := c.Get(chaos); ok {
+		t.Fatal("cache hit for a different DNS question class")
+	}
+}
+
+func TestCacheDoesNotStoreZeroTTLOrTruncatedResponse(t *testing.T) {
+	c := New(10, 1, 60)
+	q := dns.Question{Name: "uncacheable.example.", Qtype: dns.TypeA, Qclass: dns.ClassINET}
+
+	zeroTTL := makeMsg(q.Name)
+	zeroTTL.Answer[0].Header().Ttl = 0
+	c.Set(q, zeroTTL)
+	if _, ok := c.Get(q); ok {
+		t.Fatal("zero-TTL response must not be cached")
+	}
+
+	truncated := makeMsg(q.Name)
+	truncated.Truncated = true
+	c.Set(q, truncated)
+	if _, ok := c.Get(q); ok {
+		t.Fatal("truncated response must not be cached")
+	}
+}

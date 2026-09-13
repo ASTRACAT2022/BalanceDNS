@@ -38,9 +38,10 @@ type Server struct {
 	hosts    *hosts.Table
 	acl      []*net.IPNet
 
-	chain     []string
-	blacklist blacklistIndex
-	allowlist allowlistIndex
+	chain        []string
+	cacheInChain bool
+	blacklist    blacklistIndex
+	allowlist    allowlistIndex
 
 	// Мульти-тенантность: конфиги по токенам (config_id) для DoH NextDNS-стиля.
 	tenants map[string]*tenantConfig
@@ -202,19 +203,21 @@ func New(cfg *config.Config) (*Server, error) {
 		return nil, err
 	}
 
+	chain := normalizeChain(cfg.Routing.Chain)
 	s := &Server{
-		cfg:       cfg,
-		logger:    logger,
-		metrics:   m,
-		cache:     c,
-		plugins:   engine,
-		resolver:  resolver,
-		hosts:     hostTable,
-		acl:       acl,
-		chain:     normalizeChain(cfg.Routing.Chain),
-		blacklist: blacklist,
-		dotTenants: make(map[string]*tenantConfig),
-		rlCounts:  make(map[string]*rlEntry),
+		cfg:          cfg,
+		logger:       logger,
+		metrics:      m,
+		cache:        c,
+		plugins:      engine,
+		resolver:     resolver,
+		hosts:        hostTable,
+		acl:          acl,
+		chain:        chain,
+		cacheInChain: hasChainStage(chain, "cache"),
+		blacklist:    blacklist,
+		dotTenants:   make(map[string]*tenantConfig),
+		rlCounts:     make(map[string]*rlEntry),
 	}
 
 	// Лог DNS-запросов (для аналитики по-доменно).
@@ -844,13 +847,11 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, 
 				continue
 			}
 			if cached, ok := s.cache.Get(current); ok {
-				s.metrics.IncCacheHits()
 				cached.Id = req.Id
 				cached.Question = []dns.Question{current}
 				resp = cached
 				goto done
 			}
-			s.metrics.IncCacheMisses()
 
 		case "lua_policy", "plugin", "plugins", "lua":
 			if s.plugins == nil {
@@ -885,7 +886,7 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, 
 				resp = s.rcodeResponse(req, dns.RcodeServerFailure)
 				goto done
 			}
-			if s.cache != nil && resp.Rcode == dns.RcodeSuccess {
+			if s.cacheInChain && s.cache != nil && resp.Rcode == dns.RcodeSuccess {
 				s.cache.Set(current, resp)
 			}
 			s.logger.Debugf("upstream served domain=%s type=%s", current.Name, dns.TypeToString[current.Qtype])
@@ -1014,6 +1015,15 @@ func normalizeChain(chain []string) []string {
 		return []string{"blacklist", "hosts", "cache", "lua_policy", "upstream"}
 	}
 	return out
+}
+
+func hasChainStage(chain []string, wanted string) bool {
+	for _, stage := range chain {
+		if stage == wanted {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeQuestion(q dns.Question) dns.Question {
