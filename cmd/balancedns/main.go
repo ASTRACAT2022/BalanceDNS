@@ -12,6 +12,10 @@ import (
 	"balancedns/internal/config"
 )
 
+// version заполняется при сборке через -ldflags "-X main.version=...".
+// Используется для версионирования бинарника (zero-downtime deploy).
+var version = "dev"
+
 func main() {
 	configPath := flag.String("config", "configs/prod.lua", "Path to Lua config")
 	flag.Parse()

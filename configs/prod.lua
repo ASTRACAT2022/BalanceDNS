@@ -1,19 +1,12 @@
-local bind_ip = env("BALANCEDNS_BIND_IP", "144.31.151.64")
-local metrics_ip = env("BALANCEDNS_METRICS_IP", "0.0.0.0")
-
-local function addr(ip, port)
-  return string.format("%s:%d", ip, port)
-end
-
 return {
   listen = {
-    dns = addr(bind_ip, 53),
-    dot = addr(bind_ip, 853),
-    doh = addr(bind_ip, 443),
+    dns = "0.0.0.0:53",
+    dot = "0.0.0.0:853",
+    doh = "0.0.0.0:5443",
     doh_path = "/dns-query",
-    tls_cert_file = env("BALANCEDNS_TLS_CERT", "/etc/balancedns/certs/fullchain.cer"),
-    tls_key_file = env("BALANCEDNS_TLS_KEY", "/etc/balancedns/certs/key.key"),
-    metrics = addr(metrics_ip, 9091),
+    tls_cert_file = "/certs/dns.astracat.ru/fullchain.pem",
+    tls_key_file = "/certs/dns.astracat.ru/privkey.pem",
+    metrics = "0.0.0.0:9099",
     read_timeout_ms = 2500,
     write_timeout_ms = 2500,
     reuse_port = true,
@@ -39,14 +32,14 @@ return {
     {
       name = "global-primary",
       protocol = "udp",
-      addr = "95.85.95.85:53",
+      addr = "188.93.16.19:53",
       zones = { "." },
       timeout_ms = 1200,
     },
     {
       name = "global-backup",
       protocol = "udp",
-      addr = "2.56.220.2:53",
+      addr = "188.93.17.19:53",
       zones = { "." },
       timeout_ms = 1200,
     },
@@ -69,11 +62,15 @@ return {
   },
 
   plugins = {
-    enabled = false,
+    enabled = true,
     timeout_ms = 20,
+    entries = {
+      { name = "lua-policy", runtime = "lua", path = "../scripts/policy.lua" }
+    },
   },
 
-  blacklist = {},
+  blacklist = {
+  },
 
   control = {
     restart_backoff_ms = 200,

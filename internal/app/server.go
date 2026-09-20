@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -23,6 +24,7 @@ import (
 	"balancedns/internal/metrics"
 	"balancedns/internal/plugin"
 	"balancedns/internal/router"
+	"balancedns/internal/threat"
 	control "balancedns/internal/runtime"
 
 	"github.com/miekg/dns"
@@ -38,128 +40,78 @@ type Server struct {
 	hosts    *hosts.Table
 	acl      []*net.IPNet
 
-	chain        []string
-	cacheInChain bool
-	blacklist    blacklistIndex
-	allowlist    allowlistIndex
+	chain     []string
+	blacklist *blacklistIndex
+	tenants   *tenantStore
+	threat    *threat.Manager
 
-	// Мульти-тенантность: конфиги по токенам (config_id) для DoH NextDNS-стиля.
-	tenants map[string]*tenantConfig
+	// cnamesGlue caches live-resolved A/AAAA glue (IPs) for CNAME targets so a
+	// CNAME answer can inline the target's addresses. TTL 60s per entry.
+	cnamesGlue sync.Map // map[string]cnamesGlueEntry
 
-	// Мульти-тенантность DoT: SNI (поддомен) → конфиг.
-	// Ключ — адрес клиента (RemoteAddr), заполняется в GetConfigForClient при TLS-handshake.
-	dotTenants   map[string]*tenantConfig
-	dotTenantsMu sync.Mutex
-
-	// Общий security-blacklist (фиды) — проверяется отдельно, НЕ дублируется в конфиги.
-	securityBlacklist blacklistIndex
-	securityDomains   map[string][]string
-
-	// Rate-limit: защита от DNS-амплификации/флуда.
-	// map[IP] → счётчик запросов в окне.
-	rlMu     sync.Mutex
-	rlCounts map[string]*rlEntry
-
-	// Лог DNS-запросов (для аналитики по-доменно).
-	queryLog *QueryLogger
+	// dotConfigID maps a DoT client remote-address to the tenant config_id
+	// selected by SNI ({config_id}.dns.astracat.network) at TLS handshake.
+	// Populated by runDoTComponent's GetConfigForClient; consumed by handleDNS
+	// so per-tenant rules apply to per-tenant DoT connections.
+	dotConfigID sync.Map // map[string]string (remoteAddr -> config_id)
 
 	supervisor *control.Supervisor
+
+	queryLog *queryLogger
 }
 
-// rlEntry — счётчик запросов для rate-limit.
-type rlEntry struct {
-	count       int
-	windowStart time.Time
+// blacklistRule — одно правило чёрного списка.
+type blacklistRule struct {
+	suffix bool
+	value  string
 }
 
-// tenantConfig — конфиг конкретного токена (config_id).
-type tenantConfig struct {
-	blacklist blacklistIndex
-	allowlist allowlistIndex
-	hosts     *hosts.Table
-	// securityEnabled — true, если у конфига включены security-категории
-	// (тогда применяется общий security.blacklist).
-	securityEnabled bool
-}
-
-// tenantForPath возвращает конфиг по токену из пути (/{token}).
-// Если токен не найден — возвращает nil (используется дефолтный конфиг).
-func (s *Server) tenantForPath(path string) *tenantConfig {
-	if s.tenants == nil {
-		return nil
-	}
-	// Путь вида /{token} или /{token}/...
-	token := strings.TrimPrefix(path, "/")
-	if i := strings.Index(token, "/"); i >= 0 {
-		token = token[:i]
-	}
-	if token == "" || token == "dns-query" {
-		return nil
-	}
-	return s.tenants[token]
-}
-
-// SetTenant добавляет/обновляет конфиг токена.
-func (s *Server) SetTenant(token string, blacklist blacklistIndex, hosts *hosts.Table) {
-	if s.tenants == nil {
-		s.tenants = make(map[string]*tenantConfig)
-	}
-	s.tenants[token] = &tenantConfig{blacklist: blacklist, hosts: hosts}
-}
-
-// SetTenantFull добавляет/обновляет конфиг токена с allowlist и security-флагом.
-func (s *Server) SetTenantFull(token string, blacklist blacklistIndex, allowlist allowlistIndex, hosts *hosts.Table, securityEnabled bool) {
-	if s.tenants == nil {
-		s.tenants = make(map[string]*tenantConfig)
-	}
-	s.tenants[token] = &tenantConfig{blacklist: blacklist, allowlist: allowlist, hosts: hosts, securityEnabled: securityEnabled}
-}
-
-// RemoveTenant удаляет конфиг токена.
-func (s *Server) RemoveTenant(token string) {
-	if s.tenants != nil {
-		delete(s.tenants, token)
-	}
-}
-
-// blacklistIndex — индекс чёрного списка для быстрого O(1) поиска.
-// Точные совпадения — в map; wildcard/suffix-правила — в отдельном слайсе
-// (их обычно немного). Это заменяет линейный скан всего списка на каждый запрос.
+// blacklistIndex — индексированный чёрный список для O(1) lookup.
+// Точные правила хранятся в map, суффиксные проверяются по меткам домена.
+// Это критично для больших списков (100K+ доменов): линейный поиск по всем
+// правилам на каждый запрос был бы O(N) и упирался бы в CPU под нагрузкой.
 type blacklistIndex struct {
-	exact    map[string]struct{}
-	suffixes []string
+	exact   map[string]struct{} // точные домены (без суффиксного совпадения)
+	suffix  map[string]struct{} // суффиксные домены (блокируют поддомены)
 }
 
-func newBlacklistIndex() blacklistIndex {
-	return blacklistIndex{exact: make(map[string]struct{})}
-}
-
-// allowlistIndex — индекс белого списка (исключений) для O(1) поиска.
-// Домены из allowlist НЕ блокируются, даже если они в blacklist.
-type allowlistIndex struct {
-	exact map[string]struct{}
-}
-
-func newAllowlistIndex() allowlistIndex {
-	return allowlistIndex{exact: make(map[string]struct{})}
-}
-
-// isAllowed возвращает true, если домен (или его родитель) в allowlist.
-func (a allowlistIndex) isAllowed(name string) bool {
-	if len(a.exact) == 0 {
-		return false
+func newBlacklistIndex() *blacklistIndex {
+	return &blacklistIndex{
+		exact:  make(map[string]struct{}),
+		suffix: make(map[string]struct{}),
 	}
-	// Проверяем сам домен и всех родителей (example.com, com).
+}
+
+func (b *blacklistIndex) add(rule blacklistRule) {
+	if rule.suffix {
+		b.suffix[rule.value] = struct{}{}
+	} else {
+		b.exact[rule.value] = struct{}{}
+	}
+}
+
+func (b *blacklistIndex) contains(name string) bool {
+	normalized := normalizeDomain(name)
+	if _, ok := b.exact[normalized]; ok {
+		return true
+	}
+	// Суффиксные правила: проверяем сам домен и каждую суффиксную
+	// последовательность меток. "sub.example.com" → проверяем
+	// "sub.example.com", "example.com", "com". O(число меток), а не O(число правил).
+	if _, ok := b.suffix[normalized]; ok {
+		return true
+	}
 	for {
-		if _, ok := a.exact[name]; ok {
+		idx := strings.IndexByte(normalized, '.')
+		if idx < 0 {
+			break
+		}
+		normalized = normalized[idx+1:]
+		if _, ok := b.suffix[normalized]; ok {
 			return true
 		}
-		idx := strings.IndexByte(name, '.')
-		if idx < 0 {
-			return false
-		}
-		name = name[idx+1:]
 	}
+	return false
 }
 
 func New(cfg *config.Config) (*Server, error) {
@@ -177,8 +129,23 @@ func New(cfg *config.Config) (*Server, error) {
 	}
 
 	var engine *plugin.Engine
+	var threatMgr *threat.Manager
 	if cfg.Plugins.Enabled && len(cfg.Plugins.Entries) > 0 {
-		engine, err = plugin.NewEngineWithMetrics(cfg.Plugins.Entries, time.Duration(cfg.Plugins.TimeoutMS)*time.Millisecond, m)
+		// Build the Threat Intelligence manager first (if enabled) so its Lua
+		// hook can be threaded into the policy engine's sandboxes.
+		if cfg.Threat != nil && cfg.Threat.Enabled {
+			threatCfg := threatConfigFrom(cfg.Threat)
+			threatMgr, err = threat.NewManager(threatCfg, m.Registry())
+			if err != nil {
+				return nil, fmt.Errorf("threat intelligence: %w", err)
+			}
+		}
+
+		var hook plugin.LuaHook
+		if threatMgr != nil {
+			hook = plugin.NewThreatLuaHook(threatMgr)
+		}
+		engine, err = plugin.NewEngineWithOptions(cfg.Plugins.Entries, time.Duration(cfg.Plugins.TimeoutMS)*time.Millisecond, m, plugin.EngineOption{LuaHook: hook})
 		if err != nil {
 			return nil, err
 		}
@@ -197,211 +164,50 @@ func New(cfg *config.Config) (*Server, error) {
 		return nil, err
 	}
 
-	// Чёрный список: из файла (если задан) или из конфига.
-	blacklist, err := loadBlacklist(cfg)
+	blacklist, err := loadBlacklist(cfg.Blacklist)
 	if err != nil {
 		return nil, err
 	}
 
-	chain := normalizeChain(cfg.Routing.Chain)
 	s := &Server{
-		cfg:          cfg,
-		logger:       logger,
-		metrics:      m,
-		cache:        c,
-		plugins:      engine,
-		resolver:     resolver,
-		hosts:        hostTable,
-		acl:          acl,
-		chain:        chain,
-		cacheInChain: hasChainStage(chain, "cache"),
-		blacklist:    blacklist,
-		dotTenants:   make(map[string]*tenantConfig),
-		rlCounts:     make(map[string]*rlEntry),
+		cfg:       cfg,
+		logger:    logger,
+		metrics:   m,
+		cache:     c,
+		plugins:   engine,
+		resolver:  resolver,
+		hosts:     hostTable,
+		acl:       acl,
+		chain:     normalizeChain(cfg.Routing.Chain),
+		blacklist: blacklist,
+		threat:    threatMgr,
 	}
 
-	// Лог DNS-запросов (для аналитики по-доменно).
 	if cfg.QueryLog != "" {
-		ql, err := NewQueryLogger(cfg.QueryLog)
+		s.queryLog = newQueryLogger(cfg.QueryLog)
+	}
+
+	// Загружаем per-tenant правила (мульти-тенантность DoH/DoT).
+	if cfg.TenantsDir != "" {
+		tenants, err := loadTenants(cfg.TenantsDir)
 		if err != nil {
 			return nil, err
 		}
-		s.queryLog = ql
-		// Периодический flush буфера (не блокирует DNS).
-		go ql.FlushLoop(2*time.Second, nil)
-	}
-
-	// Загружаем тенантов (мульти-тенантность DoH) из директории.
-	if cfg.TenantsDir != "" {
-		if err := s.loadTenants(cfg.TenantsDir); err != nil {
-			return nil, err
-		}
+		s.tenants = tenants
 	}
 
 	return s, nil
-}
-
-// loadTenants загружает конфиги тенантов из директории.
-// Файлы: {token}.blacklist (домены по одному на строку) и {token}.hosts (hosts-формат).
-func (s *Server) loadTenants(dir string) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // директории нет — нет тенантов
-		}
-		return err
-	}
-
-	// Загружаем общий security.blacklist (фиды) — один файл на ноду.
-	// Хранится отдельно (не дублируется в конфиги), проверяется в resolveDNS.
-	s.securityBlacklist = newBlacklistIndex()
-	if secData, err := os.ReadFile(filepath.Join(dir, "security.blacklist")); err == nil {
-		var secDomains []string
-		for _, line := range strings.Split(string(secData), "\n") {
-			d := strings.TrimSpace(line)
-			if d == "" || strings.HasPrefix(d, "#") {
-				continue
-			}
-			secDomains = append(secDomains, d)
-		}
-		s.securityBlacklist = parseBlacklist(secDomains)
-	}
-
-	// Защитные лимиты: предотвращение перегрузки/OOM.
-	maxTenants := s.cfg.Limits.MaxTenants
-	maxPerTenant := s.cfg.Limits.MaxDomainsPerTenant
-	maxTotal := s.cfg.Limits.MaxTotalDomains
-	tenantCount := 0
-	totalDomains := 0
-
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasSuffix(name, ".blacklist") {
-			continue
-		}
-		// Общий security-файл — не тенант, пропускаем (загружается отдельно).
-		if name == "security.blacklist" {
-			continue
-		}
-		// Лимит на количество конфигов.
-		if maxTenants > 0 && tenantCount >= maxTenants {
-			s.logger.Infof("tenant limit reached (%d), skipping %s", maxTenants, name)
-			continue
-		}
-		token := strings.TrimSuffix(name, ".blacklist")
-		blPath := filepath.Join(dir, name)
-		hostsPath := filepath.Join(dir, token+".hosts")
-
-		// Загружаем blacklist.
-		data, err := os.ReadFile(blPath)
-		if err != nil {
-			continue
-		}
-		var domains []string
-		for _, line := range strings.Split(string(data), "\n") {
-			d := strings.TrimSpace(line)
-			if d == "" || strings.HasPrefix(d, "#") {
-				continue
-			}
-			domains = append(domains, d)
-		}
-		// Лимит на размер blacklist одного конфига.
-		if maxPerTenant > 0 && len(domains) > maxPerTenant {
-			s.logger.Infof("tenant %s: %d domains exceeds limit %d, truncating", token, len(domains), maxPerTenant)
-			domains = domains[:maxPerTenant]
-		}
-		// Лимит на общее количество доменов (защита от OOM).
-		if maxTotal > 0 && totalDomains+len(domains) > maxTotal {
-			s.logger.Infof("total domain limit reached (%d), skipping %s", maxTotal, token)
-			continue
-		}
-		totalDomains += len(domains)
-		bl := parseBlacklist(domains)
-
-		// Загружаем hosts (если есть).
-		var hostTable *hosts.Table
-		if _, err := os.Stat(hostsPath); err == nil {
-			hostTable, _ = hosts.Load(hostsPath, 120)
-		}
-
-		// Загружаем allowlist (исключения) — файл {token}.allowlist.
-		al := newAllowlistIndex()
-		alPath := filepath.Join(dir, token+".allowlist")
-		if alData, err := os.ReadFile(alPath); err == nil {
-			for _, line := range strings.Split(string(alData), "\n") {
-				d := strings.TrimSpace(line)
-				if d == "" || strings.HasPrefix(d, "#") {
-					continue
-				}
-				// Нормализуем так же, как blacklist (dns.Fqdn добавляет точку в конце),
-				// чтобы isAllowed совпадал с current.Name.
-				al.exact[normalizeDomain(d)] = struct{}{}
-			}
-		}
-
-		// Флаг security: если у конфига включены security-категории — применяем общий security.blacklist.
-		secEnabled := false
-		if _, err := os.Stat(filepath.Join(dir, token+".security")); err == nil {
-			secEnabled = true
-		}
-
-		s.SetTenantFull(token, bl, al, hostTable, secEnabled)
-		tenantCount++
-		s.logger.Infof("tenant loaded: %s (%d domains, %d allowlist, security=%v)", token, len(domains), len(al.exact), secEnabled)
-	}
-	return nil
-}
-
-// ReloadTenantsLoop периодически перечитывает директорию тенантов
-// (чтобы blocklist обновлялся при изменении конфигов).
-func (s *Server) ReloadTenantsLoop(interval time.Duration, stop <-chan struct{}) {
-	if s.cfg.TenantsDir == "" {
-		return
-	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-t.C:
-			if err := s.loadTenants(s.cfg.TenantsDir); err != nil {
-				s.logger.Errorf("tenants reload failed: %v", err)
-			}
-		case <-stop:
-			return
-		}
-	}
-}
-
-// loadBlacklist загружает чёрный список: из файла (по одному домену на строку)
-// или из cfg.Blacklist.Domains. Файл эффективен для больших списков (100K+ доменов),
-// т.к. не требует парсинга огромного Lua-конфига.
-func loadBlacklist(cfg *config.Config) (blacklistIndex, error) {
-	if cfg.Blacklist.File != "" {
-		data, err := os.ReadFile(cfg.Blacklist.File)
-		if err != nil {
-			return blacklistIndex{}, fmt.Errorf("read blacklist file: %w", err)
-		}
-		lines := strings.Split(string(data), "\n")
-		domains := make([]string, 0, len(lines))
-		for _, line := range lines {
-			d := strings.TrimSpace(line)
-			if d == "" || strings.HasPrefix(d, "#") {
-				continue
-			}
-			domains = append(domains, d)
-		}
-		return parseBlacklist(domains), nil
-	}
-	return parseBlacklist(cfg.Blacklist.Domains), nil
 }
 
 func (s *Server) Run(ctx context.Context) error {
 	dnsMux := dns.NewServeMux()
 	dnsMux.HandleFunc(".", s.handleDNS)
 
-	// Периодическая перезагрузка тенантов (обновление blocklist при изменении конфигов).
-	if s.cfg.TenantsDir != "" {
-		go s.ReloadTenantsLoop(30*time.Second, ctx.Done())
+	// Start the Threat Intelligence background updater (non-blocking). It runs
+	// alongside the DNS components; the loop stops when ctx is cancelled. DNS
+	// serving does not depend on it (fail-open), so zero-downtime is preserved.
+	if s.threat != nil && s.threat.Enabled() {
+		s.threat.Start(ctx)
 	}
 
 	components := []control.ComponentConfig{
@@ -445,12 +251,35 @@ func (s *Server) Run(ctx context.Context) error {
 	})
 
 	s.logger.Infof("control plane started: components=%d", len(components))
+
+	// Периодическая перезагрузка per-tenant правил (Node Agent обновляет
+	// файлы каждые ~60с). Без простоев: атомарная замена через RWMutex.
+	if s.tenants != nil && s.cfg.TenantsDir != "" {
+		go s.tenantReloadLoop(ctx)
+	}
+
 	err := s.supervisor.Run(ctx)
 	if err != nil {
 		return err
 	}
 	s.logger.Infof("graceful shutdown completed")
 	return nil
+}
+
+// tenantReloadLoop периодически перезагружает per-tenant правила.
+func (s *Server) tenantReloadLoop(ctx context.Context) {
+	t := time.NewTicker(60 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := s.tenants.reload(s.cfg.TenantsDir); err != nil {
+				s.logger.Errorf("tenant reload failed: %v", err)
+			}
+		}
+	}
 }
 
 func (s *Server) runDNSComponent(network, addr string, handler dns.Handler) func(context.Context) error {
@@ -496,21 +325,16 @@ func (s *Server) runDoTComponent(handler dns.Handler) func(context.Context) erro
 			TLSConfig: &tls.Config{
 				MinVersion:   tls.VersionTLS12,
 				Certificates: []tls.Certificate{cert},
-				// Персональный DoT: определяем конфиг по SNI (поддомену) при TLS-handshake.
-				// Например, ed2x.dns.astracat.network → конфиг ed2x.
+				// Персональный DoT: определяем tenant по SNI (поддомену) при
+				// TLS-handshake, например ed2x.dns.astracat.network → config_id.
+				// SNI не является поддоменом — используем дефолтный конфиг и не
+				// ломаем обычный DoT (возвращаем nil).
 				GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-					// Персональный DoT: определяем конфиг по SNI. Если SNI не поддомен —
-					// возвращаем nil (используется дефолтный конфиг, обычный DoT не ломаем).
-					if tenant := s.tenantForSNI(hello.ServerName); tenant != nil {
-						// Сохраняем tenant по адресу соединения (для handler).
-						// В miekg/dns hello.Conn — *net.TCPConn, поэтому используем его RemoteAddr.
+					if cid := s.tenantForSNI(hello.ServerName); cid != "" {
 						if conn, ok := hello.Conn.(net.Conn); ok {
-							s.dotTenantsMu.Lock()
-							s.dotTenants[conn.RemoteAddr().String()] = tenant
-							s.dotTenantsMu.Unlock()
+							s.dotConfigID.Store(conn.RemoteAddr().String(), cid)
 						}
 					}
-					// nil → используем дефолтный tls.Config (сертификат уже задан).
 					return nil, nil
 				},
 			},
@@ -530,56 +354,34 @@ func (s *Server) runDoTComponent(handler dns.Handler) func(context.Context) erro
 	}
 }
 
-// rateLimited возвращает true, если IP превысил лимит запросов (защита от флуда).
-// Лимит: 1000 запросов в секунду с одного IP (окно 1 сек).
-func (s *Server) rateLimited(ip string) bool {
-	const limit = 1000
-	const window = time.Second
-	if ip == "" {
-		return false
-	}
-	s.rlMu.Lock()
-	defer s.rlMu.Unlock()
-	now := time.Now()
-	e, ok := s.rlCounts[ip]
-	if !ok || now.Sub(e.windowStart) >= window {
-		s.rlCounts[ip] = &rlEntry{count: 1, windowStart: now}
-		return false
-	}
-	e.count++
-	return e.count > limit
-}
-
-// tenantForSNI определяет конфиг по SNI (ServerName) для персонального DoT.
-// Формат: {config_id}.dns.astracat.network → конфиг {config_id}.
-func (s *Server) tenantForSNI(serverName string) *tenantConfig {
+// tenantForSNI определяет config_id по SNI (ServerName) для персонального DoT.
+// Формат: {config_id}.dns.astracat.network → config_id. Возвращает "" если SNI
+// не является известным тенантом (тогда применяются глобальные правила).
+func (s *Server) tenantForSNI(serverName string) string {
 	if serverName == "" || s.tenants == nil {
-		return nil
+		return ""
 	}
-	// Убираем порт, если есть.
 	host := serverName
 	if h, _, err := net.SplitHostPort(serverName); err == nil {
 		host = h
 	}
 	host = strings.ToLower(strings.TrimSuffix(host, "."))
-	// Ищем поддомен вида {config_id}.dns.astracat.network
-	// Берём самую левую часть (config_id).
+	// Ищем поддомен вида {config_id}.dns.astracat.network → левая часть = config_id.
 	parts := strings.Split(host, ".")
 	if len(parts) >= 4 {
-		// Например: ed2x.dns.astracat.network → parts[0]=ed2x
-		token := parts[0]
-		if t, ok := s.tenants[token]; ok {
-			return t
+		cid := parts[0]
+		if s.tenants.get(cid) != nil {
+			return cid
 		}
 	}
-	return nil
+	return ""
 }
 
 func (s *Server) runDoHComponent() func(context.Context) error {
 	return func(ctx context.Context) error {
+		// Обрабатываем и /dns-query, и /{config_id}, и /{config_id}/dns-query
+		// (NextDNS-стиль: config_id в пути DoH URL).
 		mux := http.NewServeMux()
-		// Принимаем DoH на любом пути: и /dns-query, и /{token} (NextDNS-стиль).
-		// Токен в пути не влияет на обработку — все запросы идут по конфигу ноды.
 		mux.HandleFunc("/", s.handleDoH)
 
 		server := &http.Server{
@@ -681,19 +483,29 @@ func (s *Server) handleDNS(w dns.ResponseWriter, req *dns.Msg) {
 		if r := recover(); r != nil {
 			s.logger.Errorf("panic in dns handler: %v", r)
 			// Best-effort SERVFAIL so the client gets a response instead of a hang.
+			// Оборачиваем в отдельный recover: если w уже закрыт, вторая паника
+			// не должна ронять горутину.
 			if req != nil {
-				_ = w.WriteMsg(s.rcodeResponse(req, dns.RcodeServerFailure))
+				func() {
+					defer func() { _ = recover() }()
+					_ = w.WriteMsg(s.rcodeResponse(req, dns.RcodeServerFailure))
+				}()
 			}
 		}
 	}()
-	// Для DoT (персональный): определяем конфиг по SNI (заполнен в GetConfigForClient).
-	var tenant *tenantConfig
-	if s.cfg.Listen.DoT != "" {
-		s.dotTenantsMu.Lock()
-		tenant = s.dotTenants[w.RemoteAddr().String()]
-		s.dotTenantsMu.Unlock()
+	respp := ""
+	// Персональный DoT: если для этого соединения при TLS-handshake был
+	// выбран tenant по SNI, применяем его per-tenant правила.
+	if cid, ok := s.dotConfigID.Load(w.RemoteAddr().String()); ok {
+		if c, ok2 := cid.(string); ok2 {
+			respp = c
+		}
 	}
-	resp := s.resolveDNS(req, w.RemoteAddr(), protocolFromNet(w.LocalAddr()), tenant)
+	resp := s.resolveDNS(req, w.RemoteAddr(), protocolFromNet(w.LocalAddr()), respp)
+	if resp == nil {
+		// DROP: responder decided to send no reply (e.g. threat block_rcode).
+		return
+	}
 	if err := w.WriteMsg(resp); err != nil {
 		s.logger.Errorf("write dns response: %v", err)
 	}
@@ -724,7 +536,17 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp := s.resolveDNS(req, &net.TCPAddr{IP: remoteIP}, "doh", s.tenantForPath(r.URL.Path))
+	// Извлекаем config_id из пути DoH URL (NextDNS-стиль):
+	//   /dns-query            → default (без tenant)
+	//   /{config_id}          → tenant
+	//   /{config_id}/dns-query → tenant
+	configID := configIDFromDoHPath(r.URL.Path, s.cfg.Listen.DoHPath)
+
+	resp := s.resolveDNS(req, &net.TCPAddr{IP: remoteIP}, "doh", configID)
+	if resp == nil {
+		// DROP: responder decided to send no reply (e.g. threat block_rcode).
+		return
+	}
 	payload, err := resp.Pack()
 	if err != nil {
 		http.Error(w, "encode dns response", http.StatusInternalServerError)
@@ -734,6 +556,29 @@ func (s *Server) handleDoH(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/dns-message")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(payload)
+}
+
+// configIDFromDoHPath извлекает config_id из пути DoH URL.
+// Поддерживаются форматы: /dns-query, /{config_id}, /{config_id}/dns-query.
+func configIDFromDoHPath(path, dohPath string) string {
+	p := strings.Trim(path, "/")
+	if p == "" {
+		return ""
+	}
+	// /dns-query → default
+	if p == strings.Trim(dohPath, "/") {
+		return ""
+	}
+	// /{config_id} или /{config_id}/dns-query
+	segments := strings.Split(p, "/")
+	if len(segments) == 0 {
+		return ""
+	}
+	cid := segments[0]
+	if cid == strings.Trim(dohPath, "/") {
+		return ""
+	}
+	return cid
 }
 
 func readDoHWireMessage(r *http.Request) ([]byte, error) {
@@ -763,19 +608,8 @@ func readDoHWireMessage(r *http.Request) ([]byte, error) {
 	}
 }
 
-func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, tenant *tenantConfig) *dns.Msg {
+func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, configID string) *dns.Msg {
 	protocol = metrics.ProtocolLabel(protocol)
-
-	// Выбираем blacklist/hosts: tenant (по токену) или дефолтные.
-	bl := s.blacklist
-	hosts := s.hosts
-	al := s.allowlist
-	blocked := false
-	if tenant != nil {
-		bl = tenant.blacklist
-		hosts = tenant.hosts
-		al = tenant.allowlist
-	}
 
 	if len(req.Question) == 0 {
 		s.metrics.IncQueries(protocol, "OTHER")
@@ -789,15 +623,16 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, 
 		return s.rcodeResponse(req, dns.RcodeRefused)
 	}
 
-	// Rate-limit: защита от DNS-амплификации/флуда (макс. 1000 QPS с одного IP).
-	if s.rateLimited(remoteIPFromNetAddr(remoteAddr).String()) {
-		s.metrics.IncQueries(protocol, metrics.QueryTypeLabel(req.Question[0].Qtype))
-		s.metrics.IncResponse(metrics.RcodeLabel(dns.RcodeRefused))
-		return s.rcodeResponse(req, dns.RcodeRefused)
-	}
-
 	current := normalizeQuestion(req.Question[0])
 	qtypeLabel := metrics.QueryTypeLabel(current.Qtype)
+
+	// Per-tenant правила: если config_id задан (DoH/DoT), применяем ТОЛЬКО
+	// правила этого tenant (изоляция). Если config_id пуст (обычный DNS) —
+	// глобальные правила.
+	var tenant *tenantRules
+	if s.tenants != nil {
+		tenant = s.tenants.get(configID)
+	}
 
 	s.metrics.IncQueries(protocol, qtypeLabel)
 	s.metrics.IncQueriesInFlight()
@@ -811,35 +646,39 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, 
 	s.logger.Queryf("query id=%d remote=%s domain=%s type=%s", req.Id, remote, current.Name, dns.TypeToString[current.Qtype])
 
 	var resp *dns.Msg
+	dropped := false
 	for _, stage := range s.chain {
 		switch stage {
 		case "blacklist":
-			// Исключения (allowlist) имеют приоритет: если домен в allowlist — не блокируем.
-			if al.isAllowed(current.Name) {
-				s.logger.Debugf("allowlisted domain %s (skip blacklist)", current.Name)
+			// Allowlist (исключение) имеет приоритет над blacklist.
+			if tenant != nil && tenant.isAllowed(current.Name) {
 				continue
 			}
-			if isBlockedIndex(bl, current.Name) {
+			// Per-tenant blacklist (если config_id задан) или глобальный.
+			if tenant != nil {
+				if tenant.blacklist != nil && tenant.blacklist.contains(current.Name) {
+					s.logger.Debugf("blocked domain %s (tenant %s)", current.Name, tenant.configID)
+					resp = s.rcodeResponse(req, dns.RcodeRefused)
+					goto done
+				}
+			} else if s.isBlocked(current.Name) {
 				s.logger.Debugf("blocked domain %s", current.Name)
-				blocked = true
-				resp = s.rcodeResponse(req, dns.RcodeRefused)
-				goto done
-			}
-			// Общий security-blacklist (фиды): проверяем, если у конфига включены security.
-			if tenant != nil && tenant.securityEnabled && isBlockedIndex(s.securityBlacklist, current.Name) {
-				s.logger.Debugf("security blocked domain %s", current.Name)
-				blocked = true
 				resp = s.rcodeResponse(req, dns.RcodeRefused)
 				goto done
 			}
 
 		case "hosts":
-			if hosts == nil {
-				continue
-			}
-			if ans, ok := hosts.Lookup(current.Name, current.Qtype); ok {
-				resp = s.localDataResponse(req, current, plugin.LocalData{IPs: ans.IPs, TTL: ans.TTL})
-				goto done
+			// Per-tenant hosts (если config_id задан) или глобальный.
+			if tenant != nil {
+				if ips, ok := tenant.lookupHost(current.Name, current.Qtype); ok {
+					resp = s.localDataResponse(req, current, plugin.LocalData{IPs: ips, TTL: 120})
+					goto done
+				}
+			} else if s.hosts != nil {
+				if ans, ok := s.hosts.Lookup(current.Name, current.Qtype); ok {
+					resp = s.localDataResponse(req, current, plugin.LocalData{IPs: ans.IPs, TTL: ans.TTL})
+					goto done
+				}
 			}
 
 		case "cache":
@@ -847,11 +686,13 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, 
 				continue
 			}
 			if cached, ok := s.cache.Get(current); ok {
+				s.metrics.IncCacheHits()
 				cached.Id = req.Id
 				cached.Question = []dns.Question{current}
 				resp = cached
 				goto done
 			}
+			s.metrics.IncCacheMisses()
 
 		case "lua_policy", "plugin", "plugins", "lua":
 			if s.plugins == nil {
@@ -864,7 +705,17 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, 
 			}
 			switch decision.Action {
 			case plugin.ActionBlock:
-				resp = s.rcodeResponse(req, dns.RcodeRefused)
+				// Honor the configured block response: REFUSED (legacy default),
+				// NXDOMAIN, or DROP (send no response).
+				switch s.cfg.Plugins.BlockRcode {
+				case "NXDOMAIN":
+					resp = s.rcodeResponse(req, dns.RcodeNameError)
+				case "DROP":
+					dropped = true
+					resp = nil
+				default: // REFUSED
+					resp = s.rcodeResponse(req, dns.RcodeRefused)
+				}
 				goto done
 			case plugin.ActionLocalData:
 				resp = s.localDataResponse(req, decision.Question, decision.Local)
@@ -886,7 +737,7 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, 
 				resp = s.rcodeResponse(req, dns.RcodeServerFailure)
 				goto done
 			}
-			if s.cacheInChain && s.cache != nil && resp.Rcode == dns.RcodeSuccess {
+			if s.cache != nil && resp.Rcode == dns.RcodeSuccess {
 				s.cache.Set(current, resp)
 			}
 			s.logger.Debugf("upstream served domain=%s type=%s", current.Name, dns.TypeToString[current.Qtype])
@@ -899,35 +750,100 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, 
 	resp = s.rcodeResponse(req, dns.RcodeServerFailure)
 
 done:
-	if resp == nil {
+	if !dropped && resp == nil {
 		resp = s.rcodeResponse(req, dns.RcodeServerFailure)
+	}
+	if dropped {
+		// DROP: send no response at all. Log and count it, return nil so the
+		// transport handlers skip writing.
+		if s.queryLog != nil {
+			s.queryLog.Log(current.Name, current.Qtype, -1, protocol, configID)
+		}
+		s.metrics.ObserveQuery(protocol, qtypeLabel, "DROP", time.Since(start))
+		s.metrics.IncResponse("DROP")
+		return nil
+	}
+	if s.queryLog != nil {
+		s.queryLog.Log(current.Name, current.Qtype, resp.Rcode, protocol, configID)
 	}
 	s.metrics.ObserveQuery(protocol, qtypeLabel, metrics.RcodeLabel(resp.Rcode), time.Since(start))
 	s.metrics.IncResponse(metrics.RcodeLabel(resp.Rcode))
-	// Логируем запрос (асинхронно, не блокирует DNS-ответ) для аналитики по-доменно.
-	if s.queryLog != nil {
-		s.queryLog.Log(QueryLogEntry{
-			ConfigID: s.tenantToken(tenant),
-			Domain:   strings.TrimSuffix(current.Name, "."),
-			Blocked:  blocked,
-			Qtype:    dns.TypeToString[current.Qtype],
-			Ts:       time.Now().UnixMilli(),
-		})
-	}
 	return resp
 }
 
-// tenantToken возвращает config_id (токен) для tenant.
-func (s *Server) tenantToken(tenant *tenantConfig) string {
-	if tenant == nil {
-		return ""
-	}
-	for token, t := range s.tenants {
-		if t == tenant {
-			return token
+// cnamesGlueEntry caches live-resolved glue IPs for a CNAME target.
+type cnamesGlueEntry struct {
+	ips    []net.IP
+	expiry time.Time
+}
+
+// cnameGlueResolvers are the public recursive resolvers used to resolve a CNAME
+// target's A/AAAA records inline. Tried in order; falls back on failure.
+// Directly via dns.Client (NOT s.resolver.Forward) because the request-handler
+// path is unreliable inside a query context.
+var cnameGlueResolvers = []string{"9.9.9.9:53", "1.1.1.1:53", "8.8.8.8:53"}
+
+// resolveCNAMEChain resolves the A/AAAA records of a CNAME target through public
+// resolvers and returns them deduplicated. Results are cached for 60s. If all
+// resolvers fail, it returns false (the caller replies with CNAME only).
+func (s *Server) resolveCNAMEChain(ctx context.Context, target string) ([]net.IP, bool) {
+	// Fast path: warm cache.
+	if v, ok := s.cnamesGlue.Load(target); ok {
+		e := v.(cnamesGlueEntry)
+		if time.Now().Before(e.expiry) {
+			return e.ips, true
 		}
 	}
-	return ""
+
+	msg := new(dns.Msg)
+	msg.SetQuestion(dns.Fqdn(target), dns.TypeA)
+
+	dedup := make(map[string]bool)
+	var ips []net.IP
+	var lastErr error
+
+	client := &dns.Client{Timeout: 5 * time.Second}
+	for _, addr := range cnameGlueResolvers {
+		resp, _, err := client.Exchange(msg, addr)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		for _, rr := range resp.Answer {
+			switch r := rr.(type) {
+			case *dns.A:
+				if r.A != nil && !dedup[r.A.String()] {
+					dedup[r.A.String()] = true
+					ips = append(ips, r.A)
+				}
+			}
+		}
+		// AAAA pass: merge v6 glue.
+		msg6 := new(dns.Msg)
+		msg6.SetQuestion(dns.Fqdn(target), dns.TypeAAAA)
+		resp6, _, err6 := client.Exchange(msg6, addr)
+		if err6 == nil {
+			for _, rr := range resp6.Answer {
+				if a, ok := rr.(*dns.AAAA); ok && a.AAAA != nil && !dedup[a.AAAA.String()] {
+					dedup[a.AAAA.String()] = true
+					ips = append(ips, a.AAAA)
+				}
+			}
+		}
+		if len(ips) > 0 {
+			break
+		}
+	}
+
+	if len(ips) == 0 {
+		if lastErr != nil {
+			s.logger.Debugf("resolveCNAMEChain(%s): no glue resolved: %v", target, lastErr)
+		}
+		return nil, false
+	}
+
+	s.cnamesGlue.Store(target, cnamesGlueEntry{ips: ips, expiry: time.Now().Add(60 * time.Second)})
+	return ips, true
 }
 
 func (s *Server) localDataResponse(req *dns.Msg, q dns.Question, local plugin.LocalData) *dns.Msg {
@@ -941,6 +857,44 @@ func (s *Server) localDataResponse(req *dns.Msg, q dns.Question, local plugin.Lo
 		ttl = 60
 	}
 
+	// Explicit CNAME answer.
+	if local.CNAME != "" {
+		// CNAME record: q.Name -> local.CNAME.
+		resp.Answer = append(resp.Answer, &dns.CNAME{
+			Hdr:    dns.RR_Header{Name: q.Name, Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: ttl},
+			Target: local.CNAME,
+		})
+
+		// For A/AAAA/ANY queries, attach glue for the CNAME target: either from
+		// the policy (local.IPs) or resolved live.
+		glue := local.IPs
+		if len(glue) == 0 && (q.Qtype == dns.TypeA || q.Qtype == dns.TypeAAAA || q.Qtype == dns.TypeANY) {
+			if resolved, ok := s.resolveCNAMEChain(context.Background(), local.CNAME); ok {
+				glue = resolved
+			}
+		}
+
+		for _, ip := range glue {
+			switch {
+			case q.Qtype == dns.TypeA && ip.To4() != nil:
+				resp.Answer = append(resp.Answer, &dns.A{Hdr: dns.RR_Header{Name: local.CNAME, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl}, A: ip.To4()})
+			case q.Qtype == dns.TypeAAAA && ip.To16() != nil && ip.To4() == nil:
+				resp.Answer = append(resp.Answer, &dns.AAAA{Hdr: dns.RR_Header{Name: local.CNAME, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl}, AAAA: ip.To16()})
+			case q.Qtype == dns.TypeANY:
+				if ip.To4() != nil {
+					resp.Answer = append(resp.Answer, &dns.A{Hdr: dns.RR_Header{Name: local.CNAME, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: ttl}, A: ip.To4()})
+				} else if ip.To16() != nil {
+					resp.Answer = append(resp.Answer, &dns.AAAA{Hdr: dns.RR_Header{Name: local.CNAME, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: ttl}, AAAA: ip.To16()})
+				}
+			}
+		}
+
+		// NODATA semantics for non-address queries against a CNAME target:
+		// return an empty AA reply so clients don't chase a bogus forward.
+		return resp
+	}
+
+	// Classic A/AAAA/ANY local data (no CNAME).
 	for _, ip := range local.IPs {
 		switch {
 		case q.Qtype == dns.TypeA && ip.To4() != nil:
@@ -960,21 +914,10 @@ func (s *Server) localDataResponse(req *dns.Msg, q dns.Question, local plugin.Lo
 }
 
 func (s *Server) isBlocked(name string) bool {
-	return isBlockedIndex(s.blacklist, name)
-}
-
-// isBlockedIndex проверяет домен по конкретному индексу чёрного списка.
-func isBlockedIndex(bl blacklistIndex, name string) bool {
-	normalized := normalizeDomain(name)
-	if _, ok := bl.exact[normalized]; ok {
-		return true
+	if s.blacklist == nil {
+		return false
 	}
-	for _, suffix := range bl.suffixes {
-		if strings.HasSuffix(normalized, suffix) {
-			return true
-		}
-	}
-	return false
+	return s.blacklist.contains(name)
 }
 
 func (s *Server) rcodeResponse(req *dns.Msg, rcode int) *dns.Msg {
@@ -983,7 +926,7 @@ func (s *Server) rcodeResponse(req *dns.Msg, rcode int) *dns.Msg {
 	return msg
 }
 
-func parseBlacklist(domains []string) blacklistIndex {
+func parseBlacklist(domains []string) *blacklistIndex {
 	idx := newBlacklistIndex()
 	for _, d := range domains {
 		d = strings.TrimSpace(strings.ToLower(d))
@@ -991,16 +934,65 @@ func parseBlacklist(domains []string) blacklistIndex {
 			continue
 		}
 		if strings.HasPrefix(d, "*.") {
-			idx.suffixes = append(idx.suffixes, normalizeDomain(strings.TrimPrefix(d, "*")))
+			// "*.ads.com" → суффиксное правило на "ads.com" (без ведущей точки).
+			idx.add(blacklistRule{suffix: true, value: normalizeDomain(strings.TrimPrefix(d, "*."))})
 			continue
 		}
 		if strings.HasPrefix(d, ".") {
-			idx.suffixes = append(idx.suffixes, normalizeDomain(d))
+			// ".tracker.net" → суффиксное правило на "tracker.net" (без ведущей точки).
+			idx.add(blacklistRule{suffix: true, value: normalizeDomain(strings.TrimPrefix(d, "."))})
 			continue
 		}
-		idx.exact[normalizeDomain(d)] = struct{}{}
+		idx.add(blacklistRule{value: normalizeDomain(d)})
 	}
 	return idx
+}
+
+// loadBlacklist загружает чёрный список из конфига: домены из inline-списка
+// (blacklist.domains) и/или из файла (blacklist.file). Файл поддерживается для
+// больших списков (100K+ доменов), которые генерирует Node Agent.
+func loadBlacklist(cfg config.BlacklistConfig) (*blacklistIndex, error) {
+	idx := parseBlacklist(cfg.Domains)
+
+	if cfg.File == "" {
+		return idx, nil
+	}
+
+	data, err := os.ReadFile(cfg.File)
+	if err != nil {
+		return nil, fmt.Errorf("read blacklist file %q: %w", cfg.File, err)
+	}
+
+	parseBlacklistFileInto(idx, string(data))
+	return idx, nil
+}
+
+// parseBlacklistFile разбирает содержимое файла чёрного списка:
+// по одному домену на строку, комментарии (#) и пустые строки игнорируются.
+// Поддерживаются префиксы "*." и "." для суффиксных правил.
+func parseBlacklistFileInto(idx *blacklistIndex, content string) {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Убираем inline-комментарий.
+		if c := strings.Index(line, "#"); c >= 0 {
+			line = strings.TrimSpace(line[:c])
+		}
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "*.") {
+			idx.add(blacklistRule{suffix: true, value: normalizeDomain(strings.TrimPrefix(line, "*."))})
+			continue
+		}
+		if strings.HasPrefix(line, ".") {
+			idx.add(blacklistRule{suffix: true, value: normalizeDomain(strings.TrimPrefix(line, "."))})
+			continue
+		}
+		idx.add(blacklistRule{value: normalizeDomain(line)})
+	}
 }
 
 func normalizeChain(chain []string) []string {
@@ -1015,15 +1007,6 @@ func normalizeChain(chain []string) []string {
 		return []string{"blacklist", "hosts", "cache", "lua_policy", "upstream"}
 	}
 	return out
-}
-
-func hasChainStage(chain []string, wanted string) bool {
-	for _, stage := range chain {
-		if stage == wanted {
-			return true
-		}
-	}
-	return false
 }
 
 func normalizeQuestion(q dns.Question) dns.Question {
@@ -1126,3 +1109,268 @@ func remoteIPFromString(raw string) net.IP {
 	}
 	return net.ParseIP(host)
 }
+
+// queryLogger пишет DNS-запросы в JSON-lines файл асинхронно (для аналитики).
+// Запись идёт через буферизованный канал, чтобы не блокировать обработку DNS.
+// Формат строки совместим с Node Agent (agent/analytics.go):
+//
+//	{"config_id":"","domain":"...","blocked":bool,"qtype":"A","ts":<ms>}
+type queryLogger struct {
+	path string
+	ch   chan queryLogEntry
+	w    *bufio.Writer
+	f    *os.File
+}
+
+type queryLogEntry struct {
+	ConfigID string `json:"config_id"`
+	Domain   string `json:"domain"`
+	Blocked  bool   `json:"blocked"`
+	Qtype    string `json:"qtype"`
+	Ts       int64  `json:"ts"`
+}
+
+func newQueryLogger(path string) *queryLogger {
+	ql := &queryLogger{
+		path: path,
+		ch:   make(chan queryLogEntry, 4096),
+	}
+	go ql.run()
+	return ql
+}
+
+func (ql *queryLogger) run() {
+	f, err := os.OpenFile(ql.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	ql.f = f
+	ql.w = bufio.NewWriterSize(f, 64*1024)
+
+	// Периодический flush, чтобы данные не задерживались в буфере при низком трафике.
+	flushTicker := time.NewTicker(2 * time.Second)
+	defer flushTicker.Stop()
+
+	for {
+		select {
+		case e, ok := <-ql.ch:
+			if !ok {
+				_ = ql.w.Flush()
+				_ = f.Close()
+				return
+			}
+			data, err := json.Marshal(e)
+			if err != nil {
+				continue
+			}
+			if _, err := ql.w.Write(data); err != nil {
+				continue
+			}
+			if err := ql.w.WriteByte('\n'); err != nil {
+				continue
+			}
+			// Flush при заполнении буфера.
+			if ql.w.Buffered() >= 64*1024 {
+				_ = ql.w.Flush()
+			}
+		case <-flushTicker.C:
+			if ql.w != nil && ql.w.Buffered() > 0 {
+				_ = ql.w.Flush()
+			}
+		}
+	}
+}
+
+// Log ставит запись в очередь. Не блокирует вызывающий код (drop при переполнении).
+func (ql *queryLogger) Log(domain string, qtype uint16, rcode int, protocol, configID string) {
+	if ql == nil {
+		return
+	}
+	entry := queryLogEntry{
+		ConfigID: configID,
+		Domain:   strings.TrimSuffix(strings.ToLower(domain), "."),
+		Blocked:  rcode == dns.RcodeRefused,
+		Qtype:    dns.TypeToString[qtype],
+		Ts:       time.Now().UnixMilli(),
+	}
+	select {
+	case ql.ch <- entry:
+	default:
+		// Канал переполнен — пропускаем, чтобы не блокировать DNS.
+	}
+}
+
+// ---- Per-tenant (мульти-тенантность) ----
+
+// tenantRules — правила одного config_id (пользователя).
+// Каждый tenant изолирован: применяются ТОЛЬКО его правила, никогда не
+// объединяются с правилами других пользователей.
+type tenantRules struct {
+	configID  string
+	blacklist *blacklistIndex // <config_id>.blacklist
+	hosts     map[string][]net.IP // <config_id>.hosts (IP domain)
+	allowlist map[string]struct{} // <config_id>.allowlist (домены-исключения)
+	security  bool              // <config_id>.security == "1"
+}
+
+// tenantStore — хранилище правил всех тенантов.
+// Загружается при старте и периодически перезагружается (Node Agent
+// обновляет файлы каждые ~60с). Атомарная замена через RWMutex.
+type tenantStore struct {
+	mu      sync.RWMutex
+	tenants map[string]*tenantRules
+}
+
+func newTenantStore() *tenantStore {
+	return &tenantStore{tenants: make(map[string]*tenantRules)}
+}
+
+// loadTenants читает директорию tenants/ и загружает правила всех config_id.
+// Формат файлов (генерирует Node Agent):
+//   <config_id>.blacklist  — домены по одному на строку
+//   <config_id>.hosts      — "IP domain" (как hosts.txt)
+//   <config_id>.allowlist  — домены-исключения
+//   <config_id>.security   — "1" если включены security-фиды
+func loadTenants(dir string) (*tenantStore, error) {
+	store := newTenantStore()
+	if dir == "" {
+		return store, nil
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return store, nil
+		}
+		return nil, fmt.Errorf("read tenants dir %q: %w", dir, err)
+	}
+
+	// Собираем config_id из файлов.
+	configIDs := make(map[string]struct{})
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		// Пропускаем общий security.blacklist.
+		if name == "security.blacklist" {
+			continue
+		}
+		for _, suffix := range []string{".blacklist", ".hosts", ".allowlist", ".security"} {
+			if strings.HasSuffix(name, suffix) {
+				configIDs[strings.TrimSuffix(name, suffix)] = struct{}{}
+				break
+			}
+		}
+	}
+
+	for cid := range configIDs {
+		rules := &tenantRules{configID: cid}
+		rules.blacklist = newBlacklistIndex()
+		rules.hosts = make(map[string][]net.IP)
+		rules.allowlist = make(map[string]struct{})
+
+		// Blacklist.
+		if data, err := os.ReadFile(filepath.Join(dir, cid+".blacklist")); err == nil {
+			parseBlacklistFileInto(rules.blacklist, string(data))
+		}
+		// Allowlist.
+		if data, err := os.ReadFile(filepath.Join(dir, cid+".allowlist")); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				rules.allowlist[normalizeDomain(line)] = struct{}{}
+			}
+		}
+		// Hosts.
+		if data, err := os.ReadFile(filepath.Join(dir, cid+".hosts")); err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				fields := strings.Fields(line)
+				if len(fields) < 2 {
+					continue
+				}
+				ip := net.ParseIP(fields[0])
+				if ip == nil {
+					continue
+				}
+				for _, name := range fields[1:] {
+					rules.hosts[normalizeDomain(name)] = append(rules.hosts[normalizeDomain(name)], ip)
+				}
+			}
+		}
+		// Security flag.
+		if data, err := os.ReadFile(filepath.Join(dir, cid+".security")); err == nil {
+			rules.security = strings.TrimSpace(string(data)) == "1"
+		}
+
+		store.tenants[cid] = rules
+	}
+
+	return store, nil
+}
+
+// get возвращает правила для config_id. Если tenant не найден — nil.
+func (s *tenantStore) get(configID string) *tenantRules {
+	if s == nil || configID == "" {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.tenants[configID]
+}
+
+// reload перезагружает правила из директории (атомарно).
+func (s *tenantStore) reload(dir string) error {
+	newStore, err := loadTenants(dir)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.tenants = newStore.tenants
+	s.mu.Unlock()
+	return nil
+}
+
+// isAllowed возвращает true, если домен в allowlist (исключение).
+func (t *tenantRules) isAllowed(name string) bool {
+	if t == nil {
+		return false
+	}
+	_, ok := t.allowlist[normalizeDomain(name)]
+	return ok
+}
+
+// lookupHost возвращает IP для домена из tenant hosts.
+func (t *tenantRules) lookupHost(name string, qtype uint16) ([]net.IP, bool) {
+	if t == nil {
+		return nil, false
+	}
+	ips, ok := t.hosts[normalizeDomain(name)]
+	if !ok {
+		return nil, false
+	}
+	// Фильтруем по qtype (A/AAAA).
+	out := make([]net.IP, 0, len(ips))
+	for _, ip := range ips {
+		switch qtype {
+		case dns.TypeA:
+			if v4 := ip.To4(); v4 != nil {
+				out = append(out, v4)
+			}
+		case dns.TypeAAAA:
+			if ip.To16() != nil && ip.To4() == nil {
+				out = append(out, ip)
+			}
+		case dns.TypeANY:
+			out = append(out, ip)
+		}
+	}
+	return out, len(out) > 0
+}
+

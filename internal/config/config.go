@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -9,6 +10,62 @@ import (
 	"strings"
 	"time"
 )
+
+// ThreatConfig mirrors the Threat Intelligence configuration that the Lua
+// config file can supply under the top-level "threat" key. It keeps the
+// internal/config package decoupled from internal/threat; the app layer
+// converts this into a *threat.Config at startup.
+type ThreatConfig struct {
+	Enabled                 bool                   `json:"enabled" yaml:"enabled"`
+	DefaultAction           string                 `json:"default_action" yaml:"default_action"`
+	FailMode                string                 `json:"fail_mode" yaml:"fail_mode"`
+	UpdateIntervalSeconds   int                    `json:"update_interval" yaml:"update_interval"`
+	RequestTimeoutMS        int                    `json:"request_timeout_ms" yaml:"request_timeout_ms"`
+	MaxFeedBytes            int64                  `json:"max_feed_bytes" yaml:"max_feed_bytes"`
+	MaxDomains              int                    `json:"max_domains" yaml:"max_domains"`
+	RetryCount              int                    `json:"retry_count" yaml:"retry_count"`
+	BackoffSeconds          int                    `json:"backoff_seconds" yaml:"backoff_seconds"`
+	DiskCacheDir            string                 `json:"disk_cache_dir" yaml:"disk_cache_dir"`
+	AllowlistFile           string                 `json:"allowlist_file" yaml:"allowlist_file"`
+	CustomBlocklistFile     string                 `json:"custom_blocklist_file" yaml:"custom_blocklist_file"`
+	MinimumSources          int                    `json:"minimum_sources" yaml:"minimum_sources"`
+	BlockHighConfidence     bool                   `json:"block_high_confidence" yaml:"block_high_confidence"`
+	BlockMediumConfidence   bool                   `json:"block_medium_confidence" yaml:"block_medium_confidence"`
+	Feeds                    ThreatFeedConfigList   `json:"feeds" yaml:"feeds"`
+}
+
+// ThreatFeedConfig is one threat feed descriptor in the Lua config.
+type ThreatFeedConfig struct {
+	Name       string `json:"name" yaml:"name"`
+	URL        string `json:"url" yaml:"url"`
+	Format     string `json:"format" yaml:"format"`
+	Confidence string `json:"confidence" yaml:"confidence"`
+	Category   string `json:"category" yaml:"category"`
+	APIKey     string `json:"api_key,omitempty" yaml:"api_key,omitempty"`
+	MinEntries int    `json:"min_entries" yaml:"min_entries"`
+	MaxChangePct int `json:"max_change_pct" yaml:"max_change_pct"`
+	Enabled    bool   `json:"enabled" yaml:"enabled"`
+}
+
+// ThreatFeedConfigList accepts both a JSON array (normal) and a JSON object
+// (produced by the Lua loader for an empty table `feeds = {}`), tolerating an
+// empty object as "no feeds".
+type ThreatFeedConfigList []ThreatFeedConfig
+
+// UnmarshalJSON tolerates `[]`, `null`, and `{}` from the Lua->JSON encoder.
+func (l *ThreatFeedConfigList) UnmarshalJSON(data []byte) error {
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "null" || trimmed == "{}" {
+		*l = nil
+		return nil
+	}
+	var arr []ThreatFeedConfig
+	if err := json.Unmarshal(data, &arr); err != nil {
+		return err
+	}
+	*l = arr
+	return nil
+}
 
 type Config struct {
 	Listen    ListenConfig    `json:"listen" yaml:"listen"`
@@ -21,23 +78,15 @@ type Config struct {
 	Plugins   PluginConfig    `json:"plugins" yaml:"plugins"`
 	Blacklist BlacklistConfig `json:"blacklist" yaml:"blacklist"`
 	Control   ControlConfig   `json:"control" yaml:"control"`
-	// TenantsDir — директория с конфигами тенантов (мульти-тенантность DoH).
-	// Файлы: {token}.blacklist и {token}.hosts.
+	// Threat is the Threat Intelligence subsystem configuration (see
+	// internal/threat). Optional; when absent the subsystem is disabled.
+	Threat *ThreatConfig `json:"threat,omitempty" yaml:"threat,omitempty"`
+
+	// TenantsDir — директория с per-tenant конфигами (мульти-тенантность DoH).
+	// Node Agent пишет сюда файлы <config_id>.blacklist/.hosts/.allowlist/.security.
 	TenantsDir string `json:"tenants_dir" yaml:"tenants_dir"`
 	// QueryLog — путь к файлу лога DNS-запросов (JSON lines, для аналитики).
 	QueryLog string `json:"query_log" yaml:"query_log"`
-	// Limits — защитные лимиты (предотвращение перегрузки/OOM).
-	Limits LimitsConfig `json:"limits" yaml:"limits"`
-}
-
-// LimitsConfig — защитные лимиты для предотвращения перегрузки.
-type LimitsConfig struct {
-	// MaxTenants — максимум конфигов (тенантов). Защита от неограниченного роста.
-	MaxTenants int `json:"max_tenants" yaml:"max_tenants"`
-	// MaxDomainsPerTenant — максимум доменов в blacklist одного конфига.
-	MaxDomainsPerTenant int `json:"max_domains_per_tenant" yaml:"max_domains_per_tenant"`
-	// MaxTotalDomains — максимум доменов во всех конфигах (защита от OOM).
-	MaxTotalDomains int `json:"max_total_domains" yaml:"max_total_domains"`
 }
 
 type ListenConfig struct {
@@ -92,6 +141,10 @@ type PluginConfig struct {
 	TimeoutMS int           `json:"timeout_ms" yaml:"timeout_ms"`
 	Scripts   []string      `json:"scripts" yaml:"scripts"`
 	Entries   []PluginEntry `json:"entries" yaml:"entries"`
+	// BlockRcode is the DNS rcode used when a policy action resolves to a block.
+	// One of "REFUSED" (default, preserves legacy behavior), "NXDOMAIN", or
+	// "DROP" (send no response). Only consulted when the chain has lua_policy.
+	BlockRcode string `json:"block_rcode" yaml:"block_rcode"`
 }
 
 type PluginEntry struct {
@@ -105,8 +158,8 @@ type PluginEntry struct {
 type BlacklistConfig struct {
 	Domains []string `json:"domains" yaml:"domains"`
 	// File — путь к файлу чёрного списка (по одному домену на строку).
-	// Если задан, загружается из файла (эффективно для больших списков),
-	// иначе — из Domains.
+	// Поддерживается для больших списков (100K+ доменов), которые неэффективно
+	// встраивать в Lua-конфиг. Node Agent генерирует этот файл.
 	File string `json:"file" yaml:"file"`
 }
 
@@ -135,19 +188,6 @@ func Load(path string) (*Config, error) {
 }
 
 func applyDefaults(cfg *Config) {
-	// Защитные лимиты (по умолчанию):
-	// - максимум 200 конфигов
-	// - максимум 500K доменов в blacklist одного конфига
-	// - максимум 5M доменов во всех конфигах (защита от OOM)
-	if cfg.Limits.MaxTenants == 0 {
-		cfg.Limits.MaxTenants = 200
-	}
-	if cfg.Limits.MaxDomainsPerTenant == 0 {
-		cfg.Limits.MaxDomainsPerTenant = 500000
-	}
-	if cfg.Limits.MaxTotalDomains == 0 {
-		cfg.Limits.MaxTotalDomains = 5000000
-	}
 	if cfg.Listen.DNS == "" {
 		cfg.Listen.DNS = ":53"
 	}
@@ -225,6 +265,25 @@ func applyDefaults(cfg *Config) {
 		cfg.Plugins.Entries[i].Runtime = strings.ToLower(strings.TrimSpace(cfg.Plugins.Entries[i].Runtime))
 		if cfg.Plugins.Entries[i].Name == "" {
 			cfg.Plugins.Entries[i].Name = filepath.Base(cfg.Plugins.Entries[i].Path)
+		}
+	}
+
+	if cfg.Plugins.BlockRcode == "" {
+		cfg.Plugins.BlockRcode = "REFUSED"
+	} else {
+		cfg.Plugins.BlockRcode = strings.ToUpper(strings.TrimSpace(cfg.Plugins.BlockRcode))
+	}
+
+	// Threat defaults live in the threat package; here we only normalize the
+	// top-level action switch so validation can rely on a stable value.
+	if cfg.Threat != nil {
+		switch cfg.Threat.DefaultAction {
+		case "", "NXDOMAIN":
+			cfg.Threat.DefaultAction = "NXDOMAIN"
+		case "REFUSED":
+			cfg.Threat.DefaultAction = "REFUSED"
+		case "DROP":
+			cfg.Threat.DefaultAction = "DROP"
 		}
 	}
 }
@@ -317,6 +376,11 @@ func validate(cfg *Config) error {
 	}
 	if cfg.Plugins.TimeoutMS <= 0 {
 		return errors.New("plugins.timeout_ms must be > 0")
+	}
+	switch cfg.Plugins.BlockRcode {
+	case "REFUSED", "NXDOMAIN", "DROP":
+	default:
+		return errors.New("plugins.block_rcode must be one of REFUSED, NXDOMAIN, DROP")
 	}
 	if cfg.Hosts.File != "" && cfg.Hosts.TTL == 0 {
 		return errors.New("hosts.ttl must be > 0")

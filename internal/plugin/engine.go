@@ -32,8 +32,12 @@ const (
 )
 
 type LocalData struct {
-	IPs []net.IP
-	TTL uint32
+	IPs   []net.IP
+	TTL   uint32
+	// CNAME is an optional target for an explicit CNAME answer. When set, the
+	// responder emits a CNAME record and (optionally) A/AAAA glue for the
+	// target (from local.IPs, or resolved live when no IPs are given).
+	CNAME string
 }
 
 type Decision struct {
@@ -57,6 +61,13 @@ func NewEngine(entries []config.PluginEntry, defaultTimeout time.Duration) (*Eng
 }
 
 func NewEngineWithMetrics(entries []config.PluginEntry, defaultTimeout time.Duration, m *metrics.Provider) (*Engine, error) {
+	return NewEngineWithOptions(entries, defaultTimeout, m, EngineOption{})
+}
+
+// NewEngineWithOptions is like NewEngineWithMetrics but additionally accepts
+// engine options such as a per-state Lua hook. It preserves backward
+// compatibility: an empty Options yields identical behavior to before.
+func NewEngineWithOptions(entries []config.PluginEntry, defaultTimeout time.Duration, m *metrics.Provider, opt EngineOption) (*Engine, error) {
 	runners := make([]runner, 0, len(entries))
 
 	for i := range entries {
@@ -68,7 +79,7 @@ func NewEngineWithMetrics(entries []config.PluginEntry, defaultTimeout time.Dura
 
 		switch entry.Runtime {
 		case "lua":
-			r, err := newLuaRunner(entry, timeout)
+			r, err := newLuaRunner(entry, timeout, opt.LuaHook)
 			if err != nil {
 				return nil, err
 			}
@@ -129,14 +140,28 @@ func (e *Engine) Decide(initial dns.Question) (Decision, error) {
 	return decision, nil
 }
 
+// LuaHook is an optional callback applied to each fresh sandboxed Lua state
+// before a policy script runs. It lets the engine (or a caller such as the app
+// layer) register additional read-only Go functions into the sandbox, e.g. the
+// threat-intelligence lookup module. Must be cheap; runs once per state in the
+// pool. A nil hook leaves the sandbox exactly as before (backward compatible).
+type LuaHook func(*lua.LState)
+
+// EngineOption configures engine construction.
+type EngineOption struct {
+	// LuaHook, when non-nil, is applied to every fresh Lua sandbox state.
+	LuaHook LuaHook
+}
+
 type luaRunner struct {
 	name    string
 	src     string
 	timeout time.Duration
+	hook    LuaHook
 	pool    sync.Pool
 }
 
-func newLuaRunner(entry config.PluginEntry, timeout time.Duration) (*luaRunner, error) {
+func newLuaRunner(entry config.PluginEntry, timeout time.Duration, hook LuaHook) (*luaRunner, error) {
 	data, err := os.ReadFile(entry.Path)
 	if err != nil {
 		return nil, fmt.Errorf("read lua script %q: %w", entry.Path, err)
@@ -146,8 +171,9 @@ func newLuaRunner(entry config.PluginEntry, timeout time.Duration) (*luaRunner, 
 		name:    nonEmpty(entry.Name, filepath.Base(entry.Path)),
 		src:     string(data),
 		timeout: timeout,
+		hook:    hook,
 	}
-	r.pool.New = func() any { return newSandboxState() }
+	r.pool.New = func() any { return newSandboxState(hook) }
 	return r, nil
 }
 
@@ -192,15 +218,18 @@ func (r *luaRunner) Run(q dns.Question) (Decision, error) {
 
 func (r *luaRunner) recycle(L *lua.LState) {
 	L.Close()
-	r.pool.Put(newSandboxState())
+	r.pool.Put(newSandboxState(r.hook))
 }
 
-func newSandboxState() *lua.LState {
+func newSandboxState(hook LuaHook) *lua.LState {
 	L := lua.NewState(lua.Options{SkipOpenLibs: true})
 	lua.OpenBase(L)
 	lua.OpenTable(L)
 	lua.OpenString(L)
 	lua.OpenMath(L)
+	if hook != nil {
+		hook(L)
+	}
 	return L
 }
 
@@ -230,6 +259,8 @@ type goExecLocal struct {
 	IP  string   `json:"ip"`
 	IPs []string `json:"ips"`
 	TTL uint32   `json:"ttl"`
+	// CNAME target for explicit CNAME answers (optional).
+	CNAME string `json:"cname"`
 }
 
 func newGoExecRunner(entry config.PluginEntry, timeout time.Duration) (*goExecRunner, error) {
@@ -431,6 +462,15 @@ func parseLocalDataLua(v lua.LValue) (LocalData, error) {
 		out.TTL = ttlNum
 	}
 
+	// Explicit CNAME target (optional).
+	if cn := tbl.RawGetString("cname"); cn != lua.LNil {
+		cnameStr := dns.Fqdn(strings.ToLower(strings.TrimSpace(cn.String())))
+		if cnameStr == "." {
+			return LocalData{}, errors.New("invalid local_data.cname")
+		}
+		out.CNAME = cnameStr
+	}
+
 	if ip := strings.TrimSpace(tbl.RawGetString("ip").String()); ip != "" && ip != "nil" {
 		parsed := net.ParseIP(ip)
 		if parsed == nil {
@@ -455,8 +495,9 @@ func parseLocalDataLua(v lua.LValue) (LocalData, error) {
 		})
 	}
 
-	if len(out.IPs) == 0 {
-		return LocalData{}, errors.New("local_data requires ip or ips")
+	// A local_data must carry at least an IP list OR a CNAME target.
+	if len(out.IPs) == 0 && out.CNAME == "" {
+		return LocalData{}, errors.New("local_data requires ip, ips, or cname")
 	}
 	return out, nil
 }
@@ -465,6 +506,10 @@ func parseLocalDataGo(in goExecLocal) (LocalData, error) {
 	out := LocalData{TTL: 60}
 	if in.TTL > 0 {
 		out.TTL = in.TTL
+	}
+
+	if in.CNAME != "" {
+		out.CNAME = dns.Fqdn(strings.ToLower(strings.TrimSpace(in.CNAME)))
 	}
 
 	if in.IP != "" {
@@ -481,8 +526,8 @@ func parseLocalDataGo(in goExecLocal) (LocalData, error) {
 		}
 		out.IPs = append(out.IPs, parsed)
 	}
-	if len(out.IPs) == 0 {
-		return LocalData{}, errors.New("local_data requires ip or ips")
+	if len(out.IPs) == 0 && out.CNAME == "" {
+		return LocalData{}, errors.New("local_data requires ip, ips, or cname")
 	}
 	return out, nil
 }

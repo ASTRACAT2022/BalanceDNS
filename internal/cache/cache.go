@@ -2,6 +2,7 @@ package cache
 
 import (
 	"container/list"
+	"hash/fnv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,9 +16,8 @@ import (
 const maxShards = 64
 
 type key struct {
-	fqdn   string
-	qtype  uint16
-	qclass uint16
+	fqdn  string
+	qtype uint16
 }
 
 type entry struct {
@@ -67,7 +67,7 @@ func NewWithMetrics(capacity int, minTTLSeconds, maxTTLSeconds uint32, m *metric
 
 	return &Cache{
 		minTTL:  time.Duration(minTTLSeconds) * time.Second,
-		maxTTL:  normalizedMaxTTL(minTTLSeconds, maxTTLSeconds),
+		maxTTL:  time.Duration(maxTTLSeconds) * time.Second,
 		shards:  shards,
 		metrics: m,
 	}
@@ -78,41 +78,32 @@ func (c *Cache) Get(q dns.Question) (*dns.Msg, bool) {
 	s := &c.shards[c.shardIndex(k)]
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	item, ok := s.items[k]
 	if !ok {
-		s.mu.Unlock()
 		c.incMiss()
 		return nil, false
 	}
-	now := time.Now()
-	if !now.Before(item.expiresAt) {
+	if time.Now().After(item.expiresAt) {
 		s.remove(item)
 		c.entries.Add(-1)
-		s.mu.Unlock()
 		c.incEviction()
-		c.reportEntries()
 		c.incMiss()
 		return nil, false
 	}
 
 	s.ll.MoveToFront(item.element)
-	message := item.message
-	remaining := item.expiresAt.Sub(now)
-	s.mu.Unlock()
-
 	c.incHit()
-	// Entries are immutable after insertion; replacement only swaps the
-	// pointer while holding the shard lock. It is therefore safe to copy this
-	// snapshot outside the lock, greatly reducing reader contention.
-	return responseWithRemainingTTL(message, remaining), true
+	return item.message.Copy(), true
 }
 
-// Set stores a defensive copy of response. DNS messages are mutable and the
-// resolver continues to use the original message after this call.
+// Set stores response in the cache. The caller must not mutate response after
+// Set returns: the cache retains a reference to it (no defensive copy) to avoid
+// a double deep-copy on the hot path. Get always returns a deep copy, so the
+// stored message is never exposed directly to readers.
 func (c *Cache) Set(q dns.Question, response *dns.Msg) {
-	// A truncated UDP response is incomplete; caching it would make every
-	// later client receive the same incomplete answer instead of retrying TCP.
-	if response == nil || response.Truncated {
+	if response == nil {
 		return
 	}
 
@@ -121,41 +112,34 @@ func (c *Cache) Set(q dns.Question, response *dns.Msg) {
 		return
 	}
 
-	// Copy before acquiring the shard lock. This is the expensive part of a
-	// write and does not need synchronization with the cache itself.
-	message := response.Copy()
 	k := makeKey(q)
 	s := &c.shards[c.shardIndex(k)]
 	expiresAt := time.Now().Add(ttl)
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if current, ok := s.items[k]; ok {
-		current.message = message
+		current.message = response
 		current.expiresAt = expiresAt
 		s.ll.MoveToFront(current.element)
-		s.mu.Unlock()
 		return
 	}
 
 	elem := s.ll.PushFront(k)
 	s.items[k] = &entry{
 		key:       k,
-		message:   message,
+		message:   response,
 		expiresAt: expiresAt,
 		element:   elem,
 	}
 
-	evicted := false
 	if len(s.items) > s.cap {
 		s.evictOldest()
 		c.entries.Add(-1)
-		evicted = true
-	}
-	c.entries.Add(1)
-	s.mu.Unlock()
-	if evicted {
 		c.incEviction()
 	}
+	c.entries.Add(1)
 	c.reportEntries()
 }
 
@@ -204,19 +188,13 @@ func (c *Cache) extractTTL(msg *dns.Msg) time.Duration {
 		update(rr)
 	}
 	for _, rr := range msg.Extra {
-		// OPT's TTL field contains EDNS extended flags, not a DNS TTL.
-		if h := rr.Header(); h != nil && h.Rrtype == dns.TypeOPT {
-			continue
-		}
 		update(rr)
 	}
 
-	// Do not invent a TTL for an empty or explicitly zero-TTL response.
-	// Such data is not cacheable according to DNS semantics.
-	if minRR == 0 {
-		return 0
+	ttl := c.minTTL
+	if minRR > 0 {
+		ttl = time.Duration(minRR) * time.Second
 	}
-	ttl := time.Duration(minRR) * time.Second
 	if ttl < c.minTTL {
 		ttl = c.minTTL
 	}
@@ -224,34 +202,6 @@ func (c *Cache) extractTTL(msg *dns.Msg) time.Duration {
 		ttl = c.maxTTL
 	}
 	return ttl
-}
-
-func normalizedMaxTTL(minTTLSeconds, maxTTLSeconds uint32) time.Duration {
-	maxTTL := time.Duration(maxTTLSeconds) * time.Second
-	minTTL := time.Duration(minTTLSeconds) * time.Second
-	if maxTTL == 0 || maxTTL < minTTL {
-		return minTTL
-	}
-	return maxTTL
-}
-
-// responseWithRemainingTTL returns a copy whose TTLs reflect the time that
-// remains in the cache. Returning the original TTL would make downstream DNS
-// clients cache stale data beyond the cache entry's expiry.
-func responseWithRemainingTTL(message *dns.Msg, remaining time.Duration) *dns.Msg {
-	copy := message.Copy()
-	seconds := uint32(remaining / time.Second)
-	adjust := func(records []dns.RR) {
-		for _, rr := range records {
-			if h := rr.Header(); h != nil && h.Ttl > seconds {
-				h.Ttl = seconds
-			}
-		}
-	}
-	adjust(copy.Answer)
-	adjust(copy.Ns)
-	adjust(copy.Extra)
-	return copy
 }
 
 func (s *shard) evictOldest() {
@@ -277,21 +227,10 @@ func (s *shard) remove(e *entry) {
 }
 
 func (c *Cache) shardIndex(k key) int {
-	// Inline FNV-1a avoids allocating a hash.Hash object for every lookup.
-	const (
-		offset64 = 14695981039346656037
-		prime64  = 1099511628211
-	)
-	h := uint64(offset64)
-	for i := 0; i < len(k.fqdn); i++ {
-		h ^= uint64(k.fqdn[i])
-		h *= prime64
-	}
-	for _, b := range [...]byte{byte(k.qtype >> 8), byte(k.qtype), byte(k.qclass >> 8), byte(k.qclass)} {
-		h ^= uint64(b)
-		h *= prime64
-	}
-	return int(h % uint64(len(c.shards)))
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(k.fqdn))
+	_, _ = h.Write([]byte{byte(k.qtype >> 8), byte(k.qtype)})
+	return int(h.Sum64() % uint64(len(c.shards)))
 }
 
 func chooseShardCount(capacity int) int {
@@ -318,8 +257,7 @@ func shardCapacity(total, shards, idx int) int {
 
 func makeKey(q dns.Question) key {
 	return key{
-		fqdn:   strings.ToLower(dns.Fqdn(q.Name)),
-		qtype:  q.Qtype,
-		qclass: q.Qclass,
+		fqdn:  strings.ToLower(dns.Fqdn(q.Name)),
+		qtype: q.Qtype,
 	}
 }

@@ -175,6 +175,12 @@ func (p *Provider) Handler() http.Handler {
 	return promhttp.HandlerFor(p.registry, promhttp.HandlerOpts{})
 }
 
+// Registry returns the underlying Prometheus registry so subsystems can
+// register additional collectors (e.g. Threat Intelligence metrics).
+func (p *Provider) Registry() *prometheus.Registry {
+	return p.registry
+}
+
 // --- DNS query metrics ---
 
 func (p *Provider) IncQueries(protocol, queryType string) {

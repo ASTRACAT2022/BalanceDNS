@@ -1,19 +1,19 @@
 package app
 
-import (
-	"testing"
-)
+import "testing"
 
+// TestTenantForSNI verifies per-tenant SNI selection (personal DoT):
+// {config_id}.dns.astracat.network → config_id, resolved against the tenant store.
 func TestTenantForSNI(t *testing.T) {
-	s := &Server{tenants: map[string]*tenantConfig{
-		"ed2x":  {},
-		"baa5aa": {},
-		"de1906": {},
-	}}
+	store := newTenantStore()
+	for _, cid := range []string{"ed2x", "baa5aa", "de1906"} {
+		store.tenants[cid] = &tenantRules{configID: cid}
+	}
+	s := &Server{tenants: store}
 
 	cases := []struct {
 		sni  string
-		want string // ожидаемый config_id, "" = nil
+		want string // ожидаемый config_id, "" = нет tenant
 	}{
 		{"ed2x.dns.astracat.network", "ed2x"},
 		{"baa5aa.dns.astracat.network", "baa5aa"},
@@ -26,19 +26,8 @@ func TestTenantForSNI(t *testing.T) {
 
 	for _, c := range cases {
 		got := s.tenantForSNI(c.sni)
-		if c.want == "" {
-			if got != nil {
-				t.Errorf("tenantForSNI(%q): expected nil, got %v", c.sni, got)
-			}
-			continue
-		}
-		if got == nil {
-			t.Errorf("tenantForSNI(%q): expected tenant %q, got nil", c.sni, c.want)
-			continue
-		}
-		// Проверяем, что это правильный конфиг (по адресу в map).
-		if s.tenants[c.want] != got {
-			t.Errorf("tenantForSNI(%q): expected %q, got different tenant", c.sni, c.want)
+		if got != c.want {
+			t.Errorf("tenantForSNI(%q): expected %q, got %q", c.sni, c.want, got)
 		}
 	}
 }

@@ -6,6 +6,8 @@ BalanceDNS is a lightweight DNS resolver/forwarder in Go with policy-based routi
 
 - DNS listeners: UDP/TCP + DoT + DoH (`miekg/dns` + net/http)
 - Processing chain: `Blacklist -> Cache -> Lua/Plugin Policy -> Upstream`
+- Optional Threat Intelligence: external feed ingestion, reputation scoring,
+  atomic snapshot, and blocking (NXDOMAIN/REFUSED/DROP) with zero downtime
 - Multi-upstream routing by zone with automatic fallback between matching upstreams
 - Upstream protocols:
   - `udp`
@@ -32,6 +34,7 @@ BalanceDNS is a lightweight DNS resolver/forwarder in Go with policy-based routi
 - `balancedns_plugin_execution_errors`
 - `balancedns_component_up`
 - `balancedns_component_restarts_total`
+- `balancedns_threat_*` (see `docs/THREAT_INTELLIGENCE.md`)
 
 ## Run
 
