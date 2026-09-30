@@ -14,7 +14,9 @@ BalanceDNS is a lightweight DNS resolver/forwarder in Go with policy-based routi
   - `tcp`
   - `dot` (DNS-over-TLS)
   - `doh` (DNS-over-HTTPS)
-- Thread-safe sharded LRU cache (64 shards on large capacity) with min/max TTL bounds
+- Thread-safe sharded LRU cache (64 shards on large capacity) honoring authoritative TTLs with a configurable maximum
+- Last Known Good stale-while-revalidate responses with deduplicated background refresh
+- Lazy persistent cache records on local disk; configure retention and refresh under `cache` in the Lua config
 - Sandbox plugin engine:
   - Lua runtime in clean state without `os`, `io`, package loading
   - Go plugins executed as isolated subprocesses with strict timeout and empty environment
@@ -26,6 +28,37 @@ BalanceDNS is a lightweight DNS resolver/forwarder in Go with policy-based routi
 - Prometheus metrics
 - Graceful shutdown (`SIGINT`, `SIGTERM`)
 
+## DNS cache: Last Known Good and SWR
+
+Successful positive DNS answers are kept after their authoritative TTL expires. Fresh answers come from the in-memory L1 cache. A stale answer is returned immediately with a short client TTL while one deduplicated background refresh runs. A successful refresh replaces the cached packet atomically; upstream errors never replace the last good answer.
+
+The local persistent L2 cache is read lazily on an L1 miss and is not loaded into RAM at startup. L1 eviction does not remove the persistent record. Negative replies and responses without answer records are not stored in this positive cache.
+
+Example Lua configuration (the production config contains these settings):
+
+```lua
+cache = {
+  enabled = true,
+  capacity = 250000,
+  max_ttl_seconds = 1800,
+  persistent = {
+    enabled = true,
+    path = "/var/lib/balancedns/dns-cache",
+    max_size_gb = 20,
+  },
+  stale = { enabled = true, response_ttl = 30 },
+  refresh = {
+    enabled = true,
+    workers = 8,
+    min_delay_ms = 1000,
+    max_delay_ms = 1800000,
+  },
+  prefetch = { enabled = true, threshold_percent = 10 },
+}
+```
+
+Docker Compose persists this path in `./data/dns-cache`. For a direct deployment, point `persistent.path` at a writable local disk directory. The L2 size limit evicts least recently used records when pruning runs.
+
 ## Metrics
 
 - `balancedns_queries_total`
@@ -34,7 +67,19 @@ BalanceDNS is a lightweight DNS resolver/forwarder in Go with policy-based routi
 - `balancedns_plugin_execution_errors`
 - `balancedns_component_up`
 - `balancedns_component_restarts_total`
+- `dns_cache_requests_total`, `dns_cache_l1_hit_total`, `dns_cache_l2_hit_total`
+- `dns_cache_fresh_hit_total`, `dns_cache_stale_hit_total`, `dns_cache_miss_total`
+- `dns_cache_refresh_total`, `dns_cache_refresh_success_total`, `dns_cache_refresh_failed_total`
+- `dns_cache_refresh_duration_seconds`
 - `balancedns_threat_*` (see `docs/THREAT_INTELLIGENCE.md`)
+
+Example PromQL ratios:
+
+```promql
+sum(rate(dns_cache_l1_hit_total[5m]) + rate(dns_cache_l2_hit_total[5m])) / sum(rate(dns_cache_requests_total[5m]))
+sum(rate(dns_cache_fresh_hit_total[5m])) / sum(rate(dns_cache_requests_total[5m]))
+sum(rate(dns_cache_stale_hit_total[5m])) / sum(rate(dns_cache_requests_total[5m]))
+```
 
 ## Run
 

@@ -54,6 +54,10 @@ return {
     capacity = 250000,
     min_ttl_seconds = 5,
     max_ttl_seconds = 1800,
+    persistent = { enabled = true, path = "/var/lib/balancedns/dns-cache", max_size_gb = 20 },
+    stale = { enabled = true, response_ttl = 30 },
+    refresh = { enabled = true, workers = 8, min_delay_ms = 1000, max_delay_ms = 1800000 },
+    prefetch = { enabled = true, threshold_percent = 10 },
   },
 
   hosts = {

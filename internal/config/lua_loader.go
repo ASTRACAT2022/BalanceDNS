@@ -84,6 +84,9 @@ func loadLua(path string) (*Config, error) {
 	if cfg.Hosts.File != "" && !filepath.IsAbs(cfg.Hosts.File) {
 		cfg.Hosts.File = filepath.Join(filepath.Dir(path), cfg.Hosts.File)
 	}
+	if cfg.Cache.Persistent.Path != "" && !filepath.IsAbs(cfg.Cache.Persistent.Path) {
+		cfg.Cache.Persistent.Path = filepath.Join(filepath.Dir(path), cfg.Cache.Persistent.Path)
+	}
 
 	return cfg, nil
 }

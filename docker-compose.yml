@@ -25,4 +25,5 @@ services:
       - ./configs/prod.lua:/app/configs/prod.lua:ro
       - ./hosts.txt:/app/hosts.txt:ro
       - ${BALANCEDNS_CERTS_DIR:-./certs}:/etc/balancedns/certs:ro
+      - ./data/dns-cache:/var/lib/balancedns/dns-cache
     command: ["-config", "/app/configs/prod.lua"]

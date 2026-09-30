@@ -24,8 +24,8 @@ import (
 	"balancedns/internal/metrics"
 	"balancedns/internal/plugin"
 	"balancedns/internal/router"
-	"balancedns/internal/threat"
 	control "balancedns/internal/runtime"
+	"balancedns/internal/threat"
 
 	"github.com/miekg/dns"
 )
@@ -71,8 +71,8 @@ type blacklistRule struct {
 // Это критично для больших списков (100K+ доменов): линейный поиск по всем
 // правилам на каждый запрос был бы O(N) и упирался бы в CPU под нагрузкой.
 type blacklistIndex struct {
-	exact   map[string]struct{} // точные домены (без суффиксного совпадения)
-	suffix  map[string]struct{} // суффиксные домены (блокируют поддомены)
+	exact  map[string]struct{} // точные домены (без суффиксного совпадения)
+	suffix map[string]struct{} // суффиксные домены (блокируют поддомены)
 }
 
 func newBlacklistIndex() *blacklistIndex {
@@ -126,6 +126,22 @@ func New(cfg *config.Config) (*Server, error) {
 	var c *cache.Cache
 	if cfg.Cache.Enabled {
 		c = cache.NewWithMetrics(cfg.Cache.Capacity, cfg.Cache.MinTTLSeconds, cfg.Cache.MaxTTLSeconds, m)
+		staleTTL := time.Duration(cfg.Cache.Stale.ResponseTTL) * time.Second
+		if !cfg.Cache.Stale.Enabled {
+			staleTTL = 0
+		}
+		prefetch := 0
+		if cfg.Cache.Prefetch.Enabled {
+			prefetch = cfg.Cache.Prefetch.ThresholdPercent
+		}
+		c.Configure(staleTTL, prefetch, cfg.Cache.Refresh.Workers)
+		c.ConfigureRetry(time.Duration(cfg.Cache.Refresh.MinDelayMS)*time.Millisecond, time.Duration(cfg.Cache.Refresh.MaxDelayMS)*time.Millisecond)
+		if cfg.Cache.Persistent.Enabled {
+			maxBytes := int64(cfg.Cache.Persistent.MaxSizeGB) * 1024 * 1024 * 1024
+			if err := c.SetPersistentLimit(cfg.Cache.Persistent.Path, maxBytes); err != nil {
+				return nil, fmt.Errorf("initialize persistent DNS cache: %w", err)
+			}
+		}
 	}
 
 	var engine *plugin.Engine
@@ -200,6 +216,9 @@ func New(cfg *config.Config) (*Server, error) {
 }
 
 func (s *Server) Run(ctx context.Context) error {
+	if s.cache != nil {
+		defer s.cache.Close()
+	}
 	dnsMux := dns.NewServeMux()
 	dnsMux.HandleFunc(".", s.handleDNS)
 
@@ -685,14 +704,27 @@ func (s *Server) resolveDNS(req *dns.Msg, remoteAddr net.Addr, protocol string, 
 			if s.cache == nil {
 				continue
 			}
-			if cached, ok := s.cache.Get(current); ok {
-				s.metrics.IncCacheHits()
+			if cached, fresh, ok := s.cache.GetState(current); ok && (fresh || s.cfg.Cache.Stale.Enabled) {
+				if !fresh && s.cfg.Cache.Refresh.Enabled {
+					s.refreshCache(req, current)
+				}
+				if fresh && s.cfg.Cache.Prefetch.Enabled && s.cache.ShouldPrefetch(current) && s.cfg.Cache.Refresh.Enabled {
+					s.refreshCache(req, current)
+				}
 				cached.Id = req.Id
 				cached.Question = []dns.Question{current}
 				resp = cached
 				goto done
 			}
-			s.metrics.IncCacheMisses()
+			if cached, fresh, ok := s.cache.GetPersistent(current); ok && (fresh || s.cfg.Cache.Stale.Enabled) {
+				if (!fresh || (s.cfg.Cache.Prefetch.Enabled && s.cache.ShouldPrefetch(current))) && s.cfg.Cache.Refresh.Enabled {
+					s.refreshCache(req, current)
+				}
+				cached.Id = req.Id
+				cached.Question = []dns.Question{current}
+				resp = cached
+				goto done
+			}
 
 		case "lua_policy", "plugin", "plugins", "lua":
 			if s.plugins == nil {
@@ -769,6 +801,16 @@ done:
 	s.metrics.ObserveQuery(protocol, qtypeLabel, metrics.RcodeLabel(resp.Rcode), time.Since(start))
 	s.metrics.IncResponse(metrics.RcodeLabel(resp.Rcode))
 	return resp
+}
+
+func (s *Server) refreshCache(req *dns.Msg, q dns.Question) {
+	request := req.Copy()
+	request.Question = []dns.Question{q}
+	request.Id = dns.Id()
+	s.cache.Refresh(q, func() (*dns.Msg, error) {
+		msg, _, err := s.resolver.Forward(context.Background(), request, q)
+		return msg, err
+	})
 }
 
 // cnamesGlueEntry caches live-resolved glue IPs for a CNAME target.
@@ -1207,10 +1249,10 @@ func (ql *queryLogger) Log(domain string, qtype uint16, rcode int, protocol, con
 // объединяются с правилами других пользователей.
 type tenantRules struct {
 	configID  string
-	blacklist *blacklistIndex // <config_id>.blacklist
+	blacklist *blacklistIndex     // <config_id>.blacklist
 	hosts     map[string][]net.IP // <config_id>.hosts (IP domain)
 	allowlist map[string]struct{} // <config_id>.allowlist (домены-исключения)
-	security  bool              // <config_id>.security == "1"
+	security  bool                // <config_id>.security == "1"
 }
 
 // tenantStore — хранилище правил всех тенантов.
@@ -1227,10 +1269,11 @@ func newTenantStore() *tenantStore {
 
 // loadTenants читает директорию tenants/ и загружает правила всех config_id.
 // Формат файлов (генерирует Node Agent):
-//   <config_id>.blacklist  — домены по одному на строку
-//   <config_id>.hosts      — "IP domain" (как hosts.txt)
-//   <config_id>.allowlist  — домены-исключения
-//   <config_id>.security   — "1" если включены security-фиды
+//
+//	<config_id>.blacklist  — домены по одному на строку
+//	<config_id>.hosts      — "IP domain" (как hosts.txt)
+//	<config_id>.allowlist  — домены-исключения
+//	<config_id>.security   — "1" если включены security-фиды
 func loadTenants(dir string) (*tenantStore, error) {
 	store := newTenantStore()
 	if dir == "" {
@@ -1373,4 +1416,3 @@ func (t *tenantRules) lookupHost(name string, qtype uint16) ([]net.IP, bool) {
 	}
 	return out, len(out) > 0
 }
-

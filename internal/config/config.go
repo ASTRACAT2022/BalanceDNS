@@ -16,35 +16,35 @@ import (
 // internal/config package decoupled from internal/threat; the app layer
 // converts this into a *threat.Config at startup.
 type ThreatConfig struct {
-	Enabled                 bool                   `json:"enabled" yaml:"enabled"`
-	DefaultAction           string                 `json:"default_action" yaml:"default_action"`
-	FailMode                string                 `json:"fail_mode" yaml:"fail_mode"`
-	UpdateIntervalSeconds   int                    `json:"update_interval" yaml:"update_interval"`
-	RequestTimeoutMS        int                    `json:"request_timeout_ms" yaml:"request_timeout_ms"`
-	MaxFeedBytes            int64                  `json:"max_feed_bytes" yaml:"max_feed_bytes"`
-	MaxDomains              int                    `json:"max_domains" yaml:"max_domains"`
-	RetryCount              int                    `json:"retry_count" yaml:"retry_count"`
-	BackoffSeconds          int                    `json:"backoff_seconds" yaml:"backoff_seconds"`
-	DiskCacheDir            string                 `json:"disk_cache_dir" yaml:"disk_cache_dir"`
-	AllowlistFile           string                 `json:"allowlist_file" yaml:"allowlist_file"`
-	CustomBlocklistFile     string                 `json:"custom_blocklist_file" yaml:"custom_blocklist_file"`
-	MinimumSources          int                    `json:"minimum_sources" yaml:"minimum_sources"`
-	BlockHighConfidence     bool                   `json:"block_high_confidence" yaml:"block_high_confidence"`
-	BlockMediumConfidence   bool                   `json:"block_medium_confidence" yaml:"block_medium_confidence"`
-	Feeds                    ThreatFeedConfigList   `json:"feeds" yaml:"feeds"`
+	Enabled               bool                 `json:"enabled" yaml:"enabled"`
+	DefaultAction         string               `json:"default_action" yaml:"default_action"`
+	FailMode              string               `json:"fail_mode" yaml:"fail_mode"`
+	UpdateIntervalSeconds int                  `json:"update_interval" yaml:"update_interval"`
+	RequestTimeoutMS      int                  `json:"request_timeout_ms" yaml:"request_timeout_ms"`
+	MaxFeedBytes          int64                `json:"max_feed_bytes" yaml:"max_feed_bytes"`
+	MaxDomains            int                  `json:"max_domains" yaml:"max_domains"`
+	RetryCount            int                  `json:"retry_count" yaml:"retry_count"`
+	BackoffSeconds        int                  `json:"backoff_seconds" yaml:"backoff_seconds"`
+	DiskCacheDir          string               `json:"disk_cache_dir" yaml:"disk_cache_dir"`
+	AllowlistFile         string               `json:"allowlist_file" yaml:"allowlist_file"`
+	CustomBlocklistFile   string               `json:"custom_blocklist_file" yaml:"custom_blocklist_file"`
+	MinimumSources        int                  `json:"minimum_sources" yaml:"minimum_sources"`
+	BlockHighConfidence   bool                 `json:"block_high_confidence" yaml:"block_high_confidence"`
+	BlockMediumConfidence bool                 `json:"block_medium_confidence" yaml:"block_medium_confidence"`
+	Feeds                 ThreatFeedConfigList `json:"feeds" yaml:"feeds"`
 }
 
 // ThreatFeedConfig is one threat feed descriptor in the Lua config.
 type ThreatFeedConfig struct {
-	Name       string `json:"name" yaml:"name"`
-	URL        string `json:"url" yaml:"url"`
-	Format     string `json:"format" yaml:"format"`
-	Confidence string `json:"confidence" yaml:"confidence"`
-	Category   string `json:"category" yaml:"category"`
-	APIKey     string `json:"api_key,omitempty" yaml:"api_key,omitempty"`
-	MinEntries int    `json:"min_entries" yaml:"min_entries"`
-	MaxChangePct int `json:"max_change_pct" yaml:"max_change_pct"`
-	Enabled    bool   `json:"enabled" yaml:"enabled"`
+	Name         string `json:"name" yaml:"name"`
+	URL          string `json:"url" yaml:"url"`
+	Format       string `json:"format" yaml:"format"`
+	Confidence   string `json:"confidence" yaml:"confidence"`
+	Category     string `json:"category" yaml:"category"`
+	APIKey       string `json:"api_key,omitempty" yaml:"api_key,omitempty"`
+	MinEntries   int    `json:"min_entries" yaml:"min_entries"`
+	MaxChangePct int    `json:"max_change_pct" yaml:"max_change_pct"`
+	Enabled      bool   `json:"enabled" yaml:"enabled"`
 }
 
 // ThreatFeedConfigList accepts both a JSON array (normal) and a JSON object
@@ -125,10 +125,36 @@ type RoutingConfig struct {
 }
 
 type CacheConfig struct {
-	Enabled       bool   `json:"enabled" yaml:"enabled"`
-	Capacity      int    `json:"capacity" yaml:"capacity"`
-	MinTTLSeconds uint32 `json:"min_ttl_seconds" yaml:"min_ttl_seconds"`
-	MaxTTLSeconds uint32 `json:"max_ttl_seconds" yaml:"max_ttl_seconds"`
+	Enabled  bool `json:"enabled" yaml:"enabled"`
+	Capacity int  `json:"capacity" yaml:"capacity"`
+	// MinTTLSeconds is accepted for backwards compatibility. Cache freshness is
+	// based on authoritative TTL and never extended to this minimum.
+	MinTTLSeconds uint32                `json:"min_ttl_seconds" yaml:"min_ttl_seconds"`
+	MaxTTLSeconds uint32                `json:"max_ttl_seconds" yaml:"max_ttl_seconds"`
+	Persistent    PersistentCacheConfig `json:"persistent" yaml:"persistent"`
+	Stale         StaleCacheConfig      `json:"stale" yaml:"stale"`
+	Prefetch      PrefetchCacheConfig   `json:"prefetch" yaml:"prefetch"`
+	Refresh       RefreshCacheConfig    `json:"refresh" yaml:"refresh"`
+}
+
+type PersistentCacheConfig struct {
+	Enabled   bool   `json:"enabled" yaml:"enabled"`
+	Path      string `json:"path" yaml:"path"`
+	MaxSizeGB int    `json:"max_size_gb" yaml:"max_size_gb"`
+}
+type StaleCacheConfig struct {
+	Enabled     bool   `json:"enabled" yaml:"enabled"`
+	ResponseTTL uint32 `json:"response_ttl" yaml:"response_ttl"`
+}
+type PrefetchCacheConfig struct {
+	Enabled          bool `json:"enabled" yaml:"enabled"`
+	ThresholdPercent int  `json:"threshold_percent" yaml:"threshold_percent"`
+}
+type RefreshCacheConfig struct {
+	Enabled    bool `json:"enabled" yaml:"enabled"`
+	Workers    int  `json:"workers" yaml:"workers"`
+	MinDelayMS int  `json:"min_delay_ms" yaml:"min_delay_ms"`
+	MaxDelayMS int  `json:"max_delay_ms" yaml:"max_delay_ms"`
 }
 
 type HostsConfig struct {
@@ -180,6 +206,13 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	if cfg.Cache.Persistent.Path == "" {
+		cfg.Cache.Persistent.Path = "data/dns-cache"
+		cfg.Cache.Persistent.Enabled = true
+	}
+	if cfg.Cache.Persistent.Enabled && cfg.Cache.Persistent.MaxSizeGB <= 0 {
+		cfg.Cache.Persistent.MaxSizeGB = 20
+	}
 	applyDefaults(cfg)
 	if err := validate(cfg); err != nil {
 		return nil, err
@@ -220,6 +253,23 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Cache.MaxTTLSeconds == 0 {
 		cfg.Cache.MaxTTLSeconds = 3600
+	}
+	if cfg.Cache.Stale.ResponseTTL == 0 {
+		cfg.Cache.Stale.ResponseTTL = 30
+		cfg.Cache.Stale.Enabled = true
+	}
+	if cfg.Cache.Prefetch.ThresholdPercent == 0 {
+		cfg.Cache.Prefetch.ThresholdPercent = 10
+	}
+	if cfg.Cache.Refresh.Workers <= 0 {
+		cfg.Cache.Refresh.Workers = 8
+		cfg.Cache.Refresh.Enabled = true
+	}
+	if cfg.Cache.Refresh.MinDelayMS <= 0 {
+		cfg.Cache.Refresh.MinDelayMS = 1000
+	}
+	if cfg.Cache.Refresh.MaxDelayMS <= 0 {
+		cfg.Cache.Refresh.MaxDelayMS = 1800000
 	}
 	if cfg.Plugins.TimeoutMS == 0 {
 		cfg.Plugins.TimeoutMS = 20

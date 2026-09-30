@@ -28,10 +28,20 @@ type Provider struct {
 	ResponsesTotal  *prometheus.CounterVec
 
 	// Cache
-	CacheHitsTotal   prometheus.Counter
-	CacheMissesTotal prometheus.Counter
-	CacheEntries     prometheus.Gauge
-	CacheEvictions   prometheus.Counter
+	CacheHitsTotal          prometheus.Counter
+	CacheMissesTotal        prometheus.Counter
+	CacheEntries            prometheus.Gauge
+	CacheEvictions          prometheus.Counter
+	DNSCacheRequests        prometheus.Counter
+	DNSCacheL1Hits          prometheus.Counter
+	DNSCacheMisses          prometheus.Counter
+	DNSCacheFreshHits       prometheus.Counter
+	DNSCacheStaleHits       prometheus.Counter
+	DNSCacheL2Hits          prometheus.Counter
+	DNSCacheRefresh         prometheus.Counter
+	DNSCacheRefreshSuccess  prometheus.Counter
+	DNSCacheRefreshFailed   prometheus.Counter
+	DNSCacheRefreshDuration prometheus.Histogram
 
 	// Upstream
 	UpstreamRequests *prometheus.CounterVec
@@ -91,6 +101,16 @@ func New() *Provider {
 			Name: "balancedns_cache_evictions_total",
 			Help: "Total DNS cache evictions (LRU + expiry)",
 		}),
+		DNSCacheRequests:        prometheus.NewCounter(prometheus.CounterOpts{Name: "dns_cache_requests_total", Help: "DNS cache lookups"}),
+		DNSCacheL1Hits:          prometheus.NewCounter(prometheus.CounterOpts{Name: "dns_cache_l1_hit_total", Help: "In-memory DNS cache hits"}),
+		DNSCacheMisses:          prometheus.NewCounter(prometheus.CounterOpts{Name: "dns_cache_miss_total", Help: "DNS cache misses"}),
+		DNSCacheFreshHits:       prometheus.NewCounter(prometheus.CounterOpts{Name: "dns_cache_fresh_hit_total", Help: "Fresh in-memory DNS cache hits"}),
+		DNSCacheStaleHits:       prometheus.NewCounter(prometheus.CounterOpts{Name: "dns_cache_stale_hit_total", Help: "Stale Last Known Good cache hits"}),
+		DNSCacheL2Hits:          prometheus.NewCounter(prometheus.CounterOpts{Name: "dns_cache_l2_hit_total", Help: "Persistent DNS cache hits"}),
+		DNSCacheRefresh:         prometheus.NewCounter(prometheus.CounterOpts{Name: "dns_cache_refresh_total", Help: "Background DNS cache refresh attempts"}),
+		DNSCacheRefreshSuccess:  prometheus.NewCounter(prometheus.CounterOpts{Name: "dns_cache_refresh_success_total", Help: "Successful background DNS cache refreshes"}),
+		DNSCacheRefreshFailed:   prometheus.NewCounter(prometheus.CounterOpts{Name: "dns_cache_refresh_failed_total", Help: "Failed background DNS cache refreshes"}),
+		DNSCacheRefreshDuration: prometheus.NewHistogram(prometheus.HistogramOpts{Name: "dns_cache_refresh_duration_seconds", Help: "Background DNS refresh duration", Buckets: []float64{.001, .01, .05, .1, .5, 1, 2, 5, 10}}),
 
 		UpstreamRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "balancedns_upstream_requests_total",
@@ -151,6 +171,7 @@ func New() *Provider {
 		p.CacheMissesTotal,
 		p.CacheEntries,
 		p.CacheEvictions,
+		p.DNSCacheRequests, p.DNSCacheL1Hits, p.DNSCacheMisses, p.DNSCacheFreshHits, p.DNSCacheStaleHits, p.DNSCacheL2Hits, p.DNSCacheRefresh, p.DNSCacheRefreshSuccess, p.DNSCacheRefreshFailed, p.DNSCacheRefreshDuration,
 		p.UpstreamRequests,
 		p.UpstreamErrors,
 		p.UpstreamTimeouts,

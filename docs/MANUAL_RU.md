@@ -5,7 +5,8 @@
 `BalanceDNS` — DNS-резолвер/форвардер на Go с:
 - listener'ами `DNS (UDP/TCP)`, `DoT`, `DoH`;
 - маршрутизацией по зонам (`.ru` отдельно, остальное отдельно);
-- быстрым кэшем (sharded LRU + TTL);
+- быстрым шардированным L1-кэшем и persistent L2-кэшем;
+- Last Known Good (LKG) и stale-while-revalidate для успешно разрешённых DNS-ответов;
 - policy-движком (Lua/go_exec, sandbox);
 - supervisor-контролем компонентов;
 - метриками Prometheus.
@@ -125,12 +126,66 @@ dig @<BIND_IP> -p 53 v6.internal.example AAAA
 
 ### 8.2 Производительность
 
-- `cache.capacity` больше для горячего трафика
-- `cache.max_ttl_seconds` под ваши требования свежести
+- `cache.capacity` задаёт максимальное число записей в RAM L1;
+- `cache.max_ttl_seconds` ограничивает сверху время свежести, но не продлевает исходный DNS TTL;
 - `reuse_port = true`, `reuse_addr = true`
 - держать апстримы географически близко
 
-### 8.3 Логи
+### 8.3 LKG-кэш и stale-while-revalidate
+
+Положительный успешный ответ (`NOERROR` с записями в `Answer`) сохраняется в L1 и на диск. Пока исходный DNS TTL не истёк, ответ обслуживается из L1 как `fresh`. TTL в ответе клиенту уменьшается со временем.
+
+После истечения TTL запись остаётся как Last Known Good (`stale`). Resolver немедленно возвращает её с коротким клиентским TTL и обновляет данные в фоне. Успешный ответ атомарно заменяет старый. Таймауты, сетевые ошибки, `SERVFAIL`, `NXDOMAIN`, `REFUSED` и ответы без записей не затирают LKG. Отрицательные ответы в этот положительный кэш не записываются.
+
+На промахе L1 resolver лениво проверяет L2; весь диск-кэш при запуске в RAM не загружается. Для одного DNS-ключа одновременно выполняется не более одного refresh. При ошибках refresh действует экспоненциальная задержка с jitter. Популярные записи можно обновлять заранее, когда до конца TTL остаётся заданный процент.
+
+Пример настроек в Lua:
+
+```lua
+cache = {
+  enabled = true,
+  capacity = 250000, -- предел записей L1
+  min_ttl_seconds = 5, -- оставлен для совместимости; исходный TTL не увеличивается
+  max_ttl_seconds = 1800,
+  persistent = {
+    enabled = true,
+    path = "/var/lib/balancedns/dns-cache",
+    max_size_gb = 20,
+  },
+  stale = {
+    enabled = true,
+    response_ttl = 30,
+  },
+  refresh = {
+    enabled = true,
+    workers = 8,
+    min_delay_ms = 1000,
+    max_delay_ms = 1800000,
+  },
+  prefetch = {
+    enabled = true,
+    threshold_percent = 10,
+  },
+}
+```
+
+`capacity` ограничивает только RAM L1: LRU-вытеснение из L1 не удаляет запись из L2. L2 ограничивается параметром `max_size_gb`; самые давно использованные файлы удаляются при обслуживании дискового лимита. Для Docker Compose production-конфиг использует `/var/lib/balancedns/dns-cache`, каталог сохраняется volume `./data/dns-cache`. При отдельном запуске укажите путь на постоянном диске и выдайте пользователю процесса права записи. Не размещайте L2 на сетевом файловом хранилище.
+
+Чтобы отключить persistent cache, задайте `persistent = { enabled = false, path = "/путь/к/кэшу" }`. Чтобы отключить stale-ответы или фоновые обновления, задайте `stale.enabled = false` или `refresh.enabled = false`.
+
+Новые cache-метрики доступны на `/metrics`: `dns_cache_requests_total`, `dns_cache_l1_hit_total`, `dns_cache_l2_hit_total`, `dns_cache_fresh_hit_total`, `dns_cache_stale_hit_total`, `dns_cache_miss_total`, `dns_cache_refresh_total`, `dns_cache_refresh_success_total`, `dns_cache_refresh_failed_total` и `dns_cache_refresh_duration_seconds`. Также доступны существующие `balancedns_cache_entries`, `balancedns_cache_hits_total`, `balancedns_cache_misses_total` и `balancedns_cache_evictions_total`.
+
+Примеры PromQL для долей попаданий:
+
+```promql
+# Общее попадание в L1 или L2
+sum(rate(dns_cache_l1_hit_total[5m]) + rate(dns_cache_l2_hit_total[5m])) / sum(rate(dns_cache_requests_total[5m]))
+# Доли fresh и stale ответов среди всех запросов к кэшу
+sum(rate(dns_cache_fresh_hit_total[5m])) / sum(rate(dns_cache_requests_total[5m]))
+sum(rate(dns_cache_stale_hit_total[5m])) / sum(rate(dns_cache_requests_total[5m]))
+```
+
+### 8.4 Логи
 
 Минимум шума:
 
@@ -178,6 +233,7 @@ sudo systemctl status balancedns --no-pager
 ```
 
 Если сертификаты в `/root/...`, перенеси их в `/etc/balancedns/certs` и выдай права чтения для группы сервиса.
+У systemd-пользователя также должны быть права записи в `persistent.path` (в production-конфиге это `/var/lib/balancedns/dns-cache`).
 
 ## 12. Частые проблемы и решения
 
