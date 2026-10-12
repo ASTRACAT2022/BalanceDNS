@@ -833,9 +833,11 @@ func (s *Server) resolveCNAMEChain(ctx context.Context, target string) ([]net.IP
 	if v, ok := s.cnamesGlue.Load(target); ok {
 		e := v.(cnamesGlueEntry)
 		if time.Now().Before(e.expiry) {
-			return e.ips, true
+			return e.ips, len(e.ips) > 0
 		}
 	}
+	ctx, cancel := context.WithTimeout(ctx, 750*time.Millisecond)
+	defer cancel()
 
 	msg := new(dns.Msg)
 	msg.SetQuestion(dns.Fqdn(target), dns.TypeA)
@@ -844,11 +846,17 @@ func (s *Server) resolveCNAMEChain(ctx context.Context, target string) ([]net.IP
 	var ips []net.IP
 	var lastErr error
 
-	client := &dns.Client{Timeout: 5 * time.Second}
+	client := &dns.Client{Timeout: 750 * time.Millisecond}
 	for _, addr := range cnameGlueResolvers {
-		resp, _, err := client.Exchange(msg, addr)
+		if ctx.Err() != nil {
+			break
+		}
+		resp, _, err := client.ExchangeContext(ctx, msg, addr)
 		if err != nil {
 			lastErr = err
+			continue
+		}
+		if resp == nil {
 			continue
 		}
 		for _, rr := range resp.Answer {
@@ -863,8 +871,8 @@ func (s *Server) resolveCNAMEChain(ctx context.Context, target string) ([]net.IP
 		// AAAA pass: merge v6 glue.
 		msg6 := new(dns.Msg)
 		msg6.SetQuestion(dns.Fqdn(target), dns.TypeAAAA)
-		resp6, _, err6 := client.Exchange(msg6, addr)
-		if err6 == nil {
+		resp6, _, err6 := client.ExchangeContext(ctx, msg6, addr)
+		if err6 == nil && resp6 != nil {
 			for _, rr := range resp6.Answer {
 				if a, ok := rr.(*dns.AAAA); ok && a.AAAA != nil && !dedup[a.AAAA.String()] {
 					dedup[a.AAAA.String()] = true

@@ -125,6 +125,9 @@ func (r *Resolver) Forward(ctx context.Context, request *dns.Msg, q dns.Question
 
 	errs := make([]string, 0, len(candidates))
 	for i := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, candidates[0], err
+		}
 		up := candidates[i]
 		resp, err := r.exchange(ctx, up, requestCopy)
 		if err == nil && resp != nil {
@@ -167,6 +170,15 @@ func (r *Resolver) exchange(parent context.Context, up Upstream, msg *dns.Msg) (
 		resp, err = r.exchangeDoH(ctx, up, msg)
 	default:
 		err = fmt.Errorf("unsupported upstream protocol %q", up.Protocol)
+	}
+	if err == nil {
+		if resp == nil || resp.Truncated || resp.Id != msg.Id || len(resp.Question) != 1 || len(msg.Question) != 1 ||
+			!strings.EqualFold(resp.Question[0].Name, msg.Question[0].Name) ||
+			resp.Question[0].Qtype != msg.Question[0].Qtype || resp.Question[0].Qclass != msg.Question[0].Qclass {
+			err = errors.New("invalid upstream response")
+		} else if resp.Rcode == dns.RcodeServerFailure {
+			err = errors.New("upstream returned SERVFAIL")
+		}
 	}
 
 	if err != nil {
@@ -257,6 +269,7 @@ func (r *Resolver) selectCandidates(qname string) []Upstream {
 	count := 0
 	for i := range r.upstreams {
 		up := r.upstreams[i]
+		scores[i] = -1
 		if len(up.Zones) == 0 {
 			scores[i] = 0
 			count++
@@ -264,7 +277,7 @@ func (r *Resolver) selectCandidates(qname string) []Upstream {
 		}
 		best := -1
 		for _, zone := range up.Zones {
-			if zone == "." || strings.HasSuffix(fqdn, zone) {
+			if zone == "." || fqdn == zone || (strings.HasSuffix(fqdn, zone) && fqdn[len(fqdn)-len(zone)-1] == '.') {
 				if len(zone) > best {
 					best = len(zone)
 				}

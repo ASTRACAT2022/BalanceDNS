@@ -164,14 +164,19 @@ func (c *Cache) GetState(q dns.Question) (*dns.Msg, bool, bool) {
 	}
 	s.ll.MoveToFront(item.element)
 	item.hits++
-	message := item.message.Copy()
+	// Set replaces the message pointer under the shard lock; cached messages
+	// themselves are immutable. Copy after unlocking so concurrent hits on a
+	// popular name do not serialize on the deep copy.
+	stored := item.message
+	storedAt := item.storedAt
 	fresh := now.Before(item.expiresAt)
+	s.mu.Unlock()
+	message := stored.Copy()
 	if fresh {
-		decrementMessageTTL(message, uint32(now.Sub(item.storedAt)/time.Second))
+		decrementMessageTTL(message, uint32(now.Sub(storedAt)/time.Second))
 	} else if c.staleTTL > 0 {
 		setMessageTTL(message, uint32(c.staleTTL/time.Second))
 	}
-	s.mu.Unlock()
 	if c.metrics != nil {
 		c.metrics.DNSCacheL1Hits.Inc()
 	}
@@ -183,8 +188,6 @@ func (c *Cache) GetState(q dns.Question) (*dns.Msg, bool, bool) {
 		}
 	}
 
-	// Responses are copied while holding the shard lock so an atomic replacement
-	// cannot expose a partially modified packet to a reader.
 	c.incHit()
 	return message, fresh, true
 }
